@@ -1,0 +1,10 @@
+zig-out
+zig-pkg
+.zig-cache
+ref/
+# Intel SDE / Pin logs (written to the working directory when a child process fails)
+pin-log.txt
+pinos.log.*
+__pycache__/
+*.py[cod]
+/dist/

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.29.0", "packaging", "ziglang==0.17.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vapoursynth-zexpr"
+description = "AsmJit-accelerated VapourSynth expression plugin written in Zig"
+readme = "README.md"
+license = "Zlib"
+license-files = ["LICENSE"]
+authors = [{ name = "dnjulek" }]
+requires-python = ">=3.12"
+dependencies = ["VapourSynth>=75"]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Topic :: Multimedia :: Video",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/dnjulek/vapoursynth-zexpr"
+Repository = "https://github.com/dnjulek/vapoursynth-zexpr"
+Issues = "https://github.com/dnjulek/vapoursynth-zexpr/issues"
+
+[tool.hatch.version]
+source = "regex"
+path = "build.zig.zon"
+pattern = '\.version\s*=\s*"(?P<version>[^"]+)"'
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "/build",
+    "/build.zig",
+    "/build.zig.zon",
+    "/hatch_build.py",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/README.md",
+    "/src",
+]
+
+[tool.hatch.build.targets.wheel]
+include = ["vapoursynth/plugins"]
+artifacts = [
+    "vapoursynth/plugins/*.dylib",
+    "vapoursynth/plugins/*.so",
+    "vapoursynth/plugins/*.dll",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"

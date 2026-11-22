@@ -1,0 +1,112 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+
+      - name: Check formatting
+        run: zig fmt --check src build build.zig
+
+      - name: Build CLI
+        run: zig build cli
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - macos-15-intel
+          - windows-latest
+        optimize: [debug, fast]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies
+        run: pip install VapourSynth pytest numpy
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+          cache-key: ${{ matrix.os }}-${{ matrix.optimize }}
+
+      - name: Run host-free Zig tests (${{ matrix.optimize }})
+        run: zig build test -Doptimize=${{ matrix.optimize }} ${{ matrix.optimize == 'fast' && '-Dcpu=baseline' || '' }}
+
+      - name: Build plugin (${{ matrix.optimize }})
+        run: zig build -Doptimize=${{ matrix.optimize }} ${{ matrix.optimize == 'fast' && '-Dcpu=baseline' || '' }}
+
+      - name: Run pytest (${{ matrix.optimize }})
+        timeout-minutes: 30
+        run: pytest -v -p no:cacheprovider tests
+
+  test-musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            os: ubuntu-latest
+            optimize: debug
+          - target: x86_64-linux-musl
+            os: ubuntu-latest
+            optimize: fast
+          - target: aarch64-linux-musl
+            os: ubuntu-24.04-arm
+            optimize: debug
+          - target: aarch64-linux-musl
+            os: ubuntu-24.04-arm
+            optimize: fast
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+          cache-key: ${{ matrix.target }}-${{ matrix.optimize }}
+
+      - name: Run host-free Zig tests (${{ matrix.target }}, ${{ matrix.optimize }})
+        run: zig build test -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }}
+
+      - name: Build plugin (${{ matrix.target }}, ${{ matrix.optimize }})
+        run: zig build -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }}
+
+      - name: Run pytest in Alpine musl container (${{ matrix.target }}, ${{ matrix.optimize }})
+        timeout-minutes: 30
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work python:3.12-alpine sh -eu -c '
+            apk add --no-cache gcc musl-dev
+            pip install -q VapourSynth pytest numpy
+            pytest -v -p no:cacheprovider tests
+          '

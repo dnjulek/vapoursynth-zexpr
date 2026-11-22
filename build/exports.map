@@ -1,0 +1,4 @@
+{
+  global: VapourSynthPluginInit2;
+  local: *;
+};

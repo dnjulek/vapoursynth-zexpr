@@ -1,0 +1,23 @@
+.{
+    .name = .zexpr,
+    .version = "0.1.0",
+    .fingerprint = 0xb26e584c0bb23516,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .vapoursynth = .{
+            .url = "git+https://github.com/dnjulek/vapoursynth-zig.git#07137c2f5e336b9cedd9afd74af889ae2cff09d9",
+            .hash = "vapoursynth-4.0.0-jLYMQ3PmAgAVuS7eVi3E1g8dbA165g8YgSbFKguenIyS",
+        },
+        .asmjit = .{
+            .url = "git+https://github.com/asmjit/asmjit#677a10bac2c24f7e068cf1f9e675bf51c7b534ea",
+            .hash = "N-V-__8AAOHYowDas2Yh9UHr5lYtI4kd6HWN4SlxvH8GWIAl",
+        },
+    },
+    .paths = .{
+        "LICENSE",
+        "build",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
