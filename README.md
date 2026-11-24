@@ -18,7 +18,7 @@ zexpr.Expr(
 ) -> vs.VideoNode
 ```
 
-Per-pixel RPN expression filter: one expression per plane (the last repeats, `""` copies `src0`'s plane), `opt=1` keeps integer math in wrapping `i32`, and `boundary` picks clamp (`0`) or mirror (`1`) for `clip[dx,dy]`.
+Per-pixel RPN expression filter supporting both fixed and variable format/resolution clips: one expression per plane (the last repeats; `""` copies `src0`'s plane when sample type and bit depth match, otherwise leaving it undefined; use `"x"` to convert formats), `opt=1` keeps integer math in wrapping `i32`, and `boundary` picks clamp (`0`) or mirror (`1`) for `clip[dx,dy]`.
 
 ### `zexpr.Select`
 
@@ -62,6 +62,7 @@ Atomic frame-property editor in `akarin` style (`dict=lambda: {...}`, exact `int
 | `N` | All | Current frame number |
 | `width`, `height` | All | Current plane dimensions in `Expr`; full clip dimensions in `Select`/`PropExpr` |
 | `pi` | All | `3.14159265...` (`f32`) |
+| `range_min`, `range_max`, `range_size`, `mask_max`, `neutral`, `plane_min`, `plane_max` | All | Format and range built-in constants. Accept bare `<const>` (clip `0`), `<clip>:<const>` (`x`..`w`, `srcN`), or `dst:<const>`. `plane_min`/`plane_max` read each frame's `_Range` (`dst:` reads clip `0`'s props with `dst`'s format; integer clips without `_Range` default to limited range, so masks should use `mask_max` or `range_max`). In `Select`, bare and `<clip>:` constants use `prop_src`'s format (use `dst:` for `clip_src`'s format), and `dst:plane_min`/`dst:plane_max` are rejected. |
 
 ### Numeric Literals
 
@@ -132,8 +133,23 @@ import vapoursynth as vs
 
 core = vs.core
 
-# Gamma curve (automatic 1D LUT on u8/u16, inline SIMD on f32)
-out = core.zexpr.Expr([clip], ["x 255 / 2.2 pow 255 *"])
+# Bit-depth-agnostic gamma curve (works on 8/10/16-bit, float, and variable-format clips)
+out = core.zexpr.Expr([clip], ["x range_max / 2.2 pow range_max *"])
+
+# Per-frame _Range-aware scaling to a 16-bit output using built-in constants and dst:
+norm = core.zexpr.Expr(
+    [clip],
+    ["plane_min plane_max x linstep dst:plane_max dst:plane_min - * dst:plane_min +"],
+    format=vs.YUV420P16,
+)
+
+# Multi-clip blend across different bit depths
+# (bare `range_max` is shorthand for `x:range_max`, i.e. clip 0; `y:` targets clip 1; `dst:` targets the output)
+blend = core.zexpr.Expr(
+    [clip8, clip16],
+    ["x range_max / y y:range_max / 0.5 lerp dst:range_max *"],
+    format=vs.GRAY10,
+)
 
 # 3x3 median (native u8/u16 SIMD interior fast path)
 med = core.zexpr.Expr([clip], [
