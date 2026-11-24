@@ -7,6 +7,7 @@ comptime {
     _ = @import("jit/math.zig");
     _ = @import("jit/codegen.zig");
     _ = @import("jit/lut.zig");
+    _ = @import("jit/plane_cache.zig");
     _ = @import("jit/int_path.zig");
     _ = @import("expr/token.zig");
     _ = @import("expr/lexer.zig");

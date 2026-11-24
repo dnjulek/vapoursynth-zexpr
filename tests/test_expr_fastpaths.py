@@ -334,3 +334,47 @@ def test_vsjetpack_optimizations_exact(core: vs.Core) -> None:
                 core.zexpr.Expr(clips_u8, [expr]),
                 core.zexpr.Expr(clips_f32, [expr], format=vs.GRAY8),
             )
+
+
+def test_frameeval_plane_cache_reuse_and_eviction(core: vs.Core) -> None:
+    """Bounded LRU plane cache serves FrameEval hits, handles >32-entry eviction, and isolates keys."""
+    c8 = make_clip(core, width=32, height=8, fmt=vs.YUV420P8, length=48, seed=910)
+    c16 = make_clip(core, width=32, height=8, fmt=vs.GRAY16, length=12, seed=911)
+
+    # 1. Evict past default_capacity (32) while an earlier clip stays alive and is evaluated afterwards.
+    early = core.zexpr.Expr([c8], ["x[-1,0] x + 2 /", "x 7 +"])
+    churn = [core.zexpr.Expr([c8], [f"x {i} +", f"x {i + 1} +"]) for i in range(40)]
+    for i, node in enumerate(churn):
+        f = node.get_frame(i)
+        src_y = plane_array(c8.get_frame(i), 0).astype(np.int32)
+        np.testing.assert_array_equal(plane_array(f, 0), np.clip(src_y + i, 0, 255).astype(np.uint8))
+    # Earlier filter's cached planes were evicted from LRU but must stay valid via refcount!
+    early_ref = core.zexpr.Expr([c8], ["x[-1,0] x + 2 /", "x 7 +"])
+    assert_same_clip(early, early_ref, frames=[0, 1])
+
+    # 2. FrameEval reusing both JIT spatial kernels and 1D u16 LUTs across frames.
+    def eval_fn(n: int) -> vs.VideoNode:
+        k = (n % 4) + 1
+        return core.zexpr.Expr([c8], [f"x[-1,0] x + 2 / {k} +", f"x {k} +"])
+
+    fe = core.std.FrameEval(c8, eval_fn)
+    for n in range(12):
+        expected = eval_fn(n)
+        assert_same_clip(fe[n : n + 1], expected[n : n + 1])
+
+    def eval_lut16(n: int) -> vs.VideoNode:
+        g = 1.8 if (n % 2 == 0) else 2.2
+        return core.zexpr.Expr([c16], [f"x 65535 / {g} pow 65535 *"])
+
+    fe16 = core.std.FrameEval(c16, eval_lut16)
+    for n in range(6):
+        assert_same_clip(fe16[n : n + 1], eval_lut16(n)[n : n + 1])
+
+    # 3. Key isolation: same expression with different boundary / opt must never collide.
+    clamp_out = core.zexpr.Expr([c8], ["x[-2,0]"], boundary=0)
+    mirror_out = core.zexpr.Expr([c8], ["x[-2,0]"], boundary=1)
+    assert not np.array_equal(plane_array(clamp_out.get_frame(0), 0), plane_array(mirror_out.get_frame(0), 0))
+    opt0_out = core.zexpr.Expr([c16], ["x 0 * 16777217 + 1 + 16777216 -"], opt=0)
+    opt1_out = core.zexpr.Expr([c16], ["x 0 * 16777217 + 1 + 16777216 -"], opt=1)
+    assert np.all(plane_array(opt0_out.get_frame(0), 0) == 0)
+    assert np.all(plane_array(opt1_out.get_frame(0), 0) == 2)

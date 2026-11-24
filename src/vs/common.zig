@@ -3,6 +3,7 @@
 const std = @import("std");
 const vapoursynth = @import("vapoursynth");
 const ast = @import("../expr/ast.zig");
+const plane_cache = @import("../jit/plane_cache.zig");
 
 const vs = vapoursynth.vapoursynth4;
 const ZAPI = vapoursynth.ZAPI;
@@ -19,32 +20,9 @@ pub fn fail(map_out: ZAPI.ZMap(?*vs.Map), comptime prefix: []const u8, comptime 
     return error.Invalid;
 }
 
-pub const PropBinding = struct {
-    clip: ast.ClipId,
-    name_z: [:0]u8,
-};
-
-pub fn freePropBindings(allocator: std.mem.Allocator, props: []PropBinding) void {
-    for (props) |p| allocator.free(p.name_z);
-    allocator.free(props);
-}
-
-pub fn buildPropBindings(allocator: std.mem.Allocator, prog: *const ast.Program) std.mem.Allocator.Error![]PropBinding {
-    const out = try allocator.alloc(PropBinding, prog.props.items.len);
-    var built: usize = 0;
-    errdefer {
-        for (out[0..built]) |p| allocator.free(p.name_z);
-        allocator.free(out);
-    }
-    for (prog.props.items, 0..) |p, i| {
-        out[i] = .{
-            .clip = p.clip,
-            .name_z = try allocator.dupeSentinel(u8, p.name, 0),
-        };
-        built += 1;
-    }
-    return out;
-}
+pub const PropBinding = plane_cache.PropBinding;
+pub const freePropBindings = plane_cache.freePropBindings;
+pub const buildPropBindings = plane_cache.buildPropBindings;
 
 pub inline fn clampFrameIdx(n: c_int, num_frames: i32) c_int {
     if (num_frames <= 0) return n;
@@ -142,8 +120,13 @@ pub fn readFrameProp(zapi: ZAPI, props: ?*const vs.Map, name_z: [*:0]const u8, m
     return missing_default;
 }
 
-/// S5: Probe the running core's frame row alignment once in `Create` via a 1x1 GRAY8 frame.
+var cached_core_align: std.atomic.Value(u32) = .init(0);
+
+/// S5: Probe the running core's frame row alignment once per process via a 1x1 GRAY8 frame.
 pub fn probeCoreAlignment(zapi: ZAPI) u32 {
+    const cached = cached_core_align.load(.acquire);
+    if (cached != 0) return cached;
+
     const api = zapi.vsapi;
     var fmt: vs.VideoFormat = undefined;
     if (api.getVideoFormatByID.?(&fmt, .Gray8, zapi.core) == 0) {
@@ -152,6 +135,7 @@ pub fn probeCoreAlignment(zapi: ZAPI) u32 {
     const frame = api.newVideoFrame.?(&fmt, 1, 1, null, zapi.core) orelse return 32;
     defer api.freeFrame.?(frame);
     const stride = api.getStride.?(frame, 0);
-    if (stride <= 0) return 32;
-    return @intCast(stride);
+    const align_bytes: u32 = if (stride <= 0) 32 else @intCast(stride);
+    cached_core_align.store(align_bytes, .release);
+    return align_bytes;
 }

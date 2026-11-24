@@ -12,6 +12,7 @@ const aj = @import("../jit/asmjit.zig");
 const cpu_mod = @import("../jit/cpu.zig");
 const codegen = @import("../jit/codegen.zig");
 const lut_mod = @import("../jit/lut.zig");
+const plane_cache = @import("../jit/plane_cache.zig");
 const common = @import("common.zig");
 
 const vs = vapoursynth.vapoursynth4;
@@ -24,18 +25,30 @@ pub const params = "clips:vnode[];expr:data[];format:int:opt;opt:int:opt;boundar
 
 const max_planes = 3;
 
+var global_plane_cache: plane_cache.PlaneCache(plane_cache.default_capacity) = .{};
+
 const PlaneExec = union(enum) {
     copy,
     undefined_plane,
-    lut: lut_mod.Lut,
-    jit: struct {
-        kernel: aj.CompiledKernel,
-        props: []common.PropBinding,
-    },
+    cached: *plane_cache.Entry,
+    lut_unshared: lut_mod.Lut,
     scalar: struct {
         prog: ast.Program,
         props: []common.PropBinding,
     },
+
+    fn deinit(self: *PlaneExec) void {
+        switch (self.*) {
+            .copy, .undefined_plane => {},
+            .cached => |entry| global_plane_cache.release(allocator, entry),
+            .lut_unshared => |*l| l.deinit(allocator, null),
+            .scalar => |*s| {
+                s.prog.deinit(allocator);
+                common.freePropBindings(allocator, s.props);
+            },
+        }
+        self.* = .copy;
+    }
 };
 
 const ExprData = struct {
@@ -45,26 +58,13 @@ const ExprData = struct {
     out_vi: vs.VideoInfo,
     dst_fmt: ast.SampleFormat,
     profile: interp.TargetProfile,
-    rt: ?aj.Runtime,
     planes: [max_planes]PlaneExec,
     num_planes: usize,
 
     fn deinit(self: *ExprData, zapi: ZAPI) void {
         for (self.planes[0..self.num_planes]) |*pe| {
-            switch (pe.*) {
-                .copy, .undefined_plane => {},
-                .lut => |*l| l.deinit(allocator, if (self.rt != null) &self.rt.? else null),
-                .jit => |*j| {
-                    if (self.rt) |*rt| rt.release(j.kernel.func);
-                    common.freePropBindings(allocator, j.props);
-                },
-                .scalar => |*s| {
-                    s.prog.deinit(allocator);
-                    common.freePropBindings(allocator, s.props);
-                },
-            }
+            pe.deinit();
         }
-        if (self.rt) |*rt| rt.deinit();
         for (self.nodes) |n| zapi.freeNode(n);
         allocator.free(self.nodes);
         allocator.free(self.clip_num_frames);
@@ -165,7 +165,53 @@ fn exprGetFrame(
             for (0..d.num_planes) |p| {
                 switch (d.planes[p]) {
                     .copy, .undefined_plane => continue,
-                    .lut => |*l| {
+                    .cached => |entry| switch (entry.exec) {
+                        .lut => |*l| {
+                            const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(p)).?;
+                            const dst_stride: isize = zapi.vsapi.getStride.?(dst_frame, @intCast(p));
+                            const pw: usize = @intCast(zapi.vsapi.getFrameWidth.?(dst_frame, @intCast(p)));
+                            const ph: usize = @intCast(zapi.vsapi.getFrameHeight.?(dst_frame, @intCast(p)));
+                            for (0..n_clips) |ci| {
+                                src_ptrs[ci] = zapi.vsapi.getReadPtr.?(src_frames[ci], @intCast(p)).?;
+                                src_strides[ci] = zapi.vsapi.getStride.?(src_frames[ci], @intCast(p));
+                            }
+                            l.apply(dst_ptr, dst_stride, src_ptrs, src_strides, pw, ph);
+                        },
+                        .jit => |j| {
+                            const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(p)).?;
+                            const dst_stride: isize = zapi.vsapi.getStride.?(dst_frame, @intCast(p));
+                            for (0..n_clips) |ci| {
+                                src_ptrs[ci] = zapi.vsapi.getReadPtr.?(src_frames[ci], @intCast(p)).?;
+                                src_strides[ci] = zapi.vsapi.getStride.?(src_frames[ci], @intCast(p));
+                            }
+                            var prop_stack: [64]f32 = undefined;
+                            const prop_heap: ?[]f32 = if (j.props.len > prop_stack.len)
+                                allocator.alloc(f32, j.props.len) catch {
+                                    zapi.freeFrame(dst_frame);
+                                    zapi.setFilterError("Expr: out of memory");
+                                    return null;
+                                }
+                            else
+                                null;
+                            defer if (prop_heap) |ph| allocator.free(ph);
+                            const prop_vals: []f32 = if (prop_heap) |ph| ph else prop_stack[0..j.props.len];
+
+                            for (j.props, 0..) |pb, pi| {
+                                const fprops = zapi.vsapi.getFramePropertiesRO.?(src_frames[pb.clip]);
+                                prop_vals[pi] = common.readFrameProp(zapi, fprops, pb.name_z.ptr, std.math.nan(f32));
+                            }
+
+                            j.kernel.func(
+                                dst_ptr,
+                                dst_stride,
+                                src_ptrs.ptr,
+                                src_strides.ptr,
+                                @intCast(n),
+                                if (prop_vals.len > 0) prop_vals.ptr else null,
+                            );
+                        },
+                    },
+                    .lut_unshared => |*l| {
                         const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(p)).?;
                         const dst_stride: isize = zapi.vsapi.getStride.?(dst_frame, @intCast(p));
                         const pw: usize = @intCast(zapi.vsapi.getFrameWidth.?(dst_frame, @intCast(p)));
@@ -175,39 +221,6 @@ fn exprGetFrame(
                             src_strides[ci] = zapi.vsapi.getStride.?(src_frames[ci], @intCast(p));
                         }
                         l.apply(dst_ptr, dst_stride, src_ptrs, src_strides, pw, ph);
-                    },
-                    .jit => |j| {
-                        const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(p)).?;
-                        const dst_stride: isize = zapi.vsapi.getStride.?(dst_frame, @intCast(p));
-                        for (0..n_clips) |ci| {
-                            src_ptrs[ci] = zapi.vsapi.getReadPtr.?(src_frames[ci], @intCast(p)).?;
-                            src_strides[ci] = zapi.vsapi.getStride.?(src_frames[ci], @intCast(p));
-                        }
-                        var prop_stack: [64]f32 = undefined;
-                        const prop_heap: ?[]f32 = if (j.props.len > prop_stack.len)
-                            allocator.alloc(f32, j.props.len) catch {
-                                zapi.freeFrame(dst_frame);
-                                zapi.setFilterError("Expr: out of memory");
-                                return null;
-                            }
-                        else
-                            null;
-                        defer if (prop_heap) |ph| allocator.free(ph);
-                        const prop_vals: []f32 = if (prop_heap) |ph| ph else prop_stack[0..j.props.len];
-
-                        for (j.props, 0..) |pb, pi| {
-                            const fprops = zapi.vsapi.getFramePropertiesRO.?(src_frames[pb.clip]);
-                            prop_vals[pi] = common.readFrameProp(zapi, fprops, pb.name_z.ptr, std.math.nan(f32));
-                        }
-
-                        j.kernel.func(
-                            dst_ptr,
-                            dst_stride,
-                            src_ptrs.ptr,
-                            src_strides.ptr,
-                            @intCast(n),
-                            if (prop_vals.len > 0) prop_vals.ptr else null,
-                        );
                     },
                     .scalar => |*s| {
                         const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(p)).?;
@@ -405,54 +418,72 @@ fn createImpl(
     }
 
     // Oracle profile: when forced via ZEXPR_CPU_LEVEL=0, use_fma = false; otherwise match host_cpu.has_fma.
-    const host_default_cpu = cpu_mod.detectWithOverride(null);
     const profile: interp.TargetProfile = if (env_override != null and env_override.? == 0)
         .{ .use_fma = false, .isa_family = cpu_mod.IsaFamily.host() }
     else if (cpu.isa == .scalar)
-        .{ .use_fma = host_default_cpu.has_fma, .isa_family = cpu_mod.IsaFamily.host() }
+        .{ .use_fma = cpu_mod.detectWithOverride(null).has_fma, .isa_family = cpu_mod.IsaFamily.host() }
     else
         interp.TargetProfile.fromCpu(cpu);
 
-    var rt: ?aj.Runtime = if (cpu.isa != .scalar) aj.Runtime.init() catch null else null;
-    var owns_rt = true;
-    errdefer if (owns_rt) {
-        if (rt) |*r| r.deinit();
-    };
+    const force_scalar = env_override != null and env_override.? == 0;
 
     var planes: [max_planes]PlaneExec = .{ .copy, .copy, .copy };
-    var built_planes: usize = 0;
     var owns_planes = true;
     errdefer if (owns_planes) {
-        for (planes[0..built_planes]) |*pe| {
-            switch (pe.*) {
-                .copy, .undefined_plane => {},
-                .lut => |*l| l.deinit(allocator, if (rt != null) &rt.? else null),
-                .jit => |*j| {
-                    if (rt) |*r| r.release(j.kernel.func);
-                    common.freePropBindings(allocator, j.props);
-                },
-                .scalar => |*s| {
-                    s.prog.deinit(allocator);
-                    common.freePropBindings(allocator, s.props);
-                },
-            }
+        for (planes[0..num_planes]) |*pe| {
+            pe.deinit();
         }
     };
 
-    var execmem_warned = false;
+    var plane_keys: [max_planes]plane_cache.Key = undefined;
+    var needs_compile: [max_planes]bool = .{ false, false, false };
+    var any_miss = false;
+
     const same_sample_as_src0 =
         out_vi.format.sampleType == vi0.format.sampleType and
         out_vi.format.bitsPerSample == vi0.format.bitsPerSample;
 
+    // Phase 1: check LRU cache for each non-empty plane (instant hit in FrameEval / shared U/V).
     for (0..num_planes) |p| {
         const expr_str = plane_exprs[p];
         if (expr_str.len == 0) {
             planes[p] = if (same_sample_as_src0) .copy else .undefined_plane;
-            built_planes += 1;
             continue;
         }
+        const pw: usize = @intCast(if (p == 0) out_vi.width else out_vi.width >> @intCast(out_vi.format.subSamplingW));
+        const ph: usize = @intCast(if (p == 0) out_vi.height else out_vi.height >> @intCast(out_vi.format.subSamplingH));
+        plane_keys[p] = .{
+            .expr = expr_str,
+            .src_fmts = src_fmts,
+            .dst_fmt = dst_fmt,
+            .width = pw,
+            .height = ph,
+            .opt_int = opt_val == 1,
+            .default_boundary = default_boundary,
+            .cpu = cpu,
+            .profile = profile,
+        };
+        if (!force_scalar) {
+            if (global_plane_cache.get(plane_keys[p])) |entry| {
+                planes[p] = .{ .cached = entry };
+                continue;
+            }
+        }
+        needs_compile[p] = true;
+        any_miss = true;
+    }
 
-        var prog = parser.parse(allocator, expr_str, .{
+    // Phase 2: parse all missed planes before compiling any, so syntax errors on plane 1/2
+    // fail without wasting JIT compilation or evicting live cache entries.
+    var parsed_progs: [max_planes]?ast.Program = .{ null, null, null };
+    defer {
+        for (&parsed_progs) |*mp| {
+            if (mp.*) |*pr| pr.deinit(allocator);
+        }
+    }
+    for (0..num_planes) |p| {
+        if (!needs_compile[p]) continue;
+        parsed_progs[p] = parser.parse(allocator, plane_exprs[p], .{
             .mode = .expr,
             .num_clips = @intCast(nodes.len),
             .default_boundary = default_boundary,
@@ -460,6 +491,26 @@ fn createImpl(
         }) catch |err| {
             return common.fail(map_out, filter_name, "parse error on plane {d}: {s}", .{ p, @errorName(err) });
         };
+    }
+
+    // Phase 3: compile missed planes against the shared JitRuntime and populate the LRU cache.
+    const rt_ptr: ?*aj.Runtime = if (any_miss and cpu.isa != .scalar) global_plane_cache.ensureRuntime() else null;
+    var execmem_warned = false;
+
+    for (0..num_planes) |p| {
+        if (!needs_compile[p]) continue;
+
+        // Re-check cache in case an earlier plane in this same Create compiled an identical key
+        // (e.g., YUV420 U and V planes sharing the same expression and dimensions).
+        if (!force_scalar) {
+            if (global_plane_cache.get(plane_keys[p])) |entry| {
+                planes[p] = .{ .cached = entry };
+                continue;
+            }
+        }
+
+        var prog = parsed_progs[p].?;
+        parsed_progs[p] = null;
         errdefer prog.deinit(allocator);
 
         try lower_mod.lower(allocator, &prog, profile);
@@ -468,18 +519,16 @@ fn createImpl(
             .enable_fma = profile.use_fma,
         });
 
-        const pw: usize = @intCast(if (p == 0) out_vi.width else out_vi.width >> @intCast(out_vi.format.subSamplingW));
-        const ph: usize = @intCast(if (p == 0) out_vi.height else out_vi.height >> @intCast(out_vi.format.subSamplingH));
+        const pw = plane_keys[p].width;
+        const ph = plane_keys[p].height;
 
-        const has_fast_u8_lut = rt != null and aj.Builder.cpuSupportsFastLutU8(cpu);
+        const has_fast_u8_lut = rt_ptr != null and aj.Builder.cpuSupportsFastLutU8(cpu);
         var info = try analysis_mod.analyze(allocator, &prog, src_fmts, dst_fmt, @intCast(pw), @intCast(ph), has_fast_u8_lut);
         defer info.deinit(allocator);
 
         // Automatic 1D/2D LUT fast path (B4, Y14) unless forced to scalar via ZEXPR_CPU_LEVEL=0.
-        const force_scalar = env_override != null and env_override.? == 0;
         if (!force_scalar and info.lut_kind != .none) {
             var lut_execmem_denied = false;
-            const rt_ptr: ?*aj.Runtime = if (rt != null) &rt.? else null;
             const lut = try lut_mod.Lut.build(
                 allocator,
                 rt_ptr,
@@ -493,13 +542,21 @@ fn createImpl(
                 ph,
                 &lut_execmem_denied,
             );
-            if (lut_execmem_denied and !execmem_warned) {
-                execmem_warned = true;
-                zapi.logMessage(.Warning, "zexpr.Expr: executable memory allocation denied; falling back to scalar LUT");
-            }
             prog.deinit(allocator);
-            planes[p] = .{ .lut = lut };
-            built_planes += 1;
+            if (lut_execmem_denied) {
+                if (!execmem_warned) {
+                    execmem_warned = true;
+                    zapi.logMessage(.Warning, "zexpr.Expr: executable memory allocation denied; falling back to scalar LUT");
+                }
+                planes[p] = .{ .lut_unshared = lut };
+            } else {
+                const entry = cache_blk: {
+                    var exec: plane_cache.CompiledPlane = .{ .lut = lut };
+                    errdefer exec.deinit(allocator, rt_ptr);
+                    break :cache_blk try global_plane_cache.putOrGet(allocator, plane_keys[p], exec);
+                };
+                planes[p] = .{ .cached = entry };
+            }
             continue;
         }
 
@@ -510,8 +567,8 @@ fn createImpl(
         // Try JIT when enabled and supported for this plane.
         var compiled_kernel: ?aj.CompiledKernel = null;
         var jit_execmem_denied = false;
-        if (rt != null) {
-            if (codegen.compilePlane(allocator, &rt.?, cpu, &prog, &info, .{
+        if (rt_ptr) |runtime| {
+            if (codegen.compilePlane(allocator, runtime, cpu, &prog, &info, .{
                 .width = pw,
                 .height = ph,
                 .src_fmts = src_fmts,
@@ -541,8 +598,13 @@ fn createImpl(
         if (compiled_kernel) |kernel| {
             prog.deinit(allocator);
             owns_props = false;
-            planes[p] = .{ .jit = .{ .kernel = kernel, .props = prop_bindings } };
-        } else if (!force_scalar and (rt == null or jit_execmem_denied) and info.fallback_lut_kind != .none) {
+            const entry = cache_blk: {
+                var exec: plane_cache.CompiledPlane = .{ .jit = .{ .kernel = kernel, .props = prop_bindings } };
+                errdefer exec.deinit(allocator, rt_ptr);
+                break :cache_blk try global_plane_cache.putOrGet(allocator, plane_keys[p], exec);
+            };
+            planes[p] = .{ .cached = entry };
+        } else if (!force_scalar and (rt_ptr == null or jit_execmem_denied) and info.fallback_lut_kind != .none) {
             // M1: when executable memory is unavailable and the plane can be served by a scalar table,
             // build the table (via scalar oracle, no JIT) instead of dropping to the per-pixel interpreter.
             info.lut_kind = info.fallback_lut_kind;
@@ -563,12 +625,11 @@ fn createImpl(
             prog.deinit(allocator);
             common.freePropBindings(allocator, prop_bindings);
             owns_props = false;
-            planes[p] = .{ .lut = lut };
+            planes[p] = .{ .lut_unshared = lut };
         } else {
             owns_props = false;
             planes[p] = .{ .scalar = .{ .prog = prog, .props = prop_bindings } };
         }
-        built_planes += 1;
     }
 
     const deps = try allocator.alloc(vs.FilterDependency, nodes.len);
@@ -578,7 +639,6 @@ fn createImpl(
     owns_nodes = false;
     owns_src_fmts = false;
     owns_clip_nf = false;
-    owns_rt = false;
     owns_planes = false;
     data.* = .{
         .nodes = nodes,
@@ -587,7 +647,6 @@ fn createImpl(
         .out_vi = out_vi,
         .dst_fmt = dst_fmt,
         .profile = profile,
-        .rt = rt,
         .planes = planes,
         .num_planes = num_planes,
     };
