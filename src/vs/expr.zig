@@ -767,11 +767,7 @@ fn exprGetFrameDynamic(
             .profile = d.profile,
             .resolved_builtins = resolved_vals,
         };
-        var dim_key = plane_key;
-        dim_key.width = 0;
-        dim_key.height = 0;
-
-        const entry: *plane_cache.Entry = global_plane_cache.getOrDim(plane_key, dim_key) orelse
+        const entry: *plane_cache.Entry = global_plane_cache.getOrDim(plane_key) orelse
             (compileDynamicPlane(
                 zapi,
                 dyn,
@@ -1004,10 +1000,7 @@ fn compileSinglePlane(
     builtin_ctx: ?*const builtins.ResolveContext,
 ) (common.ArgError || std.mem.Allocator.Error)!SinglePlaneExec {
     if (!force_scalar) {
-        var dim_key = plane_key;
-        dim_key.width = 0;
-        dim_key.height = 0;
-        if (global_plane_cache.getOrDim(plane_key, dim_key)) |entry| {
+        if (global_plane_cache.getOrDim(plane_key)) |entry| {
             return .{ .cached = entry };
         }
     }
@@ -1425,10 +1418,7 @@ fn createImpl(
                 .profile = profile,
             };
             if (!force_scalar) {
-                var dim_key = plane_keys[p];
-                dim_key.width = 0;
-                dim_key.height = 0;
-                if (global_plane_cache.getOrDim(plane_keys[p], dim_key)) |entry| {
+                if (global_plane_cache.getOrDim(plane_keys[p])) |entry| {
                     planes[p] = .{ .single = .{ .cached = entry } };
                     continue;
                 }

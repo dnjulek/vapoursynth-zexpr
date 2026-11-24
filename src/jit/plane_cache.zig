@@ -14,10 +14,9 @@ const cpu_mod = @import("cpu.zig");
 const lut_mod = @import("lut.zig");
 
 pub const default_capacity: usize = 512;
-/// 16 MiB LUT byte budget (matches the old 64 x 256 KiB worst case while allowing up to 512 small JIT entries).
+/// 16 MiB cache-retained LUT payload budget (independent of evicted-but-pinned filter entries
+/// or AsmJit executable mappings; allows up to 512 small JIT entries alongside large LUTs).
 pub const default_max_lut_bytes: usize = 16 * 1024 * 1024;
-
-const cache_io: std.Io = std.Io.Threaded.global_single_threaded.io();
 
 pub const PropBinding = struct {
     clip: ast.ClipId,
@@ -98,7 +97,8 @@ pub const Entry = struct {
     key: Key,
     exec: CompiledPlane,
     ref_count: usize,
-    last_used: u64,
+    /// Intrusive singly-linked list used only after eviction to destroy dead entries outside the lock.
+    next_dead: ?*Entry = null,
 };
 
 /// Heap-allocated fallback scalar program so `SinglePlaneExec` stays pointer-sized (16 bytes).
@@ -184,31 +184,246 @@ pub const RuntimeAcquireResult = union(enum) {
     closed,
 };
 
+pub const HashPair = struct {
+    exact: u64,
+    dim_free: u64,
+};
+
+fn defaultHashPair(k: Key) HashPair {
+    const base = hashBase(k);
+    const h_exact = mixDims(base, k.width, k.height);
+    const h_dim = if (k.width == 0 and k.height == 0) h_exact else mixDims(base, 0, 0);
+    return .{ .exact = h_exact, .dim_free = h_dim };
+}
+
 pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: usize) type {
-    comptime std.debug.assert(capacity > 0);
+    return PlaneCacheCustom(capacity, max_lut_bytes, defaultHashPair);
+}
+
+pub fn PlaneCacheCustom(
+    comptime capacity: usize,
+    comptime max_lut_bytes: usize,
+    comptime hash_pair_fn: fn (Key) HashPair,
+) type {
+    comptime std.debug.assert(capacity > 0 and capacity <= std.math.maxInt(u16) - 1);
+    const none_idx: u16 = std.math.maxInt(u16);
+    const table_size: usize = std.math.ceilPowerOfTwoAssert(usize, capacity * 2);
+    const table_mask: usize = table_size - 1;
+
+    const SlotMeta = struct {
+        entry: ?*Entry = null,
+        hash: u64 = 0,
+        prev_lru: u16 = none_idx,
+        next_lru: u16 = none_idx,
+        prev_lut: u16 = none_idx,
+        next_lut: u16 = none_idx,
+        next_free: u16 = none_idx,
+        lut_bytes: usize = 0,
+    };
+
     return struct {
         const Self = @This();
+        pub const hash_table_size = table_size;
 
         mutex: std.Io.Mutex = .init,
         state: CacheState = .open,
         rt: ?aj.Runtime = null,
         live_external_refs: usize = 0,
         active_rt_users: usize = 0,
-        /// Packed active entries in `slots[0..count]` with parallel `hashes[0..count]` so lookups
-        /// scan only live entries without chasing cold pointers on hash misses.
-        slots: [capacity]?*Entry = @splat(null),
-        hashes: [capacity]u64 = @splat(0),
+
+        /// Open-addressed hash index (`0` = empty, `slot + 1` = occupied) with backward-shift
+        /// deletion (zero tombstones, load factor <= 0.50).
+        index: [table_size]u16 = @splat(0),
+        slots: [capacity]SlotMeta = @splat(.{}),
+        next_fresh_slot: u16 = 0,
+        free_head: u16 = none_idx,
+        lru_head: u16 = none_idx,
+        lru_tail: u16 = none_idx,
+        lut_head: u16 = none_idx,
+        lut_tail: u16 = none_idx,
         count: usize = 0,
         lut_bytes: usize = 0,
-        stamp: u64 = 0,
         hits: u64 = 0,
         misses: u64 = 0,
+
+        inline fn lock(self: *Self) void {
+            std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+        }
+
+        inline fn unlock(self: *Self) void {
+            std.Io.Threaded.mutexUnlock(&self.mutex);
+        }
+
+        fn allocSlotLocked(self: *Self) u16 {
+            if (self.free_head != none_idx) {
+                const s = self.free_head;
+                self.free_head = self.slots[s].next_free;
+                self.slots[s].next_free = none_idx;
+                return s;
+            }
+            std.debug.assert(self.next_fresh_slot < capacity);
+            const s = self.next_fresh_slot;
+            self.next_fresh_slot += 1;
+            return s;
+        }
+
+        fn freeSlotLocked(self: *Self, s: u16) void {
+            self.slots[s] = .{ .next_free = self.free_head };
+            self.free_head = s;
+        }
+
+        fn lruPushFrontLocked(self: *Self, s: u16) void {
+            self.slots[s].prev_lru = none_idx;
+            self.slots[s].next_lru = self.lru_head;
+            if (self.lru_head != none_idx) {
+                self.slots[self.lru_head].prev_lru = s;
+            } else {
+                self.lru_tail = s;
+            }
+            self.lru_head = s;
+        }
+
+        fn lruUnlinkLocked(self: *Self, s: u16) void {
+            const p = self.slots[s].prev_lru;
+            const n = self.slots[s].next_lru;
+            if (p != none_idx) {
+                self.slots[p].next_lru = n;
+            } else {
+                self.lru_head = n;
+            }
+            if (n != none_idx) {
+                self.slots[n].prev_lru = p;
+            } else {
+                self.lru_tail = p;
+            }
+            self.slots[s].prev_lru = none_idx;
+            self.slots[s].next_lru = none_idx;
+        }
+
+        fn lruMoveToFrontLocked(self: *Self, s: u16) void {
+            if (self.lru_head == s) return;
+            self.lruUnlinkLocked(s);
+            self.lruPushFrontLocked(s);
+        }
+
+        fn lutPushFrontLocked(self: *Self, s: u16) void {
+            self.slots[s].prev_lut = none_idx;
+            self.slots[s].next_lut = self.lut_head;
+            if (self.lut_head != none_idx) {
+                self.slots[self.lut_head].prev_lut = s;
+            } else {
+                self.lut_tail = s;
+            }
+            self.lut_head = s;
+        }
+
+        fn lutUnlinkLocked(self: *Self, s: u16) void {
+            const p = self.slots[s].prev_lut;
+            const n = self.slots[s].next_lut;
+            if (p != none_idx) {
+                self.slots[p].next_lut = n;
+            } else {
+                self.lut_head = n;
+            }
+            if (n != none_idx) {
+                self.slots[n].prev_lut = p;
+            } else {
+                self.lut_tail = p;
+            }
+            self.slots[s].prev_lut = none_idx;
+            self.slots[s].next_lut = none_idx;
+        }
+
+        fn lutMoveToFrontLocked(self: *Self, s: u16) void {
+            if (self.lut_head == s) return;
+            self.lutUnlinkLocked(s);
+            self.lutPushFrontLocked(s);
+        }
+
+        fn touchLocked(self: *Self, s: u16) void {
+            self.lruMoveToFrontLocked(s);
+            if (self.slots[s].lut_bytes > 0) {
+                self.lutMoveToFrontLocked(s);
+            }
+        }
+
+        fn findSlotLocked(self: *const Self, h: u64, key: Key) ?u16 {
+            var pos: usize = @truncate(h & table_mask);
+            while (true) {
+                const raw = self.index[pos];
+                if (raw == 0) return null;
+                const s = raw - 1;
+                if (self.slots[s].hash == h and keyEql(self.slots[s].entry.?.key, key)) {
+                    return s;
+                }
+                pos = (pos + 1) & table_mask;
+            }
+        }
+
+        fn indexInsertLocked(self: *Self, s: u16, h: u64) void {
+            var pos: usize = @truncate(h & table_mask);
+            while (self.index[pos] != 0) {
+                pos = (pos + 1) & table_mask;
+            }
+            self.index[pos] = s + 1;
+        }
+
+        fn indexRemoveLocked(self: *Self, s: u16, h: u64) void {
+            const target: u16 = s + 1;
+            var hole: usize = @truncate(h & table_mask);
+            while (self.index[hole] != target) {
+                std.debug.assert(self.index[hole] != 0);
+                hole = (hole + 1) & table_mask;
+            }
+            var cur = (hole + 1) & table_mask;
+            while (self.index[cur] != 0) {
+                const cand_slot = self.index[cur] - 1;
+                const ideal: usize = @truncate(self.slots[cand_slot].hash & table_mask);
+                // Shift `cur` backward into `hole` iff `hole` lies cyclically in `[ideal, cur)`.
+                if (((hole -% ideal) & table_mask) < ((cur -% ideal) & table_mask)) {
+                    self.index[hole] = self.index[cur];
+                    hole = cur;
+                }
+                cur = (cur + 1) & table_mask;
+            }
+            self.index[hole] = 0;
+        }
+
+        fn evictSlotLocked(self: *Self, s: u16, dead_head: *?*Entry) void {
+            const meta = self.slots[s];
+            const e = meta.entry.?;
+            self.indexRemoveLocked(s, meta.hash);
+            self.lruUnlinkLocked(s);
+            if (meta.lut_bytes > 0) {
+                self.lutUnlinkLocked(s);
+                self.lut_bytes -= meta.lut_bytes;
+            }
+            self.count -= 1;
+            self.freeSlotLocked(s);
+            e.ref_count -= 1;
+            if (e.ref_count == 0) {
+                e.next_dead = dead_head.*;
+                dead_head.* = e;
+            }
+        }
+
+        fn resetStorageLocked(self: *Self) void {
+            @memset(&self.index, 0);
+            self.next_fresh_slot = 0;
+            self.free_head = none_idx;
+            self.lru_head = none_idx;
+            self.lru_tail = none_idx;
+            self.lut_head = none_idx;
+            self.lut_tail = none_idx;
+            self.count = 0;
+            self.lut_bytes = 0;
+        }
 
         /// Lazily initialize the shared `aj.Runtime` and acquire an in-flight lease that keeps
         /// the runtime alive across compilation and insertion until `releaseRuntime()` is called.
         pub fn acquireRuntime(self: *Self) RuntimeAcquireResult {
-            self.mutex.lockUncancelable(cache_io);
-            defer self.mutex.unlock(cache_io);
+            self.lock();
+            defer self.unlock();
             if (self.state == .closed) return .closed;
             if (self.rt == null) {
                 self.rt = aj.Runtime.init() catch null;
@@ -220,8 +435,8 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
 
         /// Release one in-flight runtime lease acquired via `acquireRuntime()`.
         pub fn releaseRuntime(self: *Self) void {
-            self.mutex.lockUncancelable(cache_io);
-            defer self.mutex.unlock(cache_io);
+            self.lock();
+            defer self.unlock();
             std.debug.assert(self.active_rt_users > 0);
             self.active_rt_users -= 1;
         }
@@ -230,20 +445,50 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
             return if (self.rt != null) &self.rt.? else null;
         }
 
-        /// Look up a compiled plane by key. On hit, increments `ref_count` and
-        /// returns the entry (caller must release it with `release`).
+        /// Look up a compiled plane by exact key. On hit, moves the entry to MRU,
+        /// increments `ref_count`, and returns it (caller must release it with `release`).
         pub fn get(self: *Self, key: Key) ?*Entry {
-            const h = hashKey(key);
-            self.mutex.lockUncancelable(cache_io);
-            defer self.mutex.unlock(cache_io);
+            const h = hash_pair_fn(key).exact;
+            self.lock();
+            defer self.unlock();
             if (self.state == .closed) return null;
 
-            for (0..self.count) |i| {
-                if (self.hashes[i] != h) continue;
-                const e = self.slots[i].?;
-                if (keyEql(e.key, key)) {
-                    self.stamp +%= 1;
-                    e.last_used = self.stamp;
+            if (self.findSlotLocked(h, key)) |s| {
+                self.touchLocked(s);
+                const e = self.slots[s].entry.?;
+                e.ref_count += 1;
+                self.live_external_refs += 1;
+                self.hits += 1;
+                return e;
+            }
+            self.misses += 1;
+            return null;
+        }
+
+        /// Single-lock lookup preferring an exact `(width, height)` match and falling back
+        /// to a dimension-free (`0x0`) LUT entry, hashing the key prefix only once.
+        pub fn getOrDim(self: *Self, key: Key) ?*Entry {
+            const hp = hash_pair_fn(key);
+            const has_dims = key.width != 0 or key.height != 0;
+            self.lock();
+            defer self.unlock();
+            if (self.state == .closed) return null;
+
+            if (self.findSlotLocked(hp.exact, key)) |s| {
+                self.touchLocked(s);
+                const e = self.slots[s].entry.?;
+                e.ref_count += 1;
+                self.live_external_refs += 1;
+                self.hits += 1;
+                return e;
+            }
+            if (has_dims) {
+                var dim_key = key;
+                dim_key.width = 0;
+                dim_key.height = 0;
+                if (self.findSlotLocked(hp.dim_free, dim_key)) |s| {
+                    self.touchLocked(s);
+                    const e = self.slots[s].entry.?;
                     e.ref_count += 1;
                     self.live_external_refs += 1;
                     self.hits += 1;
@@ -254,55 +499,15 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
             return null;
         }
 
-        /// Single-lock lookup preferring an exact `(width, height)` match and falling back
-        /// to a dimension-free (`0x0`) LUT entry in the same pass over live entries.
-        pub fn getOrDim(self: *Self, key: Key, dim_key: Key) ?*Entry {
-            const h_exact = hashKey(key);
-            const h_dim = hashKey(dim_key);
-            self.mutex.lockUncancelable(cache_io);
-            defer self.mutex.unlock(cache_io);
-            if (self.state == .closed) return null;
-
-            var dim_hit: ?*Entry = null;
-            for (0..self.count) |i| {
-                const hi = self.hashes[i];
-                if (hi == h_exact) {
-                    const e = self.slots[i].?;
-                    if (keyEql(e.key, key)) {
-                        self.stamp +%= 1;
-                        e.last_used = self.stamp;
-                        e.ref_count += 1;
-                        self.live_external_refs += 1;
-                        self.hits += 1;
-                        return e;
-                    }
-                }
-                if (dim_hit == null and hi == h_dim) {
-                    const e = self.slots[i].?;
-                    if (keyEql(e.key, dim_key)) {
-                        dim_hit = e;
-                    }
-                }
-            }
-            if (dim_hit) |e| {
-                self.stamp +%= 1;
-                e.last_used = self.stamp;
-                e.ref_count += 1;
-                self.live_external_refs += 1;
-                self.hits += 1;
-                return e;
-            }
-            self.misses += 1;
-            return null;
-        }
-
         /// Insert a freshly compiled plane into the LRU cache (taking ownership of
         /// `exec` on success) and return a refcounted handle for the caller.
         /// If another thread inserted the same key concurrently, destroys the
         /// duplicate `exec` and returns a handle to the existing entry.
+        /// If a single LUT payload exceeds `max_lut_bytes`, bypasses cache admission
+        /// without evicting healthy entries and returns a caller-only entry (`ref_count = 1`).
         /// On `OutOfMemory` or `CacheClosed`, leaves `exec` untouched in caller ownership.
         pub fn putOrGet(self: *Self, allocator: std.mem.Allocator, key: Key, exec: CompiledPlane) PutError!*Entry {
-            const h = hashKey(key);
+            const h = hash_pair_fn(key).exact;
             const new_lut_bytes = entryLutBytes(&exec);
 
             const owned_expr = try allocator.dupe(u8, key.expr);
@@ -326,97 +531,77 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
             owned_key.resolved_builtins = owned_builtins;
 
             var duplicate_exec: ?CompiledPlane = null;
-            var dead_buf: [capacity]*Entry = undefined;
-            var dead_count: usize = 0;
+            var dead_head: ?*Entry = null;
             var rt_ptr: ?*aj.Runtime = null;
             var held_rt_user = false;
 
             const result: *Entry = blk: {
-                self.mutex.lockUncancelable(cache_io);
-                defer self.mutex.unlock(cache_io);
+                self.lock();
+                defer self.unlock();
                 if (self.state == .closed) return error.CacheClosed;
                 rt_ptr = self.runtimePtrLocked();
 
-                for (0..self.count) |i| {
-                    if (self.hashes[i] != h) continue;
-                    const e = self.slots[i].?;
-                    if (keyEql(e.key, key)) {
-                        self.stamp +%= 1;
-                        e.last_used = self.stamp;
-                        e.ref_count += 1;
-                        self.live_external_refs += 1;
-                        duplicate_exec = exec;
-                        self.active_rt_users += 1;
-                        held_rt_user = true;
-                        break :blk e;
-                    }
+                if (self.findSlotLocked(h, key)) |s| {
+                    self.touchLocked(s);
+                    const e = self.slots[s].entry.?;
+                    e.ref_count += 1;
+                    self.live_external_refs += 1;
+                    duplicate_exec = exec;
+                    self.active_rt_users += 1;
+                    held_rt_user = true;
+                    break :blk e;
                 }
 
-                // Enforce the LUT byte cap by evicting LRU LUT entries before touching small JIT entries.
+                // Oversize-admission bypass: a single LUT larger than the retention budget is
+                // returned with caller-only ownership instead of wiping healthy cached entries.
+                if (new_lut_bytes > max_lut_bytes) {
+                    new_entry.* = .{
+                        .hash = h,
+                        .key = owned_key,
+                        .exec = exec,
+                        .ref_count = 1,
+                        .next_dead = null,
+                    };
+                    self.live_external_refs += 1;
+                    break :blk new_entry;
+                }
+
+                // Enforce the retained LUT byte cap in O(1) per evicted LUT without touching JIT entries.
                 if (new_lut_bytes > 0) {
                     while (self.lut_bytes + new_lut_bytes > max_lut_bytes) {
-                        var lru_lut_idx: ?usize = null;
-                        var min_used: u64 = std.math.maxInt(u64);
-                        for (0..self.count) |i| {
-                            const e = self.slots[i].?;
-                            if (entryLutBytes(&e.exec) == 0) continue;
-                            if (lru_lut_idx == null or e.last_used < min_used) {
-                                min_used = e.last_used;
-                                lru_lut_idx = i;
-                            }
-                        }
-                        const idx = lru_lut_idx orelse break;
-                        const evicted = self.slots[idx].?;
-                        self.lut_bytes -= entryLutBytes(&evicted.exec);
-                        evicted.ref_count -= 1;
-                        if (evicted.ref_count == 0) {
-                            dead_buf[dead_count] = evicted;
-                            dead_count += 1;
-                        }
-                        const last = self.count - 1;
-                        self.slots[idx] = self.slots[last];
-                        self.hashes[idx] = self.hashes[last];
-                        self.slots[last] = null;
-                        self.hashes[last] = 0;
-                        self.count = last;
+                        std.debug.assert(self.lut_tail != none_idx);
+                        self.evictSlotLocked(self.lut_tail, &dead_head);
                     }
                 }
 
-                var target_slot: usize = self.count;
+                // Enforce the total slot cap in O(1) via global LRU tail.
                 if (self.count == capacity) {
-                    var min_used = self.slots[0].?.last_used;
-                    target_slot = 0;
-                    for (1..self.count) |i| {
-                        const e = self.slots[i].?;
-                        if (e.last_used < min_used) {
-                            min_used = e.last_used;
-                            target_slot = i;
-                        }
-                    }
-                    const evicted = self.slots[target_slot].?;
-                    self.lut_bytes -= entryLutBytes(&evicted.exec);
-                    evicted.ref_count -= 1;
-                    if (evicted.ref_count == 0) {
-                        dead_buf[dead_count] = evicted;
-                        dead_count += 1;
-                    }
-                } else {
-                    self.count += 1;
+                    std.debug.assert(self.lru_tail != none_idx);
+                    self.evictSlotLocked(self.lru_tail, &dead_head);
                 }
 
-                self.stamp +%= 1;
+                const slot = self.allocSlotLocked();
                 new_entry.* = .{
                     .hash = h,
                     .key = owned_key,
                     .exec = exec,
                     .ref_count = 2, // 1 for cache slot + 1 for caller
-                    .last_used = self.stamp,
+                    .next_dead = null,
                 };
-                self.slots[target_slot] = new_entry;
-                self.hashes[target_slot] = h;
-                self.lut_bytes += new_lut_bytes;
+                self.slots[slot] = .{
+                    .entry = new_entry,
+                    .hash = h,
+                    .lut_bytes = new_lut_bytes,
+                };
+                self.indexInsertLocked(slot, h);
+                self.lruPushFrontLocked(slot);
+                if (new_lut_bytes > 0) {
+                    self.lutPushFrontLocked(slot);
+                    self.lut_bytes += new_lut_bytes;
+                }
+                self.count += 1;
                 self.live_external_refs += 1;
-                if (dead_count > 0) {
+                if (dead_head != null) {
                     self.active_rt_users += 1;
                     held_rt_user = true;
                 }
@@ -431,14 +616,17 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
                 if (owned_builtins.len > 0) allocator.free(owned_builtins);
                 allocator.destroy(new_entry);
             }
-            for (dead_buf[0..dead_count]) |dead| {
+            var cur_dead = dead_head;
+            while (cur_dead) |dead| {
+                const next = dead.next_dead;
                 destroyEntry(allocator, dead, rt_ptr);
+                cur_dead = next;
             }
             return result;
         }
 
         /// Drop one caller reference to `entry`. Destroys the entry once evicted
-        /// from the cache and no active filters hold a reference.
+        /// (or uncached due to oversize bypass) and no active filters hold a reference.
         pub fn release(self: *Self, allocator: std.mem.Allocator, entry: *Entry) void {
             self.releaseImpl(allocator, entry, null, null);
         }
@@ -453,8 +641,8 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
             var destroy = false;
             var rt_ptr: ?*aj.Runtime = null;
             {
-                self.mutex.lockUncancelable(cache_io);
-                defer self.mutex.unlock(cache_io);
+                self.lock();
+                defer self.unlock();
                 std.debug.assert(entry.ref_count > 0);
                 std.debug.assert(self.live_external_refs > 0);
                 entry.ref_count -= 1;
@@ -480,23 +668,24 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
         /// runtime user is active (dirty process exit).
         pub fn shutdown(self: *Self, allocator: std.mem.Allocator) bool {
             if (!self.mutex.tryLock()) return false;
-            defer self.mutex.unlock(cache_io);
+            defer self.unlock();
             if (self.state == .closed) return false;
             if (self.live_external_refs != 0 or self.active_rt_users != 0) return false;
 
             self.state = .closed;
-            for (0..self.count) |i| {
-                const e = self.slots[i].?;
+            var s = self.lru_head;
+            while (s != none_idx) {
+                const next = self.slots[s].next_lru;
+                const e = self.slots[s].entry.?;
                 e.ref_count -= 1;
                 std.debug.assert(e.ref_count == 0);
                 // Pass `rt = null` so per-kernel `Runtime.release` (and its internal lock) is
                 // skipped; `self.rt.deinit()` reclaims all executable blocks in one bulk reset.
                 destroyEntry(allocator, e, null);
-                self.slots[i] = null;
-                self.hashes[i] = 0;
+                self.slots[s] = .{};
+                s = next;
             }
-            self.count = 0;
-            self.lut_bytes = 0;
+            self.resetStorageLocked();
             if (self.rt) |*r| {
                 r.deinit();
                 self.rt = null;
@@ -507,21 +696,22 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
         /// Release all cached entries and the shared `JitRuntime` (for tests;
         /// callers must have released all active entries and runtime leases first).
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            self.mutex.lockUncancelable(cache_io);
-            defer self.mutex.unlock(cache_io);
+            self.lock();
+            defer self.unlock();
             std.debug.assert(self.live_external_refs == 0);
             std.debug.assert(self.active_rt_users == 0);
             self.state = .closed;
-            for (0..self.count) |i| {
-                const e = self.slots[i].?;
+            var s = self.lru_head;
+            while (s != none_idx) {
+                const next = self.slots[s].next_lru;
+                const e = self.slots[s].entry.?;
                 e.ref_count -= 1;
                 std.debug.assert(e.ref_count == 0);
                 destroyEntry(allocator, e, null);
-                self.slots[i] = null;
-                self.hashes[i] = 0;
+                self.slots[s] = .{};
+                s = next;
             }
-            self.count = 0;
-            self.lut_bytes = 0;
+            self.resetStorageLocked();
             if (self.rt) |*r| {
                 r.deinit();
                 self.rt = null;
@@ -538,7 +728,9 @@ fn destroyEntry(allocator: std.mem.Allocator, entry: *Entry, rt: ?*aj.Runtime) v
     allocator.destroy(entry);
 }
 
-fn hashKey(k: Key) u64 {
+/// Hash all dimension-independent key fields once so `getOrDim` derives exact and `0x0`
+/// hashes without re-hashing `expr`, `src_fmts`, or `resolved_builtins`.
+fn hashBase(k: Key) u64 {
     var h = std.hash.Wyhash.init(0);
     h.update(std.mem.asBytes(&k.expr.len));
     h.update(k.expr);
@@ -549,8 +741,6 @@ fn hashKey(k: Key) u64 {
     }
     const packed_dst: u16 = (@as(u16, @intFromBool(k.dst_fmt.is_float)) << 8) | k.dst_fmt.bits_per_sample;
     h.update(std.mem.asBytes(&packed_dst));
-    h.update(std.mem.asBytes(&k.width));
-    h.update(std.mem.asBytes(&k.height));
     const flags: u8 =
         (@as(u8, @intFromBool(k.opt_int)) << 0) |
         (@as(u8, @backingInt(k.default_boundary)) << 1) |
@@ -576,6 +766,17 @@ fn hashKey(k: Key) u64 {
         bv.hashInto(&h);
     }
     return h.final();
+}
+
+fn mixDims(base: u64, width: usize, height: usize) u64 {
+    var h = std.hash.Wyhash.init(base);
+    h.update(std.mem.asBytes(&width));
+    h.update(std.mem.asBytes(&height));
+    return h.final();
+}
+
+fn hashKey(k: Key) u64 {
+    return mixDims(hashBase(k), k.width, k.height);
 }
 
 fn fmtEql(a: ast.SampleFormat, b: ast.SampleFormat) bool {
@@ -1127,10 +1328,7 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
         .cpu = cpu,
         .profile = profile,
     };
-    var dim_lut2 = exact_lut2;
-    dim_lut2.width = 0;
-    dim_lut2.height = 0;
-    const lut_hit = cache.getOrDim(exact_lut2, dim_lut2) orelse return error.TestUnexpectedResult;
+    const lut_hit = cache.getOrDim(exact_lut2) orelse return error.TestUnexpectedResult;
     defer cache.release(alloc, lut_hit);
     try std.testing.expectEqual(e_lut2, lut_hit);
 }
@@ -1285,9 +1483,9 @@ test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy
     {
         var cache: PlaneCache(2) = .{};
         defer cache.deinit(alloc);
-        cache.mutex.lockUncancelable(cache_io);
+        cache.lock();
         try std.testing.expect(!cache.shutdown(alloc));
-        cache.mutex.unlock(cache_io);
+        cache.unlock();
         try std.testing.expectEqual(CacheState.open, cache.state);
         try std.testing.expect(cache.shutdown(alloc));
     }
@@ -1302,10 +1500,7 @@ test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy
 
         try std.testing.expectEqual(RuntimeAcquireResult.closed, cache.acquireRuntime());
         try std.testing.expect(cache.get(base_key) == null);
-        var dim_key = base_key;
-        dim_key.width = 0;
-        dim_key.height = 0;
-        try std.testing.expect(cache.getOrDim(base_key, dim_key) == null);
+        try std.testing.expect(cache.getOrDim(base_key) == null);
 
         var sp = try parser.parse(alloc, "x 1 +", .{ .mode = .expr, .num_clips = 1 });
         var owns_sp = true;
@@ -1322,4 +1517,323 @@ test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy
         try std.testing.expectEqual(@as(usize, 0), cache.count);
         try std.testing.expectEqual(@as(usize, 0), cache.live_external_refs);
     }
+}
+
+test "PlaneCacheCustom matches reference model under wrap-around clusters, exact/0x0 hash collisions, and multi-LUT eviction" {
+    const parser = @import("../expr/parser.zig");
+    const alloc = std.testing.allocator;
+    const cpu = cpu_mod.detectWithOverride(null);
+    const profile = interp.TargetProfile.fromCpu(cpu);
+    const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
+    const src_fmts = [_]ast.SampleFormat{u8_fmt};
+
+    // Deliberately hash everything into bucket 6 or 7 of an 8-bucket table (capacity=4, table_size=8)
+    // to force clusters that wrap across index 7 -> 0 -> 1 -> 2, and force exact == dim_free hash collisions!
+    const wrapCollideHash = struct {
+        fn run(k: Key) HashPair {
+            const bucket: u64 = if (k.expr.len > 0 and (k.expr[0] & 1) == 0) 7 else 6;
+            const h: u64 = (bucket | (0x5a00 + @as(u64, k.expr.len % 2) * 0x100));
+            return .{ .exact = h, .dim_free = h };
+        }
+    }.run;
+
+    const TestCache = PlaneCacheCustom(4, 300, wrapCollideHash);
+    var cache: TestCache = .{};
+    defer cache.deinit(alloc);
+
+    const RefEntry = struct {
+        expr: []const u8,
+        w: usize,
+        h: usize,
+        lut_bytes: usize,
+        ptr: *Entry,
+    };
+    var ref_all: std.ArrayList(RefEntry) = .empty;
+    defer ref_all.deinit(alloc);
+
+    const makeKey = struct {
+        fn k(expr_s: []const u8, w: usize, h: usize, c_info: cpu_mod.CpuInfo, prof: interp.TargetProfile) Key {
+            return .{
+                .expr = expr_s,
+                .src_fmts = &src_fmts,
+                .dst_fmt = u8_fmt,
+                .width = w,
+                .height = h,
+                .opt_int = false,
+                .default_boundary = .clamp,
+                .cpu = c_info,
+                .profile = prof,
+            };
+        }
+    }.k;
+
+    const makeExec = struct {
+        fn build(a: std.mem.Allocator, expr_s: []const u8, lut_len: usize) !CompiledPlane {
+            if (lut_len > 0) {
+                const tbl = try a.alignedAlloc(u8, .@"64", lut_len);
+                @memset(tbl, 0);
+                return .{ .lut = .{
+                    .kind = .lut1d_u8,
+                    .clips = .{ 0, 0 },
+                    .dst_fmt = u8_fmt,
+                    .table = tbl,
+                    .simd_kernel = null,
+                } };
+            }
+            var pr = try parser.parse(a, expr_s, .{ .mode = .expr, .num_clips = 1 });
+            errdefer pr.deinit(a);
+            const props = try buildPropBindings(a, &pr);
+            return .{ .scalar = .{ .prog = pr, .props = props } };
+        }
+    }.build;
+
+    const verifyModel = struct {
+        fn check(c: *const TestCache, ref: []const RefEntry) !void {
+            const none_idx: u16 = std.math.maxInt(u16);
+            try std.testing.expectEqual(ref.len, c.count);
+
+            // 1. Check global LRU forward (head -> tail) AND backward (tail -> head).
+            var idx: usize = 0;
+            var cur = c.lru_head;
+            var prev: u16 = none_idx;
+            var ref_lut_total: usize = 0;
+            while (cur != none_idx) : (idx += 1) {
+                try std.testing.expect(idx < ref.len);
+                try std.testing.expectEqual(prev, c.slots[cur].prev_lru);
+                try std.testing.expectEqual(ref[idx].ptr, c.slots[cur].entry.?);
+                try std.testing.expectEqual(ref[idx].lut_bytes, c.slots[cur].lut_bytes);
+                ref_lut_total += ref[idx].lut_bytes;
+                prev = cur;
+                cur = c.slots[cur].next_lru;
+            }
+            try std.testing.expectEqual(ref.len, idx);
+            try std.testing.expectEqual(prev, c.lru_tail);
+            try std.testing.expectEqual(ref_lut_total, c.lut_bytes);
+
+            // 2. Check LUT-only LRU forward AND backward order matches relative order of LUTs in `ref`.
+            var lut_cur = c.lut_head;
+            var lut_prev: u16 = none_idx;
+            for (ref) |re| {
+                if (re.lut_bytes == 0) continue;
+                try std.testing.expect(lut_cur != none_idx);
+                try std.testing.expectEqual(lut_prev, c.slots[lut_cur].prev_lut);
+                try std.testing.expectEqual(re.ptr, c.slots[lut_cur].entry.?);
+                lut_prev = lut_cur;
+                lut_cur = c.slots[lut_cur].next_lut;
+            }
+            try std.testing.expectEqual(none_idx, lut_cur);
+            try std.testing.expectEqual(lut_prev, c.lut_tail);
+
+            // 3. Verify open-addressed table probe integrity for every live slot (no broken backward-shift chains).
+            var occupied_buckets: usize = 0;
+            for (c.index) |raw| {
+                if (raw != 0) occupied_buckets += 1;
+            }
+            try std.testing.expectEqual(ref.len, occupied_buckets);
+            for (ref) |re| {
+                const k = re.ptr.key;
+                const found = c.findSlotLocked(re.ptr.hash, k) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(re.ptr, c.slots[found].entry.?);
+            }
+        }
+    }.check;
+
+    const refTouch = struct {
+        fn run(ref: *std.ArrayList(RefEntry), ptr: *Entry) void {
+            for (ref.items, 0..) |item, i| {
+                if (item.ptr == ptr) {
+                    const saved = ref.orderedRemove(i);
+                    ref.insertAssumeCapacity(0, saved);
+                    return;
+                }
+            }
+            unreachable;
+        }
+    }.run;
+
+    const refInsert = struct {
+        fn run(a: std.mem.Allocator, ref: *std.ArrayList(RefEntry), re: RefEntry) !void {
+            if (re.lut_bytes > 0) {
+                while (true) {
+                    var total: usize = 0;
+                    for (ref.items) |it| total += it.lut_bytes;
+                    if (total + re.lut_bytes <= 300) break;
+                    // Evict LRU LUT (last LUT in ref).
+                    var victim: ?usize = null;
+                    var j = ref.items.len;
+                    while (j > 0) {
+                        j -= 1;
+                        if (ref.items[j].lut_bytes > 0) {
+                            victim = j;
+                            break;
+                        }
+                    }
+                    _ = ref.orderedRemove(victim.?);
+                }
+            }
+            if (ref.items.len == 4) {
+                _ = ref.pop();
+            }
+            try ref.insert(a, 0, re);
+        }
+    }.run;
+
+    // Step 1: Insert 0x0 LUT "x 1 +" (100B), 0x0 LUT "x 2 +" (100B), exact JIT "x 1 +" (32x4, collides hash with 0x0!), and JIT "x 3 +" (16x4).
+    const e_lut1 = blk: {
+        var ex = try makeExec(alloc, "x 1 +", 100);
+        errdefer ex.deinit(alloc, null);
+        break :blk try cache.putOrGet(alloc, makeKey("x 1 +", 0, 0, cpu, profile), ex);
+    };
+    try refInsert(alloc, &ref_all, .{ .expr = "x 1 +", .w = 0, .h = 0, .lut_bytes = 100, .ptr = e_lut1 });
+    cache.release(alloc, e_lut1);
+    try verifyModel(&cache, ref_all.items);
+
+    const e_lut2 = blk: {
+        var ex = try makeExec(alloc, "x 2 +", 100);
+        errdefer ex.deinit(alloc, null);
+        break :blk try cache.putOrGet(alloc, makeKey("x 2 +", 0, 0, cpu, profile), ex);
+    };
+    try refInsert(alloc, &ref_all, .{ .expr = "x 2 +", .w = 0, .h = 0, .lut_bytes = 100, .ptr = e_lut2 });
+    cache.release(alloc, e_lut2);
+    try verifyModel(&cache, ref_all.items);
+
+    // Exact (32x4) entry shares hash with 0x0 LUT "x 1 +"!
+    const e_exact1 = blk: {
+        var ex = try makeExec(alloc, "x 1 +", 0);
+        errdefer ex.deinit(alloc, null);
+        break :blk try cache.putOrGet(alloc, makeKey("x 1 +", 32, 4, cpu, profile), ex);
+    };
+    try refInsert(alloc, &ref_all, .{ .expr = "x 1 +", .w = 32, .h = 4, .lut_bytes = 0, .ptr = e_exact1 });
+    cache.release(alloc, e_exact1);
+    try verifyModel(&cache, ref_all.items);
+
+    // Step 2: Verify `getOrDim` prefers exact (32x4) over colliding 0x0, while (64x8) falls back to 0x0!
+    {
+        const hit_exact = cache.getOrDim(makeKey("x 1 +", 32, 4, cpu, profile)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(e_exact1, hit_exact);
+        refTouch(&ref_all, hit_exact);
+        cache.release(alloc, hit_exact);
+        try verifyModel(&cache, ref_all.items);
+
+        const hit_dim = cache.getOrDim(makeKey("x 1 +", 64, 8, cpu, profile)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(e_lut1, hit_dim);
+        refTouch(&ref_all, hit_dim);
+        cache.release(alloc, hit_dim);
+        try verifyModel(&cache, ref_all.items);
+    }
+
+    // Step 3: Insert JIT "x 3 +" -> fills capacity=4 (all wrapped in buckets 6,7,0,1).
+    const e_jit3 = blk: {
+        var ex = try makeExec(alloc, "x 3 +", 0);
+        errdefer ex.deinit(alloc, null);
+        break :blk try cache.putOrGet(alloc, makeKey("x 3 +", 16, 4, cpu, profile), ex);
+    };
+    try refInsert(alloc, &ref_all, .{ .expr = "x 3 +", .w = 16, .h = 4, .lut_bytes = 0, .ptr = e_jit3 });
+    cache.release(alloc, e_jit3);
+    try verifyModel(&cache, ref_all.items);
+
+    // Step 4: Duplicate insert of "x 2 +" (0x0) must dedup, touch both LRU lists, and destroy duplicate cleanly.
+    {
+        var ex = try makeExec(alloc, "x 2 +", 100);
+        errdefer ex.deinit(alloc, null);
+        const dup = try cache.putOrGet(alloc, makeKey("x 2 +", 0, 0, cpu, profile), ex);
+        try std.testing.expectEqual(e_lut2, dup);
+        refTouch(&ref_all, dup);
+        cache.release(alloc, dup);
+        try verifyModel(&cache, ref_all.items);
+    }
+
+    // Step 5: Multi-LUT eviction in ONE insert! Insert a 250B LUT (budget=300B, current=200B -> must evict BOTH e_lut1 and e_lut2!).
+    // This triggers two backward-shift deletions inside a wrapped cluster while preserving e_exact1 and e_jit3!
+    const e_lut3 = blk: {
+        var ex = try makeExec(alloc, "x 4 +", 250);
+        errdefer ex.deinit(alloc, null);
+        break :blk try cache.putOrGet(alloc, makeKey("x 4 +", 0, 0, cpu, profile), ex);
+    };
+    try refInsert(alloc, &ref_all, .{ .expr = "x 4 +", .w = 0, .h = 0, .lut_bytes = 250, .ptr = e_lut3 });
+    cache.release(alloc, e_lut3);
+    try verifyModel(&cache, ref_all.items);
+    try std.testing.expectEqual(@as(usize, 3), cache.count);
+    try std.testing.expectEqual(@as(usize, 250), cache.lut_bytes);
+
+    // Step 6: Insert two more JIT entries to force capacity eviction across wrapped buckets.
+    for ([_][]const u8{ "x 5 +", "x 6 +" }) |expr_s| {
+        const ej = blk: {
+            var ex = try makeExec(alloc, expr_s, 0);
+            errdefer ex.deinit(alloc, null);
+            break :blk try cache.putOrGet(alloc, makeKey(expr_s, 8, 8, cpu, profile), ex);
+        };
+        try refInsert(alloc, &ref_all, .{ .expr = expr_s, .w = 8, .h = 8, .lut_bytes = 0, .ptr = ej });
+        cache.release(alloc, ej);
+        try verifyModel(&cache, ref_all.items);
+    }
+}
+
+test "PlaneCacheWithLutCap bypasses admission for oversized single LUT without evicting healthy entries" {
+    const parser = @import("../expr/parser.zig");
+    const alloc = std.testing.allocator;
+    const cpu = cpu_mod.detectWithOverride(null);
+    const profile = interp.TargetProfile.fromCpu(cpu);
+    const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
+    const src_fmts = [_]ast.SampleFormat{u8_fmt};
+
+    // Configurable 1 KiB LUT cap: 256B LUT fits, 2 KiB LUT exceeds cap -> must bypass without evicting!
+    var cache: PlaneCacheWithLutCap(4, 1024) = .{};
+    defer cache.deinit(alloc);
+
+    const k_small: Key = .{
+        .expr = "x 1 +",
+        .src_fmts = &src_fmts,
+        .dst_fmt = u8_fmt,
+        .width = 0,
+        .height = 0,
+        .opt_int = false,
+        .default_boundary = .clamp,
+        .cpu = cpu,
+        .profile = profile,
+    };
+    const e_small = blk: {
+        const tbl = try alloc.alignedAlloc(u8, .@"64", 256);
+        @memset(tbl, 1);
+        var ex: CompiledPlane = .{ .lut = .{ .kind = .lut1d_u8, .clips = .{ 0, 0 }, .dst_fmt = u8_fmt, .table = tbl } };
+        errdefer ex.deinit(alloc, null);
+        break :blk try cache.putOrGet(alloc, k_small, ex);
+    };
+    cache.release(alloc, e_small);
+    try std.testing.expectEqual(@as(usize, 1), cache.count);
+    try std.testing.expectEqual(@as(usize, 256), cache.lut_bytes);
+
+    var k_big = k_small;
+    k_big.expr = "x 2 +";
+    const e_big = blk: {
+        const tbl = try alloc.alignedAlloc(u8, .@"64", 2048);
+        @memset(tbl, 2);
+        var ex: CompiledPlane = .{ .lut = .{ .kind = .lut1d_u8, .clips = .{ 0, 0 }, .dst_fmt = u8_fmt, .table = tbl } };
+        errdefer ex.deinit(alloc, null);
+        break :blk try cache.putOrGet(alloc, k_big, ex);
+    };
+    // Oversized entry bypasses cache: ref_count == 1 (caller only), healthy entry untouched!
+    try std.testing.expectEqual(@as(usize, 1), e_big.ref_count);
+    try std.testing.expectEqual(@as(usize, 1), cache.count);
+    try std.testing.expectEqual(@as(usize, 256), cache.lut_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.live_external_refs);
+    try std.testing.expect(cache.get(k_big) == null);
+    const small_still = cache.get(k_small) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(e_small, small_still);
+    cache.release(alloc, small_still);
+    // Releasing caller-only oversized entry destroys it cleanly.
+    cache.release(alloc, e_big);
+    try std.testing.expectEqual(@as(usize, 0), cache.live_external_refs);
+
+    // Closed cache must still reject oversized admission with `error.CacheClosed`.
+    try std.testing.expect(cache.shutdown(alloc));
+    const tbl2 = try alloc.alignedAlloc(u8, .@"64", 2048);
+    @memset(tbl2, 3);
+    var big_closed: CompiledPlane = .{ .lut = .{ .kind = .lut1d_u8, .clips = .{ 0, 0 }, .dst_fmt = u8_fmt, .table = tbl2 } };
+    defer big_closed.deinit(alloc, null);
+    try std.testing.expectError(error.CacheClosed, cache.putOrGet(alloc, k_big, big_closed));
+    try std.testing.expectEqual(@as(usize, 0), cache.count);
+    try std.testing.expectEqual(@as(usize, 0), cache.live_external_refs);
+
+    _ = parser;
 }
