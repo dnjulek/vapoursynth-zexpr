@@ -328,21 +328,15 @@ fn compileDynamicPlane(
             &info,
             src_fmts,
             dst_fmt,
-            pw,
-            ph,
             &lut_execmem_denied,
         );
         prog.deinit(allocator);
         if (lut_execmem_denied and !dyn.execmem_warned.swap(true, .acq_rel)) {
             zapi.logMessage(.Warning, "zexpr.Expr: executable memory allocation denied; falling back to scalar LUT");
         }
-        var store_key = plane_key;
-        if (lut.simd_kernel == null) {
-            store_key.width = 0;
-            store_key.height = 0;
-        }
         var exec: plane_cache.CompiledPlane = .{ .lut = lut };
         errdefer exec.deinit(allocator, rt_ptr);
+        const store_key = plane_cache.storageKey(plane_key, &exec);
         return global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.CacheClosed => {
@@ -410,18 +404,14 @@ fn compileDynamicPlane(
             &info,
             src_fmts,
             dst_fmt,
-            pw,
-            ph,
             null,
         );
         prog.deinit(allocator);
         common.freePropBindings(allocator, prop_bindings);
         owns_props = false;
-        var store_key = plane_key;
-        store_key.width = 0;
-        store_key.height = 0;
         var exec: plane_cache.CompiledPlane = .{ .lut = lut };
         errdefer exec.deinit(allocator, null);
+        const store_key = plane_cache.storageKey(plane_key, &exec);
         return global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.CacheClosed => {
@@ -1051,8 +1041,6 @@ fn compileSinglePlane(
             &info,
             src_fmts,
             dst_fmt,
-            pw,
-            ph,
             &lut_execmem_denied,
         );
         prog.deinit(allocator);
@@ -1060,15 +1048,11 @@ fn compileSinglePlane(
             execmem_warned.* = true;
             zapi.logMessage(.Warning, "zexpr.Expr: executable memory allocation denied; falling back to scalar LUT");
         }
-        // C9: Cache scalar LUTs even after ExecMemDenied (they require zero executable memory).
-        var store_key = plane_key;
-        if (lut.simd_kernel == null) {
-            store_key.width = 0;
-            store_key.height = 0;
-        }
+        // C9 + Phase 3: ALL LUTs (scalar and runtime-dimension SIMD u8) store under `0x0` via `storageKey`.
         const entry = cache_blk: {
             var exec: plane_cache.CompiledPlane = .{ .lut = lut };
             errdefer exec.deinit(allocator, rt_ptr);
+            const store_key = plane_cache.storageKey(plane_key, &exec);
             break :cache_blk global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
@@ -1138,19 +1122,15 @@ fn compileSinglePlane(
             &info,
             src_fmts,
             dst_fmt,
-            pw,
-            ph,
             null,
         );
         prog.deinit(allocator);
         common.freePropBindings(allocator, prop_bindings);
         owns_props = false;
-        var store_key = plane_key;
-        store_key.width = 0;
-        store_key.height = 0;
         const entry = cache_blk: {
             var exec: plane_cache.CompiledPlane = .{ .lut = lut };
             errdefer exec.deinit(allocator, null);
+            const store_key = plane_cache.storageKey(plane_key, &exec);
             break :cache_blk global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),

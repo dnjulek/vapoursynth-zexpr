@@ -519,3 +519,50 @@ def test_lut_cache_key_width_height_invariant(core: vs.Core) -> None:
         got_h = plane_array(core.zexpr.Expr([cg], [expr_h]).get_frame(0), 0)
         assert np.all(got_w == int(np.rint(base_val * np.float32(w) + np.float32(0.5))))
         assert np.all(got_h == int(np.rint(base_val * np.float32(h) + np.float32(0.5))))
+
+
+def test_simd_u8_lut_runtime_dims_yuv420_odd_chroma_and_plane_max(core: vs.Core) -> None:
+    """Phase 3: Runtime-dimension SIMD u8 LUTs match f32 reference across odd-chroma YUV420P8
+    widths, variable-resolution clips, and full vs limited `plane_max` range variants."""
+    gamma_u8 = "x 255 / 2.2 pow 255 *"
+
+    # Odd chroma widths (34->17, 62->31, 66->33, 98->49, 130->65) exercising 16/32/64B boundaries.
+    for w, h, seed in ((34, 8, 950), (62, 6, 951), (66, 10, 952), (98, 4, 953), (130, 6, 954)):
+        cyuv = make_clip(core, width=w, height=h, fmt=vs.YUV420P8, length=2, seed=seed)
+        got = core.zexpr.Expr([cyuv], [gamma_u8])
+        cyuv_f32 = core.zexpr.Expr([cyuv], ["x"], format=vs.YUV420PS)
+        ref = core.zexpr.Expr([cyuv_f32], [gamma_u8], format=vs.YUV420P8)
+        assert_same_clip(got, ref)
+        f0 = got.get_frame(0)
+        assert not np.array_equal(plane_array(f0, 1), plane_array(f0, 2))
+
+    # Variable-resolution clip switching across odd/boundary widths reusing the 0x0 SIMD u8 LUT.
+    parts = [
+        make_clip(core, width=34, height=8, fmt=vs.YUV420P8, length=1, seed=960),
+        make_clip(core, width=64, height=16, fmt=vs.YUV420P8, length=1, seed=961),
+        make_clip(core, width=98, height=12, fmt=vs.YUV420P8, length=1, seed=962),
+        make_clip(core, width=16, height=4, fmt=vs.YUV420P8, length=1, seed=963),
+    ]
+    vclip = core.std.Splice(parts, mismatch=True)
+    vgot = core.zexpr.Expr([vclip], [gamma_u8])
+    for idx, part in enumerate(parts):
+        part_f32 = core.zexpr.Expr([part], ["x"], format=vs.YUV420PS)
+        part_ref = core.zexpr.Expr([part_f32], [gamma_u8], format=vs.YUV420P8)
+        gf = vgot.get_frame(idx)
+        rf = part_ref.get_frame(0)
+        for p in range(3):
+            np.testing.assert_array_equal(plane_array(gf, p), plane_array(rf, p))
+
+    # `plane_max` on YUV420P8: full-range (_Range=1) -> [255, 255, 255], limited (_Range=0) -> [235, 240, 240].
+    pmax_expr = "x 255 / 2.2 pow plane_max *"
+    c_full = core.std.BlankClip(width=34, height=8, format=vs.YUV420P8, color=[255, 255, 255], length=1)
+    c_full = core.std.SetFrameProp(c_full, prop="_Range", intval=1)
+    c_lim = core.std.BlankClip(width=34, height=8, format=vs.YUV420P8, color=[255, 255, 255], length=1)
+    c_lim = core.std.SetFrameProp(c_lim, prop="_Range", intval=0)
+
+    f_full = core.zexpr.Expr([c_full], [pmax_expr]).get_frame(0)
+    f_lim = core.zexpr.Expr([c_lim], [pmax_expr]).get_frame(0)
+    for p, exp_val in enumerate((255, 255, 255)):
+        assert np.all(plane_array(f_full, p) == exp_val), f"full plane {p} expected {exp_val}"
+    for p, exp_val in enumerate((235, 240, 240)):
+        assert np.all(plane_array(f_lim, p) == exp_val), f"limited plane {p} expected {exp_val}"

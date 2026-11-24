@@ -456,6 +456,25 @@ int32_t zj_ctx_begin_func(zj_ctx* ctx) {
     return 0;
 }
 
+int32_t zj_ctx_begin_lut_func(zj_ctx* ctx) {
+    if (!ctx_ok(ctx)) return -1;
+    aj::FuncSignature sig = aj::FuncSignature::build<
+        void,
+        uint8_t*,
+        intptr_t,
+        const uint8_t* const*,
+        const intptr_t*,
+        size_t,
+        size_t
+    >();
+    ctx->func_node = ctx->cc.add_func(sig);
+    if (ctx->func_node == nullptr) {
+        return -1;
+    }
+    ctx->uc.hook_func();
+    return 0;
+}
+
 zj_reg_t zj_ctx_arg_gp(zj_ctx* ctx, uint32_t index) {
     if (!ctx_ok(ctx) || ctx->func_node == nullptr || index >= 6u) {
         return zj_reg_t{0u, 0u};
@@ -1929,8 +1948,6 @@ int32_t zj_compile_lut1d_u8_neon(
     zj_runtime* rt,
     const uint8_t* table_256,
     uint32_t clip_idx,
-    uint32_t width,
-    uint32_t height,
     void** out_fn,
     size_t* out_size,
     uint8_t* out_execmem_denied
@@ -1939,7 +1956,7 @@ int32_t zj_compile_lut1d_u8_neon(
     if (out_size != nullptr) *out_size = 0u;
     if (out_execmem_denied != nullptr) *out_execmem_denied = 0u;
 #if defined(ASMJIT_UJIT_AARCH64)
-    if (rt == nullptr || table_256 == nullptr || width == 0u || height == 0u) return -1;
+    if (rt == nullptr || table_256 == nullptr) return -1;
 
     aj::CodeHolder code;
     if (code.init(rt->rt.environment(), rt->rt.cpu_features()) != aj::Error::kOk) return -1;
@@ -1959,7 +1976,12 @@ int32_t zj_compile_lut1d_u8_neon(
     const Vec q24 = Vec::make_q(24), q25 = Vec::make_q(25), q26 = Vec::make_q(26), q27 = Vec::make_q(27);
     const Vec q28 = Vec::make_q(28), q29 = Vec::make_q(29), q30 = Vec::make_q(30), q31 = Vec::make_q(31);
 
-    // Args: x0=dst, x1=dst_stride, x2=srcs, x3=src_strides. Uses only caller-saved x0..x11, v0..v4, v16..v31.
+    // Args: x0=dst, x1=dst_stride, x2=srcs, x3=src_strides, x4=width, x5=height.
+    // Uses only AAPCS64 caller-saved x0..x13, v0..v4, v16..v31.
+    aj::Label l_done = a.new_label();
+    a.cbz(x4, l_done);
+    a.cbz(x5, l_done);
+
     const uint64_t clip_off = uint64_t(clip_idx) * 8u;
     if (clip_off <= 32760u) {
         a.ldr(x6, ptr(x2, int32_t(clip_off)));
@@ -1976,7 +1998,11 @@ int32_t zj_compile_lut1d_u8_neon(
         a.ldp(Vec::make_q(16u + i * 2u), Vec::make_q(17u + i * 2u), ptr(x9, int32_t(i * 32u)));
     }
     a.movi(q4.b16(), 64);
-    a.mov(x8, uint64_t(height));
+
+    // Preserve x12 (iters32 = width / 32) and x13 (rem = width & 31) across all rows.
+    a.lsr(x12, x4, 5);
+    a.and_(x13, x4, 31);
+    a.mov(x8, x5);
 
     auto emit_16 = [&](const Vec& out_v, const Vec& in_v) {
         a.tbl(out_v.b16(), q16.b16(), q17.b16(), q18.b16(), q19.b16(), in_v.b16());
@@ -1989,51 +2015,54 @@ int32_t zj_compile_lut1d_u8_neon(
     };
 
     aj::Label l_y = a.new_label();
+    aj::Label l_tail = a.new_label();
+    aj::Label l_next_y = a.new_label();
     a.bind(l_y);
     a.mov(x9, x0);
     a.mov(x10, x6);
 
     // 2x-unrolled 32B/iter loop using ldp/stp and interleaved 4-register tbl/tbx over v16..v31.
-    const uint32_t iters32 = width / 32u;
-    const uint32_t rem = width % 32u;
-    if (iters32 > 0u) {
-        a.mov(x11, uint64_t(iters32));
-        aj::Label l_x32 = a.new_label();
-        a.bind(l_x32);
-        a.ldp(q0, q1, ptr_post(x10, 32));
-        a.tbl(q2.b16(), q16.b16(), q17.b16(), q18.b16(), q19.b16(), q0.b16());
-        a.tbl(q3.b16(), q16.b16(), q17.b16(), q18.b16(), q19.b16(), q1.b16());
-        a.sub(q0.b16(), q0.b16(), q4.b16());
-        a.sub(q1.b16(), q1.b16(), q4.b16());
-        a.tbx(q2.b16(), q20.b16(), q21.b16(), q22.b16(), q23.b16(), q0.b16());
-        a.tbx(q3.b16(), q20.b16(), q21.b16(), q22.b16(), q23.b16(), q1.b16());
-        a.sub(q0.b16(), q0.b16(), q4.b16());
-        a.sub(q1.b16(), q1.b16(), q4.b16());
-        a.tbx(q2.b16(), q24.b16(), q25.b16(), q26.b16(), q27.b16(), q0.b16());
-        a.tbx(q3.b16(), q24.b16(), q25.b16(), q26.b16(), q27.b16(), q1.b16());
-        a.sub(q0.b16(), q0.b16(), q4.b16());
-        a.sub(q1.b16(), q1.b16(), q4.b16());
-        a.tbx(q2.b16(), q28.b16(), q29.b16(), q30.b16(), q31.b16(), q0.b16());
-        a.tbx(q3.b16(), q28.b16(), q29.b16(), q30.b16(), q31.b16(), q1.b16());
-        a.stp(q2, q3, ptr_post(x9, 32));
-        a.subs(x11, x11, 1);
-        a.b_ne(l_x32);
-    }
-    if (rem > 0u) {
-        a.ldr(q0, ptr_post(x10, 16));
-        emit_16(q2, q0);
-        a.str(q2, ptr_post(x9, 16));
-        if (rem > 16u) {
-            a.ldr(q0, ptr(x10));
-            emit_16(q2, q0);
-            a.str(q2, ptr(x9));
-        }
-    }
+    a.cbz(x12, l_tail);
+    a.mov(x11, x12);
+    aj::Label l_x32 = a.new_label();
+    a.bind(l_x32);
+    a.ldp(q0, q1, ptr_post(x10, 32));
+    a.tbl(q2.b16(), q16.b16(), q17.b16(), q18.b16(), q19.b16(), q0.b16());
+    a.tbl(q3.b16(), q16.b16(), q17.b16(), q18.b16(), q19.b16(), q1.b16());
+    a.sub(q0.b16(), q0.b16(), q4.b16());
+    a.sub(q1.b16(), q1.b16(), q4.b16());
+    a.tbx(q2.b16(), q20.b16(), q21.b16(), q22.b16(), q23.b16(), q0.b16());
+    a.tbx(q3.b16(), q20.b16(), q21.b16(), q22.b16(), q23.b16(), q1.b16());
+    a.sub(q0.b16(), q0.b16(), q4.b16());
+    a.sub(q1.b16(), q1.b16(), q4.b16());
+    a.tbx(q2.b16(), q24.b16(), q25.b16(), q26.b16(), q27.b16(), q0.b16());
+    a.tbx(q3.b16(), q24.b16(), q25.b16(), q26.b16(), q27.b16(), q1.b16());
+    a.sub(q0.b16(), q0.b16(), q4.b16());
+    a.sub(q1.b16(), q1.b16(), q4.b16());
+    a.tbx(q2.b16(), q28.b16(), q29.b16(), q30.b16(), q31.b16(), q0.b16());
+    a.tbx(q3.b16(), q28.b16(), q29.b16(), q30.b16(), q31.b16(), q1.b16());
+    a.stp(q2, q3, ptr_post(x9, 32));
+    a.subs(x11, x11, 1);
+    a.b_ne(l_x32);
 
+    a.bind(l_tail);
+    a.cbz(x13, l_next_y);
+    a.ldr(q0, ptr_post(x10, 16));
+    emit_16(q2, q0);
+    a.str(q2, ptr_post(x9, 16));
+    a.cmp(x13, 16);
+    a.b_ls(l_next_y);
+    a.ldr(q0, ptr(x10));
+    emit_16(q2, q0);
+    a.str(q2, ptr(x9));
+
+    a.bind(l_next_y);
     a.add(x0, x0, x1);
     a.add(x6, x6, x7);
     a.subs(x8, x8, 1);
     a.b_ne(l_y);
+
+    a.bind(l_done);
     a.ret(x30);
 
     a.align(aj::AlignMode::kData, 16);
@@ -2055,7 +2084,7 @@ int32_t zj_compile_lut1d_u8_neon(
     if (out_size != nullptr) *out_size = code_size;
     return 0;
 #else
-    (void)rt; (void)table_256; (void)clip_idx; (void)width; (void)height;
+    (void)rt; (void)table_256; (void)clip_idx;
     return -1;
 #endif
 }

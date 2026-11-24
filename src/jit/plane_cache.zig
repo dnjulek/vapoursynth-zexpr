@@ -158,6 +158,18 @@ pub fn PlaneCache(comptime capacity: usize) type {
     return PlaneCacheWithLutCap(capacity, default_max_lut_bytes);
 }
 
+pub fn storageKey(key: Key, exec: *const CompiledPlane) Key {
+    var out = key;
+    switch (exec.*) {
+        .lut => {
+            out.width = 0;
+            out.height = 0;
+        },
+        .jit, .scalar => {},
+    }
+    return out;
+}
+
 fn entryLutBytes(exec: *const CompiledPlane) usize {
     return switch (exec.*) {
         .lut => |*l| l.table.len,
@@ -1004,7 +1016,7 @@ test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase 
     defer info.deinit(alloc);
     try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info.lut_kind);
 
-    const lut = try lut_mod.Lut.build(alloc, rt, cpu, profile, &prog, &info, &u16_srcs, u16_fmt, 32, 16, null);
+    const lut = try lut_mod.Lut.build(alloc, rt, cpu, profile, &prog, &info, &u16_srcs, u16_fmt, null);
     try std.testing.expect(lut.simd_kernel == null);
 
     const u16_rmax = [_]builtins_mod.BuiltinVal{try builtins_mod.resolveMeta(.range_max, y16_meta)};
@@ -1132,7 +1144,7 @@ test "PlaneCache Phase B limited YUV16 LUT sharing (D3) and partial-variant refc
             try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
             var inf = try analysis_mod.analyze(a, &pr, &.{.{ .is_float = false, .bits_per_sample = 16 }}, .{ .is_float = false, .bits_per_sample = 16 }, 32, 16, .{ .f32_lanes = c_info.f32_lanes });
             defer inf.deinit(a);
-            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, &.{.{ .is_float = false, .bits_per_sample = 16 }}, .{ .is_float = false, .bits_per_sample = 16 }, 32, 16, null);
+            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, &.{.{ .is_float = false, .bits_per_sample = 16 }}, .{ .is_float = false, .bits_per_sample = 16 }, null);
             var exec: CompiledPlane = .{ .lut = lut };
             errdefer exec.deinit(a, r);
             return try c.putOrGet(a, k, exec);
@@ -1295,7 +1307,7 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
             try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
             var inf = try analysis_mod.analyze(a, &pr, k.src_fmts, k.dst_fmt, 64, 16, .{ .f32_lanes = c_info.f32_lanes });
             defer inf.deinit(a);
-            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, k.src_fmts, k.dst_fmt, 64, 16, null);
+            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, k.src_fmts, k.dst_fmt, null);
             var exec: CompiledPlane = .{ .lut = lut };
             errdefer exec.deinit(a, r);
             return try c.putOrGet(a, k, exec);
@@ -1836,4 +1848,181 @@ test "PlaneCacheWithLutCap bypasses admission for oversized single LUT without e
     try std.testing.expectEqual(@as(usize, 0), cache.live_external_refs);
 
     _ = parser;
+}
+
+test "PlaneCache Phase 3 dimension-free SIMD u8 LUT build counts and entry identity across YUV420P8 planes" {
+    const parser = @import("../expr/parser.zig");
+    const lower_mod = @import("../expr/lower.zig");
+    const optimize_mod = @import("../expr/optimize.zig");
+    const analysis_mod = @import("../expr/analysis.zig");
+
+    const alloc = std.testing.allocator;
+    const cpu = cpu_mod.detectWithOverride(null);
+    if (!aj.Builder.cpuSupportsFastLutU8(cpu)) return;
+    const profile = interp.TargetProfile.fromCpu(cpu);
+    const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
+    const src_fmts = [_]ast.SampleFormat{u8_fmt};
+
+    // Helper mirroring static/dynamic Expr admission via the shared production `storageKey()`.
+    const admitU8Lut = struct {
+        fn run(
+            a: std.mem.Allocator,
+            c: *PlaneCache(16),
+            r: *aj.Runtime,
+            c_info: cpu_mod.CpuInfo,
+            prof: interp.TargetProfile,
+            expr_s: []const u8,
+            w: usize,
+            h: usize,
+            meta: ?builtins_mod.ClipMeta,
+            rb: []const builtins_mod.BuiltinVal,
+            build_count: *usize,
+        ) !*Entry {
+            const plane_key: Key = .{
+                .expr = expr_s,
+                .src_fmts = &src_fmts,
+                .dst_fmt = u8_fmt,
+                .width = w,
+                .height = h,
+                .opt_int = false,
+                .default_boundary = .clamp,
+                .cpu = c_info,
+                .profile = prof,
+                .resolved_builtins = rb,
+            };
+            if (c.getOrDim(plane_key)) |hit| return hit;
+
+            var rctx_storage: builtins_mod.ResolveContext = undefined;
+            const rctx_ptr: ?*const builtins_mod.ResolveContext = if (meta) |m| blk: {
+                rctx_storage = .{ .src_metas = &.{m}, .dst_meta = m, .opt_int = false };
+                break :blk &rctx_storage;
+            } else null;
+
+            var pr = try parser.parse(a, expr_s, .{
+                .mode = .expr,
+                .num_clips = 1,
+                .builtin_ctx = rctx_ptr,
+            });
+            defer pr.deinit(a);
+            try lower_mod.lower(a, &pr, prof);
+            try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
+            var inf = try analysis_mod.analyze(a, &pr, &src_fmts, u8_fmt, @intCast(w), @intCast(h), .{
+                .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(c_info),
+                .f32_lanes = c_info.f32_lanes,
+            });
+            defer inf.deinit(a);
+            try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, inf.lut_kind);
+
+            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, &src_fmts, u8_fmt, null);
+            build_count.* += 1;
+            // Review 7 #1: scalar fallback must never false-pass this SIMD sharing test.
+            try std.testing.expect(lut.simd_kernel != null);
+
+            var exec: CompiledPlane = .{ .lut = lut };
+            errdefer exec.deinit(a, r);
+            const store_key = storageKey(plane_key, &exec);
+            try std.testing.expectEqual(@as(usize, 0), store_key.width);
+            try std.testing.expectEqual(@as(usize, 0), store_key.height);
+            return try c.putOrGet(a, store_key, exec);
+        }
+    }.run;
+
+    // Case 1: Literal YUV420P8 gamma `x 255 / 2.2 pow 255 *`:
+    //   34x8 (Y) + 17x4 (U) + 17x4 (V) -> exactly 1 build shared across all 3 planes,
+    //   and 0 additional builds at 64x16 / 32x8!
+    {
+        var cache: PlaneCache(16) = .{};
+        defer cache.deinit(alloc);
+        const rt = switch (cache.acquireRuntime()) {
+            .lease => |l| l.rt,
+            else => return error.OutOfMemory,
+        };
+        defer cache.releaseRuntime();
+
+        var builds: usize = 0;
+        const expr = "x 255 / 2.2 pow 255 *";
+        const e_y = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, 34, 8, null, &.{}, &builds);
+        defer cache.release(alloc, e_y);
+        const e_u = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, 17, 4, null, &.{}, &builds);
+        defer cache.release(alloc, e_u);
+        const e_v = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, 17, 4, null, &.{}, &builds);
+        defer cache.release(alloc, e_v);
+
+        try std.testing.expectEqual(@as(usize, 1), builds);
+        try std.testing.expectEqual(@as(usize, 1), cache.count);
+        try std.testing.expectEqual(e_y, e_u);
+        try std.testing.expectEqual(e_y, e_v);
+        try std.testing.expect(e_y.exec == .lut and e_y.exec.lut.simd_kernel != null);
+
+        // New resolution (64x16 Y, 32x8 U/V) adds 0 builds and hits the exact same entry.
+        const e_y2 = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, 64, 16, null, &.{}, &builds);
+        defer cache.release(alloc, e_y2);
+        const e_u2 = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, 32, 8, null, &.{}, &builds);
+        defer cache.release(alloc, e_u2);
+        try std.testing.expectEqual(@as(usize, 1), builds);
+        try std.testing.expectEqual(e_y, e_y2);
+        try std.testing.expectEqual(e_y, e_u2);
+    }
+
+    // Case 2: YUV420P8 `x 255 / 2.2 pow plane_max *` (static Create compiles both limited & full variants):
+    //   Full-range resolves to 255 on Y/U/V (1 shared entry); limited resolves to 235 (Y) and 240 (U/V)
+    //   -> exactly 3 distinct SIMD entries total (down from 4 baseline), and 0 additional builds at 64x16/32x8!
+    {
+        var cache: PlaneCache(16) = .{};
+        defer cache.deinit(alloc);
+        const rt = switch (cache.acquireRuntime()) {
+            .lease => |l| l.rt,
+            else => return error.OutOfMemory,
+        };
+        defer cache.releaseRuntime();
+
+        var builds: usize = 0;
+        const expr = "x 255 / 2.2 pow plane_max *";
+        const p_dims = [_][2]usize{ .{ 34, 8 }, .{ 17, 4 }, .{ 17, 4 } };
+        var full_entries: [3]*Entry = undefined;
+        var lim_entries: [3]*Entry = undefined;
+        for (0..3) |p| {
+            const m_full: builtins_mod.ClipMeta = .{ .is_float = false, .bits_per_sample = 8, .color_family = .yuv, .plane_idx = @intCast(p), .is_full_range = true };
+            const m_lim: builtins_mod.ClipMeta = .{ .is_float = false, .bits_per_sample = 8, .color_family = .yuv, .plane_idx = @intCast(p), .is_full_range = false };
+            const rb_full = [_]builtins_mod.BuiltinVal{try builtins_mod.resolveMeta(.plane_max, m_full)};
+            const rb_lim = [_]builtins_mod.BuiltinVal{try builtins_mod.resolveMeta(.plane_max, m_lim)};
+            full_entries[p] = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, p_dims[p][0], p_dims[p][1], m_full, &rb_full, &builds);
+            lim_entries[p] = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, p_dims[p][0], p_dims[p][1], m_lim, &rb_lim, &builds);
+        }
+        defer {
+            for (full_entries) |e| cache.release(alloc, e);
+            for (lim_entries) |e| cache.release(alloc, e);
+        }
+
+        try std.testing.expectEqual(@as(usize, 3), builds);
+        try std.testing.expectEqual(@as(usize, 3), cache.count);
+        // Full-range 255 is shared across Y, U, V.
+        try std.testing.expectEqual(full_entries[0], full_entries[1]);
+        try std.testing.expectEqual(full_entries[0], full_entries[2]);
+        // Limited-range Y (235) is distinct from limited-range U/V (240), and U/V share one entry.
+        try std.testing.expect(lim_entries[0] != lim_entries[1]);
+        try std.testing.expect(lim_entries[0] != full_entries[0]);
+        try std.testing.expect(lim_entries[1] != full_entries[0]);
+        try std.testing.expectEqual(lim_entries[1], lim_entries[2]);
+        // Every distinct entry must hold a live SIMD kernel (not scalar fallback).
+        try std.testing.expect(full_entries[0].exec == .lut and full_entries[0].exec.lut.simd_kernel != null);
+        try std.testing.expect(lim_entries[0].exec == .lut and lim_entries[0].exec.lut.simd_kernel != null);
+        try std.testing.expect(lim_entries[1].exec == .lut and lim_entries[1].exec.lut.simd_kernel != null);
+
+        // Repeating at 64x16 / 32x8 adds 0 builds and hits the exact same 3 entries.
+        const p_dims2 = [_][2]usize{ .{ 64, 16 }, .{ 32, 8 }, .{ 32, 8 } };
+        for (0..3) |p| {
+            const m_full: builtins_mod.ClipMeta = .{ .is_float = false, .bits_per_sample = 8, .color_family = .yuv, .plane_idx = @intCast(p), .is_full_range = true };
+            const m_lim: builtins_mod.ClipMeta = .{ .is_float = false, .bits_per_sample = 8, .color_family = .yuv, .plane_idx = @intCast(p), .is_full_range = false };
+            const rb_full = [_]builtins_mod.BuiltinVal{try builtins_mod.resolveMeta(.plane_max, m_full)};
+            const rb_lim = [_]builtins_mod.BuiltinVal{try builtins_mod.resolveMeta(.plane_max, m_lim)};
+            const ef = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, p_dims2[p][0], p_dims2[p][1], m_full, &rb_full, &builds);
+            defer cache.release(alloc, ef);
+            const el = try admitU8Lut(alloc, &cache, rt, cpu, profile, expr, p_dims2[p][0], p_dims2[p][1], m_lim, &rb_lim, &builds);
+            defer cache.release(alloc, el);
+            try std.testing.expectEqual(full_entries[p], ef);
+            try std.testing.expectEqual(lim_entries[p], el);
+        }
+        try std.testing.expectEqual(@as(usize, 3), builds);
+    }
 }

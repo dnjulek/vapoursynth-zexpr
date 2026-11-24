@@ -26,12 +26,12 @@ pub const Lut = struct {
     dst_fmt: ast.SampleFormat,
     /// Flat byte table of `numEntries() * dst_fmt.bytesPerSample()`.
     table: []align(64) u8,
-    /// Optional AsmJit-compiled SIMD plane kernel for 1D `u8 -> u8` LUTs.
-    simd_kernel: ?aj.CompiledKernel = null,
+    /// Optional AsmJit-compiled runtime-dimension SIMD plane kernel for 1D `u8 -> u8` LUTs.
+    simd_kernel: ?aj.LutKernel = null,
 
     pub fn deinit(self: *Lut, allocator: std.mem.Allocator, rt: ?*aj.Runtime) void {
         if (self.simd_kernel) |k| {
-            if (rt) |runtime| runtime.release(k.func);
+            if (rt) |runtime| runtime.releaseLut(k.func);
         }
         allocator.free(self.table);
         self.* = undefined;
@@ -46,7 +46,7 @@ pub const Lut = struct {
         };
     }
 
-    /// Build and populate a LUT over the full integer container domain (B4, Y14).
+    /// Build and populate a dimension-free LUT over the full integer container domain (B4, Y14).
     pub fn build(
         allocator: std.mem.Allocator,
         rt: ?*aj.Runtime,
@@ -56,8 +56,6 @@ pub const Lut = struct {
         info: *const analysis_mod.Analysis,
         src_fmts: []const ast.SampleFormat,
         dst_fmt: ast.SampleFormat,
-        plane_width: usize,
-        plane_height: usize,
         out_execmem_denied: ?*bool,
     ) std.mem.Allocator.Error!Lut {
         const kind = info.lut_kind;
@@ -166,13 +164,11 @@ pub const Lut = struct {
             });
         }
 
-        // Compile fast SIMD in-register 1D u8 -> u8 LUT kernel when supported.
+        // Compile fast runtime-dimension SIMD in-register 1D u8 -> u8 LUT kernel when supported.
         // M1: on AVX-512 hosts without VBMI (Skylake-SP/X, Cascade Lake), fall back to the 32B AVX2
         // vpshufb+vpblendvb kernel (~1.68 insns/px vs 3.30 scalar) instead of the scalar table loop.
-        var simd_kernel: ?aj.CompiledKernel = null;
-        if (kind == .lut1d_u8 and !dst_fmt.is_float and dst_fmt.bits_per_sample == 8 and
-            plane_width > 0 and plane_height > 0)
-        {
+        var simd_kernel: ?aj.LutKernel = null;
+        if (kind == .lut1d_u8 and !dst_fmt.is_float and dst_fmt.bits_per_sample == 8) {
             const lut_cpu: ?cpu_mod.CpuInfo = if (aj.Builder.cpuSupportsFastLutU8(cpu))
                 cpu
             else if (cpu.vec_bytes == 64 and cpu.has_avx2)
@@ -181,7 +177,7 @@ pub const Lut = struct {
                 null;
             if (lut_cpu) |lcpu| {
                 if (rt) |runtime| {
-                    if (compileU8LutPlane(runtime, lcpu, info.lut_clips[0], table[0..256], plane_width, plane_height)) |k| {
+                    if (compileU8LutPlane(runtime, lcpu, info.lut_clips[0], table[0..256])) |k| {
                         simd_kernel = k;
                     } else |err| {
                         if (err == error.ExecMemDenied) {
@@ -211,8 +207,9 @@ pub const Lut = struct {
         width: usize,
         height: usize,
     ) void {
+        if (width == 0 or height == 0) return;
         if (self.simd_kernel) |k| {
-            k.func(dst, dst_stride, srcs.ptr, src_strides.ptr, 0, null);
+            k.func(dst, dst_stride, srcs.ptr, src_strides.ptr, width, height);
             return;
         }
         const bps = self.dst_fmt.bytesPerSample();
@@ -342,27 +339,31 @@ pub const Lut = struct {
     }
 };
 
-/// Compile a specialized AsmJit plane kernel for 1D `u8 -> u8` LUTs using
+/// Compile a runtime-dimension AsmJit plane kernel for 1D `u8 -> u8` LUTs using
 /// AVX-512 VBMI `vpermb`, AVX2/SSE4.1 `vpshufb + vpblendvb` tree, or AArch64 NEON `tbl`.
 fn compileU8LutPlane(
     rt: *aj.Runtime,
     cpu: cpu_mod.CpuInfo,
     clip_idx: ast.ClipId,
     table_256: *const [256]u8,
-    width: usize,
-    height: usize,
-) aj.JitError!aj.CompiledKernel {
+) aj.JitError!aj.LutKernel {
     if (cpu.isa == .neon) {
-        return aj.Builder.compileLut1dU8Neon(rt, table_256, @intCast(clip_idx), width, height);
+        return aj.Builder.compileLut1dU8Neon(rt, table_256, @intCast(clip_idx));
     }
     var b = try aj.Builder.init(rt, cpu, false);
     defer b.deinit();
-    try b.beginFunc();
+    try b.beginLutFunc();
 
     const dst_ptr = b.argGp(0);
     const dst_stride = b.argGp(1);
     const srcs_ptr = b.argGp(2);
     const src_strides_ptr = b.argGp(3);
+    const width_gp = b.argGp(4);
+    const height_gp = b.argGp(5);
+
+    const done_lbl = b.newLabel();
+    b.jccImm(.eq, width_gp, 0, done_lbl);
+    b.jccImm(.eq, height_gp, 0, done_lbl);
 
     const src_row = b.newGp64();
     const src_stride = b.newGp64();
@@ -388,16 +389,17 @@ fn compileU8LutPlane(
     b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 0, 0), out_v);
 
     b.gpOp3Imm(.add, x_gp, x_gp, step);
-    b.jccImm(.ult, x_gp, @intCast(width), x_loop);
+    b.jcc(.ult, x_gp, width_gp, x_loop);
 
     b.gpOp3(.add, dst_ptr, dst_ptr, dst_stride);
     b.gpOp3(.add, src_row, src_row, src_stride);
     b.gpOp3Imm(.add, y_gp, y_gp, 1);
-    b.jccImm(.ult, y_gp, @intCast(height), y_loop);
+    b.jcc(.ult, y_gp, height_gp, y_loop);
 
+    b.bind(done_lbl);
     b.retVoid();
     b.endFunc();
-    return try b.finalize();
+    return try b.finalizeLut();
 }
 
 inline fn offsetRow(base: [*]const u8, stride: isize, y: usize) [*]const u8 {
@@ -757,7 +759,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info.lut_kind);
 
-        var lut = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt10, 16, 1, null);
+        var lut = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt10, null);
         defer lut.deinit(allocator, &rt);
 
         var src align(64) = [_]u16{ 0, 1, 512, 1023, 1024, 5000, 32768, 65535, 100, 200, 300, 400, 500, 600, 700, 800 };
@@ -904,7 +906,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info.lut_kind);
 
-        var lut = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt8, 256, 1, null);
+        var lut = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt8, null);
         defer lut.deinit(allocator, &rt);
         if (aj.Builder.cpuSupportsFastLutU8(cpu)) {
             try std.testing.expect(lut.simd_kernel != null);
@@ -932,18 +934,21 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         });
         try std.testing.expectEqualSlices(u8, &dst_ref, &dst_lut);
 
-        // AR3: Exercise SIMD u8 LUT (including NEON 32B/16B `tbl`/`tbx` tail) across odd & boundary widths 1..65.
-        var src_tail: [2 * 128]u8 align(64) = undefined;
+        // Reuse ONE single compiled SIMD u8 LUT across widths on both sides of 16/32/64B boundaries,
+        // multiple heights (>= 2), and varying strides without rebuilding it.
+        var src_tail: [5 * 192]u8 align(64) = undefined;
         for (0..src_tail.len) |i| src_tail[i] = @intCast((i * 53 + 11) & 255);
-        for ([_]usize{ 1, 2, 3, 7, 8, 15, 16, 17, 23, 24, 31, 32, 33, 47, 48, 49, 63, 64, 65 }) |w| {
-            var lut_w = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt8, w, 2, null);
-            defer lut_w.deinit(allocator, &rt);
-            const row_stride: usize = std.mem.alignForward(usize, w, if (cpu.has_avx512) 64 else 32);
-            var out_lut: [2 * 128]u8 align(64) = @splat(0xA5);
-            var out_ref: [2 * 128]u8 align(64) = @splat(0xA5);
+        const heights = [_]usize{ 2, 3, 5 };
+        for ([_]usize{ 1, 2, 3, 7, 8, 15, 16, 17, 23, 24, 31, 32, 33, 47, 48, 49, 63, 64, 65, 97 }) |w| {
+            const h = heights[w % heights.len];
+            const min_stride: usize = std.mem.alignForward(usize, w, if (cpu.has_avx512) 64 else 32);
+            // Vary stride (minimal aligned vs padded +64B) to exercise row-stride advancement.
+            const row_stride: usize = if ((w & 1) == 0) min_stride + 64 else min_stride;
+            var out_lut: [5 * 192]u8 align(64) = @splat(0xA5);
+            var out_ref: [5 * 192]u8 align(64) = @splat(0xA5);
             const s_arr = [_][*]const u8{&src_tail};
             const st_arr = [_]isize{@intCast(row_stride)};
-            lut_w.apply(&out_lut, @intCast(row_stride), &s_arr, &st_arr, w, 2);
+            lut.apply(&out_lut, @intCast(row_stride), &s_arr, &st_arr, w, h);
             try interp.evalPlane(allocator, &prog, profile, .{
                 .dst = &out_ref,
                 .dst_stride = @intCast(row_stride),
@@ -952,11 +957,11 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
                 .src_strides = &st_arr,
                 .src_fmts = &fmts,
                 .width = w,
-                .height = 2,
+                .height = h,
                 .frame_n = 0,
                 .props = &.{},
             });
-            for (0..2) |y| {
+            for (0..h) |y| {
                 const row_off = y * row_stride;
                 try std.testing.expectEqualSlices(u8, out_ref[row_off .. row_off + w], out_lut[row_off .. row_off + w]);
             }
@@ -976,7 +981,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut2d_u8, info.lut_kind);
 
-        var lut = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt8, 64, 4, null);
+        var lut = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt8, null);
         defer lut.deinit(allocator, &rt);
 
         var s0: [256]u8 align(64) = undefined;
@@ -1086,7 +1091,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer info_f16.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info_f16.lut_kind);
 
-        var lut_f16 = try Lut.build(allocator, &rt, cpu, profile, &p_f16, &info_f16, &fmts_f16, fmt_f16, 17, 2, null);
+        var lut_f16 = try Lut.build(allocator, &rt, cpu, profile, &p_f16, &info_f16, &fmts_f16, fmt_f16, null);
         defer lut_f16.deinit(allocator, &rt);
 
         // Cover +0.0, -0.0, subnormals, normal floats, negative floats, +inf, -inf, qNaN.

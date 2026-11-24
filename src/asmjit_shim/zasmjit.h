@@ -66,6 +66,16 @@ typedef void (*zj_expr_plane_fn)(
     const float* props
 );
 
+/* Runtime-dimension SIMD LUT kernel signature: ZJ_SIG_LUT_PLANE. */
+typedef void (*zj_lut_plane_fn)(
+    uint8_t* dst,
+    intptr_t dst_stride,
+    const uint8_t* const* srcs,
+    const intptr_t* src_strides,
+    size_t width,
+    size_t height
+);
+
 /* GP condition codes (fixed-width). */
 typedef uint32_t zj_cond_t;
 #define ZJ_COND_EQ  ((zj_cond_t)0u)
@@ -251,6 +261,7 @@ void zj_emit_shutdown_marker_if_enabled(void);
 zj_ctx* zj_ctx_create(zj_runtime* rt, const zj_cpu_info_t* cpu, uint8_t capture_disasm);
 void zj_ctx_destroy(zj_ctx* ctx);
 int32_t zj_ctx_begin_func(zj_ctx* ctx);
+int32_t zj_ctx_begin_lut_func(zj_ctx* ctx);
 zj_reg_t zj_ctx_arg_gp(zj_ctx* ctx, uint32_t index);
 void zj_ctx_ret_void(zj_ctx* ctx);
 void zj_ctx_end_func(zj_ctx* ctx);
@@ -314,8 +325,6 @@ int32_t zj_compile_lut1d_u8_neon(
     zj_runtime* rt,
     const uint8_t* table_256,
     uint32_t clip_idx,
-    uint32_t width,
-    uint32_t height,
     void** out_fn,
     size_t* out_size,
     uint8_t* out_execmem_denied

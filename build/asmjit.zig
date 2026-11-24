@@ -41,9 +41,16 @@ pub fn create(
 ) Bundle {
     const asmjit_dep = b.dependency("asmjit", .{});
 
+    // Compile upstream AsmJit with at least ReleaseSafe optimization so Clang
+    // enables stack-slot coloring inside huge switch tables (x86/a64 Assembler::_emit
+    // and UniCompiler::emit_{2v,3v} exceed 130 KiB combined at -O0 and overflow
+    // musl's 128 KiB default worker-thread stack during dynamic getFrame compiles),
+    // while still keeping ASMJIT_BUILD_DEBUG assertions and UBSan in Debug builds.
+    const asmjit_optimize: std.lang.Optimize = if (optimize == .debug) .safe else optimize;
+
     const asmjit_mod = b.createModule(.{
         .target = target,
-        .optimize = optimize,
+        .optimize = asmjit_optimize,
         .pic = if (target.result.ofmt == .elf) true else null,
         .link_libc = true,
         .link_libcpp = true,

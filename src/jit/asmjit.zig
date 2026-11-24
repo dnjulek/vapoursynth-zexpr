@@ -16,6 +16,15 @@ pub const ExprPlaneFn = *const fn (
     props: ?[*]const f32,
 ) callconv(.c) void;
 
+pub const LutPlaneFn = *const fn (
+    dst: [*]u8,
+    dst_stride: isize,
+    srcs: [*]const [*]const u8,
+    src_strides: [*]const isize,
+    width: usize,
+    height: usize,
+) callconv(.c) void;
+
 pub const Reg = struct {
     raw: c.zj_reg_t,
 
@@ -244,6 +253,11 @@ pub const CompiledKernel = struct {
     code_size: usize,
 };
 
+pub const LutKernel = struct {
+    func: LutPlaneFn,
+    code_size: usize,
+};
+
 pub const Runtime = struct {
     raw: *c.zj_runtime,
 
@@ -261,6 +275,10 @@ pub const Runtime = struct {
     }
 
     pub fn release(self: *Runtime, func: ExprPlaneFn) void {
+        c.zj_runtime_release(self.raw, @ptrFromInt(@intFromPtr(func)));
+    }
+
+    pub fn releaseLut(self: *Runtime, func: LutPlaneFn) void {
         c.zj_runtime_release(self.raw, @ptrFromInt(@intFromPtr(func)));
     }
 };
@@ -294,6 +312,10 @@ pub const Builder = struct {
         if (c.zj_ctx_begin_func(self.raw) != 0) return error.CompileFailed;
     }
 
+    pub fn beginLutFunc(self: *Builder) JitError!void {
+        if (c.zj_ctx_begin_lut_func(self.raw) != 0) return error.CompileFailed;
+    }
+
     pub fn argGp(self: *Builder, index: u32) Reg {
         return .{ .raw = c.zj_ctx_arg_gp(self.raw, index) };
     }
@@ -307,6 +329,22 @@ pub const Builder = struct {
     }
 
     pub fn finalize(self: *Builder) JitError!CompiledKernel {
+        var fn_ptr: ?*anyopaque = null;
+        var code_size: usize = 0;
+        var execmem_denied: u8 = 0;
+        const rc = c.zj_ctx_finalize(self.raw, &fn_ptr, &code_size, &execmem_denied);
+        if (rc != 0) {
+            if (execmem_denied != 0) return error.ExecMemDenied;
+            return error.CompileFailed;
+        }
+        const ptr = fn_ptr orelse return error.CompileFailed;
+        return .{
+            .func = @ptrCast(@alignCast(ptr)),
+            .code_size = code_size,
+        };
+    }
+
+    pub fn finalizeLut(self: *Builder) JitError!LutKernel {
         var fn_ptr: ?*anyopaque = null;
         var code_size: usize = 0;
         var execmem_denied: u8 = 0;
@@ -486,9 +524,7 @@ pub const Builder = struct {
         rt: *Runtime,
         table_256: *const [256]u8,
         clip_idx: u32,
-        width: usize,
-        height: usize,
-    ) JitError!CompiledKernel {
+    ) JitError!LutKernel {
         var fn_ptr: ?*anyopaque = null;
         var code_size: usize = 0;
         var execmem_denied: u8 = 0;
@@ -496,8 +532,6 @@ pub const Builder = struct {
             rt.raw,
             table_256,
             clip_idx,
-            @intCast(width),
-            @intCast(height),
             &fn_ptr,
             &code_size,
             &execmem_denied,
