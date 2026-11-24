@@ -12,6 +12,7 @@
 //! ~2.5x higher throughput than scalar lookups (~16.8 GB/s single-core on AVX2).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("../expr/ast.zig");
 const analysis_mod = @import("../expr/analysis.zig");
 const interp = @import("../expr/interp.zig");
@@ -240,6 +241,15 @@ pub const Lut = struct {
 
         switch (self.kind) {
             .lut1d_u8 => {
+                if (comptime builtin.cpu.arch.endian() == .little) {
+                    if (DstT == u16) {
+                        applyLut1dU8ToU16Packed8x(lut_vals, dst_base, dst_stride, s0_base, s0_stride, width, height);
+                        return;
+                    } else if (DstT == u32) {
+                        applyLut1dU8ToU32Packed8x(lut_vals, dst_base, dst_stride, s0_base, s0_stride, width, height);
+                        return;
+                    }
+                }
                 for (0..height) |y| {
                     const d_row: [*]DstT = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
                     const s_row = offsetRow(s0_base, s0_stride, y);
@@ -260,10 +270,33 @@ pub const Lut = struct {
                 }
             },
             .lut1d_u16 => {
+                if (comptime builtin.cpu.arch.endian() == .little) {
+                    if (DstT == u16) {
+                        applyLut1dU16Packed8x(lut_vals, dst_base, dst_stride, s0_base, s0_stride, width, height);
+                        return;
+                    } else if (DstT == u8) {
+                        applyLut1dU16ToU8Packed8x(lut_vals, dst_base, dst_stride, s0_base, s0_stride, width, height);
+                        return;
+                    } else if (DstT == u32) {
+                        applyLut1dU16ToU32Packed8x(lut_vals, dst_base, dst_stride, s0_base, s0_stride, width, height);
+                        return;
+                    }
+                }
                 for (0..height) |y| {
                     const d_row: [*]DstT = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
                     const s_row: [*]const u16 = @ptrCast(@alignCast(offsetRow(s0_base, s0_stride, y)));
-                    for (0..width) |x| {
+                    var x: usize = 0;
+                    while (x + 4 <= width) : (x += 4) {
+                        const v0 = lut_vals[s_row[x]];
+                        const v1 = lut_vals[s_row[x + 1]];
+                        const v2 = lut_vals[s_row[x + 2]];
+                        const v3 = lut_vals[s_row[x + 3]];
+                        d_row[x] = v0;
+                        d_row[x + 1] = v1;
+                        d_row[x + 2] = v2;
+                        d_row[x + 3] = v3;
+                    }
+                    while (x < width) : (x += 1) {
                         d_row[x] = lut_vals[s_row[x]];
                     }
                 }
@@ -272,11 +305,33 @@ pub const Lut = struct {
                 const c1 = self.clips[1];
                 const s1_base = srcs[c1];
                 const s1_stride = src_strides[c1];
+                // Packed 8x `u64` wins +28%..+61% on AArch64 (wide GP regfile + 1-cycle `ubfx`/`orr`),
+                // whereas 4x scalar wins on x86-64 (1,080 vs 877 fps on Zen 3 due to GP pressure).
+                if (comptime builtin.cpu.arch.isAARCH64() and builtin.cpu.arch.endian() == .little) {
+                    if (DstT == u8) {
+                        applyLut2dU8ToU8Packed8x(lut_vals, dst_base, dst_stride, s0_base, s0_stride, s1_base, s1_stride, width, height);
+                        return;
+                    } else if (DstT == u16) {
+                        applyLut2dU8ToU16Packed8x(lut_vals, dst_base, dst_stride, s0_base, s0_stride, s1_base, s1_stride, width, height);
+                        return;
+                    }
+                }
                 for (0..height) |y| {
                     const d_row: [*]DstT = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
                     const r0 = offsetRow(s0_base, s0_stride, y);
                     const r1 = offsetRow(s1_base, s1_stride, y);
-                    for (0..width) |x| {
+                    var x: usize = 0;
+                    while (x + 4 <= width) : (x += 4) {
+                        const v0 = lut_vals[(@as(usize, r1[x]) << 8) | r0[x]];
+                        const v1 = lut_vals[(@as(usize, r1[x + 1]) << 8) | r0[x + 1]];
+                        const v2 = lut_vals[(@as(usize, r1[x + 2]) << 8) | r0[x + 2]];
+                        const v3 = lut_vals[(@as(usize, r1[x + 3]) << 8) | r0[x + 3]];
+                        d_row[x] = v0;
+                        d_row[x + 1] = v1;
+                        d_row[x + 2] = v2;
+                        d_row[x + 3] = v3;
+                    }
+                    while (x < width) : (x += 1) {
                         const idx: usize = (@as(usize, r1[x]) << 8) | r0[x];
                         d_row[x] = lut_vals[idx];
                     }
@@ -297,6 +352,9 @@ fn compileU8LutPlane(
     width: usize,
     height: usize,
 ) aj.JitError!aj.CompiledKernel {
+    if (cpu.isa == .neon) {
+        return aj.Builder.compileLut1dU8Neon(rt, table_256, @intCast(clip_idx), width, height);
+    }
     var b = try aj.Builder.init(rt, cpu, false);
     defer b.deinit();
     try b.beginFunc();
@@ -354,6 +412,327 @@ inline fn offsetRowMut(base: [*]u8, stride: isize, y: usize) [*]u8 {
     return base - @as(usize, @intCast(-byte_off));
 }
 
+inline fn lookupPack4U16(lut_vals: [*]const u16, p: u64) u64 {
+    const a0: u64 = lut_vals[@as(u16, @truncate(p))];
+    const a1: u64 = lut_vals[@as(u16, @truncate(p >> 16))];
+    const a2: u64 = lut_vals[@as(u16, @truncate(p >> 32))];
+    const a3: u64 = lut_vals[@as(u16, @truncate(p >> 48))];
+    return (a0 | (a1 << 16)) | ((a2 | (a3 << 16)) << 32);
+}
+
+/// 8-pixel/iter `u64`-packed 1D `u16 -> u16` (and `f16 -> f16`) LUT apply loop.
+/// Compiles on AArch64 to `ldp` + 8 independent `ldrh` lookups + `orr` + `stp`,
+/// cutting load/store uops by ~40% on wide-L1D cores (Apple M-series: +64% over 1x scalar).
+fn applyLut1dU16Packed8x(
+    noalias lut_vals: [*]const u16,
+    dst_base: [*]u8,
+    dst_stride: isize,
+    s0_base: [*]const u8,
+    s0_stride: isize,
+    width: usize,
+    height: usize,
+) void {
+    for (0..height) |y| {
+        const d_row: [*]u16 = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
+        const s_row: [*]const u16 = @ptrCast(@alignCast(offsetRow(s0_base, s0_stride, y)));
+        lutRowU16ToU16(d_row, s_row, lut_vals, width);
+    }
+}
+
+fn lutRowU16ToU16(
+    noalias d_row: [*]u16,
+    noalias s_row: [*]const u16,
+    noalias lut_vals: [*]const u16,
+    width: usize,
+) void {
+    var sp: [*]align(2) const u64 = @ptrCast(s_row);
+    var dp: [*]align(2) u64 = @ptrCast(d_row);
+    var chunks = width >> 3;
+    while (chunks != 0) : (chunks -= 1) {
+        const p0 = sp[0];
+        const p1 = sp[1];
+        sp += 2;
+        dp[0] = lookupPack4U16(lut_vals, p0);
+        dp[1] = lookupPack4U16(lut_vals, p1);
+        dp += 2;
+    }
+    var x = width & ~@as(usize, 7);
+    while (x < width) : (x += 1) {
+        d_row[x] = lut_vals[s_row[x]];
+    }
+}
+
+fn applyLut1dU16ToU8Packed8x(
+    noalias lut_vals: [*]const u8,
+    dst_base: [*]u8,
+    dst_stride: isize,
+    s0_base: [*]const u8,
+    s0_stride: isize,
+    width: usize,
+    height: usize,
+) void {
+    for (0..height) |y| {
+        const d_row = offsetRowMut(dst_base, dst_stride, y);
+        const s_row: [*]const u16 = @ptrCast(@alignCast(offsetRow(s0_base, s0_stride, y)));
+        lutRowU16ToU8(d_row, s_row, lut_vals, width);
+    }
+}
+
+fn lutRowU16ToU8(
+    noalias d_row: [*]u8,
+    noalias s_row: [*]const u16,
+    noalias lut_vals: [*]const u8,
+    width: usize,
+) void {
+    var sp: [*]align(2) const u64 = @ptrCast(s_row);
+    var dp: [*]align(1) u64 = @ptrCast(d_row);
+    var chunks = width >> 3;
+    while (chunks != 0) : (chunks -= 1) {
+        const p0 = sp[0];
+        const p1 = sp[1];
+        sp += 2;
+        const v0: u64 = lut_vals[@as(u16, @truncate(p0))];
+        const v1: u64 = lut_vals[@as(u16, @truncate(p0 >> 16))];
+        const v2: u64 = lut_vals[@as(u16, @truncate(p0 >> 32))];
+        const v3: u64 = lut_vals[@as(u16, @truncate(p0 >> 48))];
+        const v4: u64 = lut_vals[@as(u16, @truncate(p1))];
+        const v5: u64 = lut_vals[@as(u16, @truncate(p1 >> 16))];
+        const v6: u64 = lut_vals[@as(u16, @truncate(p1 >> 32))];
+        const v7: u64 = lut_vals[@as(u16, @truncate(p1 >> 48))];
+        const lo = (v0 | (v1 << 8)) | ((v2 | (v3 << 8)) << 16);
+        const hi = (v4 | (v5 << 8)) | ((v6 | (v7 << 8)) << 16);
+        dp[0] = lo | (hi << 32);
+        dp += 1;
+    }
+    var x = width & ~@as(usize, 7);
+    while (x < width) : (x += 1) {
+        d_row[x] = lut_vals[s_row[x]];
+    }
+}
+
+fn applyLut1dU16ToU32Packed8x(
+    lut_vals: [*]const u32,
+    dst_base: [*]u8,
+    dst_stride: isize,
+    s0_base: [*]const u8,
+    s0_stride: isize,
+    width: usize,
+    height: usize,
+) void {
+    const chunks_per_row = width >> 3;
+    const tail_start = width & ~@as(usize, 7);
+    for (0..height) |y| {
+        const d_row: [*]u32 = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
+        const s_row: [*]const u16 = @ptrCast(@alignCast(offsetRow(s0_base, s0_stride, y)));
+        var sp: [*]align(2) const u64 = @ptrCast(s_row);
+        var dp: [*]align(4) u64 = @ptrCast(d_row);
+        var chunks = chunks_per_row;
+        while (chunks != 0) : (chunks -= 1) {
+            const p0 = sp[0];
+            const p1 = sp[1];
+            sp += 2;
+            const v0: u64 = lut_vals[@as(u16, @truncate(p0))];
+            const v1: u64 = lut_vals[@as(u16, @truncate(p0 >> 16))];
+            const v2: u64 = lut_vals[@as(u16, @truncate(p0 >> 32))];
+            const v3: u64 = lut_vals[@as(u16, @truncate(p0 >> 48))];
+            const v4: u64 = lut_vals[@as(u16, @truncate(p1))];
+            const v5: u64 = lut_vals[@as(u16, @truncate(p1 >> 16))];
+            const v6: u64 = lut_vals[@as(u16, @truncate(p1 >> 32))];
+            const v7: u64 = lut_vals[@as(u16, @truncate(p1 >> 48))];
+            dp[0] = v0 | (v1 << 32);
+            dp[1] = v2 | (v3 << 32);
+            dp[2] = v4 | (v5 << 32);
+            dp[3] = v6 | (v7 << 32);
+            dp += 4;
+        }
+        var x = tail_start;
+        while (x < width) : (x += 1) {
+            d_row[x] = lut_vals[s_row[x]];
+        }
+    }
+}
+
+fn applyLut1dU8ToU16Packed8x(
+    lut_vals: [*]const u16,
+    dst_base: [*]u8,
+    dst_stride: isize,
+    s0_base: [*]const u8,
+    s0_stride: isize,
+    width: usize,
+    height: usize,
+) void {
+    const chunks_per_row = width >> 3;
+    const tail_start = width & ~@as(usize, 7);
+    for (0..height) |y| {
+        const d_row: [*]u16 = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
+        const s_row = offsetRow(s0_base, s0_stride, y);
+        var sp: [*]align(1) const u64 = @ptrCast(s_row);
+        var dp: [*]align(2) u64 = @ptrCast(d_row);
+        var chunks = chunks_per_row;
+        while (chunks != 0) : (chunks -= 1) {
+            const p = sp[0];
+            sp += 1;
+            const v0: u64 = lut_vals[@as(u8, @truncate(p))];
+            const v1: u64 = lut_vals[@as(u8, @truncate(p >> 8))];
+            const v2: u64 = lut_vals[@as(u8, @truncate(p >> 16))];
+            const v3: u64 = lut_vals[@as(u8, @truncate(p >> 24))];
+            const v4: u64 = lut_vals[@as(u8, @truncate(p >> 32))];
+            const v5: u64 = lut_vals[@as(u8, @truncate(p >> 40))];
+            const v6: u64 = lut_vals[@as(u8, @truncate(p >> 48))];
+            const v7: u64 = lut_vals[@as(u8, @truncate(p >> 56))];
+            dp[0] = (v0 | (v1 << 16)) | ((v2 | (v3 << 16)) << 32);
+            dp[1] = (v4 | (v5 << 16)) | ((v6 | (v7 << 16)) << 32);
+            dp += 2;
+        }
+        var x = tail_start;
+        while (x < width) : (x += 1) {
+            d_row[x] = lut_vals[s_row[x]];
+        }
+    }
+}
+
+fn applyLut1dU8ToU32Packed8x(
+    lut_vals: [*]const u32,
+    dst_base: [*]u8,
+    dst_stride: isize,
+    s0_base: [*]const u8,
+    s0_stride: isize,
+    width: usize,
+    height: usize,
+) void {
+    const chunks_per_row = width >> 3;
+    const tail_start = width & ~@as(usize, 7);
+    for (0..height) |y| {
+        const d_row: [*]u32 = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
+        const s_row = offsetRow(s0_base, s0_stride, y);
+        var sp: [*]align(1) const u64 = @ptrCast(s_row);
+        var dp: [*]align(4) u64 = @ptrCast(d_row);
+        var chunks = chunks_per_row;
+        while (chunks != 0) : (chunks -= 1) {
+            const p = sp[0];
+            sp += 1;
+            const v0: u64 = lut_vals[@as(u8, @truncate(p))];
+            const v1: u64 = lut_vals[@as(u8, @truncate(p >> 8))];
+            const v2: u64 = lut_vals[@as(u8, @truncate(p >> 16))];
+            const v3: u64 = lut_vals[@as(u8, @truncate(p >> 24))];
+            const v4: u64 = lut_vals[@as(u8, @truncate(p >> 32))];
+            const v5: u64 = lut_vals[@as(u8, @truncate(p >> 40))];
+            const v6: u64 = lut_vals[@as(u8, @truncate(p >> 48))];
+            const v7: u64 = lut_vals[@as(u8, @truncate(p >> 56))];
+            dp[0] = v0 | (v1 << 32);
+            dp[1] = v2 | (v3 << 32);
+            dp[2] = v4 | (v5 << 32);
+            dp[3] = v6 | (v7 << 32);
+            dp += 4;
+        }
+        var x = tail_start;
+        while (x < width) : (x += 1) {
+            d_row[x] = lut_vals[s_row[x]];
+        }
+    }
+}
+
+fn applyLut2dU8ToU8Packed8x(
+    noalias lut_vals: [*]const u8,
+    dst_base: [*]u8,
+    dst_stride: isize,
+    s0_base: [*]const u8,
+    s0_stride: isize,
+    s1_base: [*]const u8,
+    s1_stride: isize,
+    width: usize,
+    height: usize,
+) void {
+    for (0..height) |y| {
+        const d_row = offsetRowMut(dst_base, dst_stride, y);
+        const r0 = offsetRow(s0_base, s0_stride, y);
+        const r1 = offsetRow(s1_base, s1_stride, y);
+        lutRow2dU8ToU8(d_row, r0, r1, lut_vals, width);
+    }
+}
+
+fn lutRow2dU8ToU8(
+    noalias d_row: [*]u8,
+    noalias r0: [*]const u8,
+    noalias r1: [*]const u8,
+    noalias lut_vals: [*]const u8,
+    width: usize,
+) void {
+    var sp0: [*]align(1) const u64 = @ptrCast(r0);
+    var sp1: [*]align(1) const u64 = @ptrCast(r1);
+    var dp: [*]align(1) u64 = @ptrCast(d_row);
+    var chunks = width >> 3;
+    while (chunks != 0) : (chunks -= 1) {
+        const a = sp0[0];
+        const b = sp1[0];
+        sp0 += 1;
+        sp1 += 1;
+        const v0: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b))) << 8) | @as(u8, @truncate(a))];
+        const v1: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 8))) << 8) | @as(u8, @truncate(a >> 8))];
+        const v2: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 16))) << 8) | @as(u8, @truncate(a >> 16))];
+        const v3: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 24))) << 8) | @as(u8, @truncate(a >> 24))];
+        const v4: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 32))) << 8) | @as(u8, @truncate(a >> 32))];
+        const v5: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 40))) << 8) | @as(u8, @truncate(a >> 40))];
+        const v6: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 48))) << 8) | @as(u8, @truncate(a >> 48))];
+        const v7: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 56))) << 8) | @as(u8, @truncate(a >> 56))];
+        const lo = (v0 | (v1 << 8)) | ((v2 | (v3 << 8)) << 16);
+        const hi = (v4 | (v5 << 8)) | ((v6 | (v7 << 8)) << 16);
+        dp[0] = lo | (hi << 32);
+        dp += 1;
+    }
+    var x = width & ~@as(usize, 7);
+    while (x < width) : (x += 1) {
+        const idx: usize = (@as(usize, r1[x]) << 8) | r0[x];
+        d_row[x] = lut_vals[idx];
+    }
+}
+
+fn applyLut2dU8ToU16Packed8x(
+    lut_vals: [*]const u16,
+    dst_base: [*]u8,
+    dst_stride: isize,
+    s0_base: [*]const u8,
+    s0_stride: isize,
+    s1_base: [*]const u8,
+    s1_stride: isize,
+    width: usize,
+    height: usize,
+) void {
+    const chunks_per_row = width >> 3;
+    const tail_start = width & ~@as(usize, 7);
+    for (0..height) |y| {
+        const d_row: [*]u16 = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
+        const r0 = offsetRow(s0_base, s0_stride, y);
+        const r1 = offsetRow(s1_base, s1_stride, y);
+        var sp0: [*]align(1) const u64 = @ptrCast(r0);
+        var sp1: [*]align(1) const u64 = @ptrCast(r1);
+        var dp: [*]align(2) u64 = @ptrCast(d_row);
+        var chunks = chunks_per_row;
+        while (chunks != 0) : (chunks -= 1) {
+            const a = sp0[0];
+            const b = sp1[0];
+            sp0 += 1;
+            sp1 += 1;
+            const v0: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b))) << 8) | @as(u8, @truncate(a))];
+            const v1: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 8))) << 8) | @as(u8, @truncate(a >> 8))];
+            const v2: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 16))) << 8) | @as(u8, @truncate(a >> 16))];
+            const v3: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 24))) << 8) | @as(u8, @truncate(a >> 24))];
+            const v4: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 32))) << 8) | @as(u8, @truncate(a >> 32))];
+            const v5: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 40))) << 8) | @as(u8, @truncate(a >> 40))];
+            const v6: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 48))) << 8) | @as(u8, @truncate(a >> 48))];
+            const v7: u64 = lut_vals[(@as(usize, @as(u8, @truncate(b >> 56))) << 8) | @as(u8, @truncate(a >> 56))];
+            dp[0] = (v0 | (v1 << 16)) | ((v2 | (v3 << 16)) << 32);
+            dp[1] = (v4 | (v5 << 16)) | ((v6 | (v7 << 16)) << 32);
+            dp += 2;
+        }
+        var x = tail_start;
+        while (x < width) : (x += 1) {
+            const idx: usize = (@as(usize, r1[x]) << 8) | r0[x];
+            d_row[x] = lut_vals[idx];
+        }
+    }
+}
+
 test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD u8 LUT" {
     const parser = @import("../expr/parser.zig");
     const lower_mod = @import("../expr/lower.zig");
@@ -374,7 +753,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         try lower_mod.lower(allocator, &prog, profile);
         try optimize_mod.optimize(allocator, &prog, profile, .{});
 
-        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt10, 16, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt10, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info.lut_kind);
 
@@ -401,10 +780,32 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
             .props = &.{},
         });
         try std.testing.expectEqualSlices(u16, &dst_ref, &dst_lut);
+
+        // Verify 8x u64-packed 1D u16 LUT across odd and multi-chunk widths (1..33, height=3).
+        var src_wide: [3 * 36]u16 align(64) = undefined;
+        for (&src_wide, 0..) |*slot, i| {
+            slot.* = @intCast((i * 19937 + 12345) & 0xffff);
+        }
+        const table_u16: [*]const u16 = @ptrCast(@alignCast(lut.table.ptr));
+        const wide_widths = [_]usize{ 1, 3, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33 };
+        const wide_srcs = [_][*]const u8{@ptrCast(&src_wide)};
+        const wide_strides = [_]isize{72};
+
+        for (wide_widths) |w| {
+            var ref_buf: [3 * 36]u16 align(64) = @splat(0);
+            for (0..3) |y| {
+                for (0..w) |x| {
+                    ref_buf[y * 36 + x] = table_u16[src_wide[y * 36 + x]];
+                }
+            }
+            var out_buf: [3 * 36]u16 align(64) = @splat(0);
+            lut.apply(@ptrCast(&out_buf), 72, &wide_srcs, &wide_strides, w, 3);
+            try std.testing.expectEqualSlices(u16, &ref_buf, &out_buf);
+        }
     }
 
-    // 1b. Low-cost u16 expressions (cost < 24, e.g. prefilter range mask) stay on AVX2/NEON SIMD
-    // rather than hitting L2 via the 128 KB 1D u16 LUT.
+    // 1b. Low-cost u16 expressions (cost < 16, e.g. prefilter range mask) stay on AVX2/NEON SIMD
+    // rather than hitting L2 via the 128 KB 1D u16 LUT; exp/poly8 use LUT on 4-lane CPUs and SIMD on 8+ lanes.
     {
         const fmt16 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 16 };
         const fmts = [_]ast.SampleFormat{fmt16};
@@ -412,10 +813,32 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer prog.deinit(allocator);
         try lower_mod.lower(allocator, &prog, profile);
         try optimize_mod.optimize(allocator, &prog, profile, .{});
-        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt16, 16, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info.lut_kind);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info.fallback_lut_kind);
+
+        var p_exp = try parser.parse(allocator, "x 65535 / exp 24000 *", .{ .num_clips = 1 });
+        defer p_exp.deinit(allocator);
+        try lower_mod.lower(allocator, &p_exp, profile);
+        try optimize_mod.optimize(allocator, &p_exp, profile, .{});
+        var i_exp4 = try analysis_mod.analyze(allocator, &p_exp, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = true, .f32_lanes = 4 });
+        defer i_exp4.deinit(allocator);
+        try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, i_exp4.lut_kind);
+        var i_exp8 = try analysis_mod.analyze(allocator, &p_exp, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = true, .f32_lanes = 8 });
+        defer i_exp8.deinit(allocator);
+        try std.testing.expectEqual(analysis_mod.LutKind.none, i_exp8.lut_kind);
+
+        var p_poly = try parser.parse(allocator, "x 65535 / T! T@ 0.1 * 0.2 + T@ * 0.3 + T@ * 0.4 + T@ * 0.5 + T@ * 0.6 + T@ * 0.7 + T@ * 0.8 + 65535 *", .{ .num_clips = 1 });
+        defer p_poly.deinit(allocator);
+        try lower_mod.lower(allocator, &p_poly, profile);
+        try optimize_mod.optimize(allocator, &p_poly, profile, .{ .enable_fma = true });
+        var i_poly4 = try analysis_mod.analyze(allocator, &p_poly, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = true, .f32_lanes = 4 });
+        defer i_poly4.deinit(allocator);
+        try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, i_poly4.lut_kind);
+        var i_poly8 = try analysis_mod.analyze(allocator, &p_poly, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = true, .f32_lanes = 8 });
+        defer i_poly8.deinit(allocator);
+        try std.testing.expectEqual(analysis_mod.LutKind.none, i_poly8.lut_kind);
     }
 
     // 1c. Scalar non-u8 LUTs (`u8 -> f32`) and 64 KB 2D `u8x8` LUTs bypass LUT for cost < 24
@@ -430,7 +853,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_pref.deinit(allocator);
         try lower_mod.lower(allocator, &p_pref, profile);
         try optimize_mod.optimize(allocator, &p_pref, profile, .{});
-        var i_pref = try analysis_mod.analyze(allocator, &p_pref, &fmts1, fmtf32, 16, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var i_pref = try analysis_mod.analyze(allocator, &p_pref, &fmts1, fmtf32, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_pref.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, i_pref.lut_kind);
 
@@ -438,7 +861,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_gam.deinit(allocator);
         try lower_mod.lower(allocator, &p_gam, profile);
         try optimize_mod.optimize(allocator, &p_gam, profile, .{});
-        var i_gam = try analysis_mod.analyze(allocator, &p_gam, &fmts1, fmtf32, 16, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var i_gam = try analysis_mod.analyze(allocator, &p_gam, &fmts1, fmtf32, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_gam.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, i_gam.lut_kind);
 
@@ -446,7 +869,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_2sqrt.deinit(allocator);
         try lower_mod.lower(allocator, &p_2sqrt, profile);
         try optimize_mod.optimize(allocator, &p_2sqrt, profile, .{});
-        var i_2sqrt = try analysis_mod.analyze(allocator, &p_2sqrt, &fmts2, fmt8, 16, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var i_2sqrt = try analysis_mod.analyze(allocator, &p_2sqrt, &fmts2, fmt8, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_2sqrt.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, i_2sqrt.lut_kind);
 
@@ -454,7 +877,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_2pow.deinit(allocator);
         try lower_mod.lower(allocator, &p_2pow, profile);
         try optimize_mod.optimize(allocator, &p_2pow, profile, .{});
-        var i_2pow = try analysis_mod.analyze(allocator, &p_2pow, &fmts2, fmt8, 16, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var i_2pow = try analysis_mod.analyze(allocator, &p_2pow, &fmts2, fmt8, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_2pow.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut2d_u8, i_2pow.lut_kind);
 
@@ -462,7 +885,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_i16.deinit(allocator);
         try lower_mod.lower(allocator, &p_i16, profile);
         try optimize_mod.optimize(allocator, &p_i16, profile, .{});
-        var i_i16 = try analysis_mod.analyze(allocator, &p_i16, &fmts1, fmt8, 16, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var i_i16 = try analysis_mod.analyze(allocator, &p_i16, &fmts1, fmt8, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_i16.deinit(allocator);
         try std.testing.expect(i_i16.int16_plan.eligible);
         try std.testing.expectEqual(analysis_mod.LutKind.none, i_i16.lut_kind);
@@ -477,7 +900,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         try lower_mod.lower(allocator, &prog, profile);
         try optimize_mod.optimize(allocator, &prog, profile, .{});
 
-        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, 256, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, 256, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info.lut_kind);
 
@@ -508,6 +931,36 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
             .props = &.{},
         });
         try std.testing.expectEqualSlices(u8, &dst_ref, &dst_lut);
+
+        // AR3: Exercise SIMD u8 LUT (including NEON 32B/16B `tbl`/`tbx` tail) across odd & boundary widths 1..65.
+        var src_tail: [2 * 128]u8 align(64) = undefined;
+        for (0..src_tail.len) |i| src_tail[i] = @intCast((i * 53 + 11) & 255);
+        for ([_]usize{ 1, 2, 3, 7, 8, 15, 16, 17, 23, 24, 31, 32, 33, 47, 48, 49, 63, 64, 65 }) |w| {
+            var lut_w = try Lut.build(allocator, &rt, cpu, profile, &prog, &info, &fmts, fmt8, w, 2, null);
+            defer lut_w.deinit(allocator, &rt);
+            const row_stride: usize = std.mem.alignForward(usize, w, if (cpu.has_avx512) 64 else 32);
+            var out_lut: [2 * 128]u8 align(64) = @splat(0xA5);
+            var out_ref: [2 * 128]u8 align(64) = @splat(0xA5);
+            const s_arr = [_][*]const u8{&src_tail};
+            const st_arr = [_]isize{@intCast(row_stride)};
+            lut_w.apply(&out_lut, @intCast(row_stride), &s_arr, &st_arr, w, 2);
+            try interp.evalPlane(allocator, &prog, profile, .{
+                .dst = &out_ref,
+                .dst_stride = @intCast(row_stride),
+                .dst_fmt = fmt8,
+                .srcs = &s_arr,
+                .src_strides = &st_arr,
+                .src_fmts = &fmts,
+                .width = w,
+                .height = 2,
+                .frame_n = 0,
+                .props = &.{},
+            });
+            for (0..2) |y| {
+                const row_off = y * row_stride;
+                try std.testing.expectEqualSlices(u8, out_ref[row_off .. row_off + w], out_lut[row_off .. row_off + w]);
+            }
+        }
     }
 
     // 3. Asymmetric 2D u8x8 LUT (`lut2d_u8`) matches oracle bit-for-bit (V14).
@@ -519,7 +972,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         try lower_mod.lower(allocator, &prog, profile);
         try optimize_mod.optimize(allocator, &prog, profile, .{});
 
-        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, 64, 4, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, 64, 4, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut2d_u8, info.lut_kind);
 
@@ -563,7 +1016,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_cheap.deinit(allocator);
         try lower_mod.lower(allocator, &p_cheap, profile);
         try optimize_mod.optimize(allocator, &p_cheap, profile, .{});
-        var info_cheap = try analysis_mod.analyze(allocator, &p_cheap, &fmts, fmt_f32, 1920, 1080, true);
+        var info_cheap = try analysis_mod.analyze(allocator, &p_cheap, &fmts, fmt_f32, 1920, 1080, .{ .has_fast_u8_lut = true });
         defer info_cheap.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info_cheap.lut_kind);
 
@@ -571,7 +1024,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_heavy.deinit(allocator);
         try lower_mod.lower(allocator, &p_heavy, profile);
         try optimize_mod.optimize(allocator, &p_heavy, profile, .{});
-        var info_heavy = try analysis_mod.analyze(allocator, &p_heavy, &fmts, fmt_f32, 1920, 1080, true);
+        var info_heavy = try analysis_mod.analyze(allocator, &p_heavy, &fmts, fmt_f32, 1920, 1080, .{ .has_fast_u8_lut = true });
         defer info_heavy.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_heavy.lut_kind);
 
@@ -581,10 +1034,10 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_lin.deinit(allocator);
         try lower_mod.lower(allocator, &p_lin, profile);
         try optimize_mod.optimize(allocator, &p_lin, profile, .{});
-        var info_lin_simd = try analysis_mod.analyze(allocator, &p_lin, &fmts, fmt8, 1920, 1080, true);
+        var info_lin_simd = try analysis_mod.analyze(allocator, &p_lin, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = true });
         defer info_lin_simd.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_lin_simd.lut_kind);
-        var info_lin_nosimd = try analysis_mod.analyze(allocator, &p_lin, &fmts, fmt8, 1920, 1080, false);
+        var info_lin_nosimd = try analysis_mod.analyze(allocator, &p_lin, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = false });
         defer info_lin_nosimd.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info_lin_nosimd.lut_kind);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_lin_nosimd.fallback_lut_kind);
@@ -595,7 +1048,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_u8_c10.deinit(allocator);
         try lower_mod.lower(allocator, &p_u8_c10, profile);
         try optimize_mod.optimize(allocator, &p_u8_c10, profile, .{});
-        var info_u8_c10 = try analysis_mod.analyze(allocator, &p_u8_c10, &fmts, fmt8, 1920, 1080, false);
+        var info_u8_c10 = try analysis_mod.analyze(allocator, &p_u8_c10, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = false });
         defer info_u8_c10.deinit(allocator);
         try std.testing.expect(info_u8_c10.u8_plan.eligible);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info_u8_c10.lut_kind);
@@ -605,7 +1058,7 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_i16_c9.deinit(allocator);
         try lower_mod.lower(allocator, &p_i16_c9, profile);
         try optimize_mod.optimize(allocator, &p_i16_c9, profile, .{});
-        var info_i16_c9 = try analysis_mod.analyze(allocator, &p_i16_c9, &fmts, fmt8, 1920, 1080, false);
+        var info_i16_c9 = try analysis_mod.analyze(allocator, &p_i16_c9, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = false });
         defer info_i16_c9.deinit(allocator);
         try std.testing.expect(info_i16_c9.int16_plan.eligible);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info_i16_c9.lut_kind);
@@ -615,8 +1068,128 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer p_gam.deinit(allocator);
         try lower_mod.lower(allocator, &p_gam, profile);
         try optimize_mod.optimize(allocator, &p_gam, profile, .{});
-        var info_gam_nosimd = try analysis_mod.analyze(allocator, &p_gam, &fmts, fmt8, 1920, 1080, false);
+        var info_gam_nosimd = try analysis_mod.analyze(allocator, &p_gam, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = false });
         defer info_gam_nosimd.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_gam_nosimd.lut_kind);
+    }
+
+    // 5. 1D f16 -> f16 LUT (128 KB) matches oracle bit-for-bit across special f16 bit patterns,
+    //    plus packed 8x mixed-depth (`u16->u8`, `u16->f32`, `u8->u16`, `u8->f32`) and `lut2d_u8` (`u8`, `u16`).
+    {
+        const fmt_f16 = ast.SampleFormat{ .is_float = true, .bits_per_sample = 16 };
+        const fmts_f16 = [_]ast.SampleFormat{fmt_f16};
+        var p_f16 = try parser.parse(allocator, "x abs 2.2 pow", .{ .num_clips = 1 });
+        defer p_f16.deinit(allocator);
+        try lower_mod.lower(allocator, &p_f16, profile);
+        try optimize_mod.optimize(allocator, &p_f16, profile, .{ .enable_fma = profile.use_fma });
+        var info_f16 = try analysis_mod.analyze(allocator, &p_f16, &fmts_f16, fmt_f16, 17, 2, .{ .has_fast_u8_lut = true, .f32_lanes = cpu.f32_lanes });
+        defer info_f16.deinit(allocator);
+        try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info_f16.lut_kind);
+
+        var lut_f16 = try Lut.build(allocator, &rt, cpu, profile, &p_f16, &info_f16, &fmts_f16, fmt_f16, 17, 2, null);
+        defer lut_f16.deinit(allocator, &rt);
+
+        // Cover +0.0, -0.0, subnormals, normal floats, negative floats, +inf, -inf, qNaN.
+        var src_f16 align(64) = [_]u16{
+            0x0000, 0x8000, 0x0001, 0x03ff, 0x3c00, 0xbc00, 0x3800, 0x4000,
+            0x4500, 0xc500, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0x3555,
+            0x3999,
+        };
+        var dst_lut: [17]u16 align(64) = @splat(0);
+        var dst_ref: [17]u16 align(64) = @splat(0);
+        const srcs = [_][*]const u8{@ptrCast(&src_f16)};
+        const strides = [_]isize{34};
+        lut_f16.apply(@ptrCast(&dst_lut), 34, &srcs, &strides, 17, 1);
+        try interp.evalPlane(allocator, &p_f16, profile, .{
+            .dst = @ptrCast(&dst_ref),
+            .dst_stride = 34,
+            .dst_fmt = fmt_f16,
+            .srcs = &srcs,
+            .src_strides = &strides,
+            .src_fmts = &fmts_f16,
+            .width = 17,
+            .height = 1,
+            .frame_n = 0,
+            .props = &.{},
+        });
+        try std.testing.expectEqualSlices(u16, &dst_ref, &dst_lut);
+
+        // Verify packed 8x helpers across odd & multi-chunk widths.
+        var s8_a: [2 * 28]u8 align(64) = undefined;
+        var s8_b: [2 * 28]u8 align(64) = undefined;
+        var s16_a: [2 * 28]u16 align(64) = undefined;
+        for (0..56) |i| {
+            s8_a[i] = @intCast((i * 37 + 5) & 255);
+            s8_b[i] = @intCast((i * 73 + 11) & 255);
+            s16_a[i] = @intCast((i * 19937 + 12345) & 0xffff);
+        }
+        const tbl8 = try allocator.alloc(u8, 65536);
+        defer allocator.free(tbl8);
+        const tbl16 = try allocator.alloc(u16, 65536);
+        defer allocator.free(tbl16);
+        const tbl32 = try allocator.alloc(u32, 65536);
+        defer allocator.free(tbl32);
+        for (0..65536) |i| {
+            tbl8[i] = @intCast((i * 29 + 7) & 255);
+            tbl16[i] = @intCast((i * 257 + 13) & 0xffff);
+            tbl32[i] = @intCast((i * 65537 + 19) & 0xffff_ffff);
+        }
+        for ([_]usize{ 1, 3, 7, 8, 9, 15, 16, 17, 25 }) |w| {
+            var d8: [56]u8 align(64) = @splat(0);
+            var r8: [56]u8 align(64) = @splat(0);
+            for (0..2) |y| for (0..w) |x| {
+                r8[y * 28 + x] = tbl8[(@as(usize, s8_b[y * 28 + x]) << 8) | s8_a[y * 28 + x]];
+            };
+            applyLut2dU8ToU8Packed8x(tbl8.ptr, &d8, 28, &s8_a, 28, &s8_b, 28, w, 2);
+            try std.testing.expectEqualSlices(u8, &r8, &d8);
+
+            var d16: [56]u16 align(64) = @splat(0);
+            var r16: [56]u16 align(64) = @splat(0);
+            applyLut2dU8ToU16Packed8x(tbl16.ptr, @ptrCast(&d16), 56, &s8_a, 28, &s8_b, 28, w, 2);
+            for (0..2) |y| for (0..w) |x| {
+                r16[y * 28 + x] = tbl16[(@as(usize, s8_b[y * 28 + x]) << 8) | s8_a[y * 28 + x]];
+            };
+            try std.testing.expectEqualSlices(u16, &r16, &d16);
+
+            @memset(&d16, 0);
+            @memset(&r16, 0);
+            for (0..2) |y| for (0..w) |x| {
+                r16[y * 28 + x] = tbl16[s16_a[y * 28 + x]];
+            };
+            applyLut1dU16Packed8x(tbl16.ptr, @ptrCast(&d16), 56, @ptrCast(&s16_a), 56, w, 2);
+            try std.testing.expectEqualSlices(u16, &r16, &d16);
+
+            @memset(&d8, 0);
+            @memset(&r8, 0);
+            for (0..2) |y| for (0..w) |x| {
+                r8[y * 28 + x] = tbl8[s16_a[y * 28 + x]];
+            };
+            applyLut1dU16ToU8Packed8x(tbl8.ptr, &d8, 28, @ptrCast(&s16_a), 56, w, 2);
+            try std.testing.expectEqualSlices(u8, &r8, &d8);
+
+            @memset(&d16, 0);
+            @memset(&r16, 0);
+            applyLut1dU8ToU16Packed8x(tbl16.ptr, @ptrCast(&d16), 56, &s8_a, 28, w, 2);
+            for (0..2) |y| for (0..w) |x| {
+                r16[y * 28 + x] = tbl16[s8_a[y * 28 + x]];
+            };
+            try std.testing.expectEqualSlices(u16, &r16, &d16);
+
+            var d32: [56]u32 align(64) = @splat(0);
+            var r32: [56]u32 align(64) = @splat(0);
+            applyLut1dU8ToU32Packed8x(tbl32.ptr, @ptrCast(&d32), 112, &s8_a, 28, w, 2);
+            for (0..2) |y| for (0..w) |x| {
+                r32[y * 28 + x] = tbl32[s8_a[y * 28 + x]];
+            };
+            try std.testing.expectEqualSlices(u32, &r32, &d32);
+
+            @memset(&d32, 0);
+            @memset(&r32, 0);
+            applyLut1dU16ToU32Packed8x(tbl32.ptr, @ptrCast(&d32), 112, @ptrCast(&s16_a), 56, w, 2);
+            for (0..2) |y| for (0..w) |x| {
+                r32[y * 28 + x] = tbl32[s16_a[y * 28 + x]];
+            };
+            try std.testing.expectEqualSlices(u32, &r32, &d32);
+        }
     }
 }

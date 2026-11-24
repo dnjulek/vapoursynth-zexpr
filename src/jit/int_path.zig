@@ -61,6 +61,7 @@ pub fn emitU8InteriorBody(
     src_row_ptrs: []const ?aj.Reg,
     row_ptr_resolver: anytype,
 ) std.mem.Allocator.Error!void {
+    _ = x_gp;
     const eval_root = prog.root;
     const n_nodes = prog.nodes.items.len;
     const slots = try allocator.alloc(?RegSlot, n_nodes);
@@ -139,14 +140,14 @@ pub fn emitU8InteriorBody(
             },
             .load_clip => |clip| {
                 const dst = acquireVec(b, &free_vecs);
-                b.vecLoad(.u_vec, dst, aj.Mem.indexed(src_row_ptrs[clip].?, x_gp, 0, 0));
+                b.vecLoad(.u_vec, dst, row_ptr_resolver.rowMem(src_row_ptrs[clip].?, 0, 0));
                 slots[idx] = .{ .reg = dst, .owned = true };
             },
             .load_rel => |rel| {
                 const dst = acquireVec(b, &free_vecs);
                 const row_ptr = row_ptr_resolver.rowPtrFor(rel.clip, rel.dy, rel.mode);
                 const eff_dx: i32 = interp.clampRelOffset(rel.dx, w_i32);
-                b.vecLoad(.u_vec, dst, aj.Mem.indexed(row_ptr, x_gp, 0, eff_dx));
+                b.vecLoad(.u_vec, dst, row_ptr_resolver.rowMem(row_ptr, 0, eff_dx));
                 slots[idx] = .{ .reg = dst, .owned = true };
             },
             .unary => |u| {
@@ -187,7 +188,7 @@ pub fn emitU8InteriorBody(
     }
 
     const res = slots[eval_root].?.reg;
-    b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 0, 0), res);
+    b.vecStore(.u_vec, row_ptr_resolver.rowMem(dst_ptr, 0, 0), res);
 }
 
 /// Emit native `u16` SIMD evaluation (`vec_bytes / 2` = 8/16/32 pixels per iteration, zero unpack/pack).
@@ -203,6 +204,7 @@ pub fn emitU16InteriorBody(
     src_row_ptrs: []const ?aj.Reg,
     row_ptr_resolver: anytype,
 ) std.mem.Allocator.Error!void {
+    _ = x_gp;
     const eval_root = prog.root;
     const n_nodes = prog.nodes.items.len;
     const slots = try allocator.alloc(?RegSlot, n_nodes);
@@ -256,14 +258,14 @@ pub fn emitU16InteriorBody(
             },
             .load_clip => |clip| {
                 const dst = b.newVec();
-                b.vecLoad(.u_vec, dst, aj.Mem.indexed(src_row_ptrs[clip].?, x_gp, 1, 0));
+                b.vecLoad(.u_vec, dst, row_ptr_resolver.rowMem(src_row_ptrs[clip].?, 1, 0));
                 slots[idx] = .{ .reg = dst, .owned = true };
             },
             .load_rel => |rel| {
                 const dst = b.newVec();
                 const row_ptr = row_ptr_resolver.rowPtrFor(rel.clip, rel.dy, rel.mode);
                 const eff_dx: i32 = interp.clampRelOffset(rel.dx, w_i32);
-                b.vecLoad(.u_vec, dst, aj.Mem.indexed(row_ptr, x_gp, 1, eff_dx * 2));
+                b.vecLoad(.u_vec, dst, row_ptr_resolver.rowMem(row_ptr, 1, eff_dx * 2));
                 slots[idx] = .{ .reg = dst, .owned = true };
             },
             .unary => |u| {
@@ -304,7 +306,7 @@ pub fn emitU16InteriorBody(
         b.vecOp3(.min_u16, clamped, res, constU16Splat(b, @intCast(dst_fmt.peakInt())));
         res = clamped;
     }
-    b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 1, 0), res);
+    b.vecStore(.u_vec, row_ptr_resolver.rowMem(dst_ptr, 1, 0), res);
 }
 
 fn isFusableBoolI16(nodes: []const ast.Node, rem_uses: []const u32, idx: ast.NodeIdx) bool {
@@ -444,6 +446,7 @@ fn evalI16Vector(
     row_ptr_resolver: anytype,
     free_vecs: *std.ArrayList(aj.Reg),
 ) std.mem.Allocator.Error!aj.Reg {
+    _ = x_gp;
     const final_shift = info.int16_plan.final_div_shift;
     const eval_root: ast.NodeIdx = if (info.int16_plan.eval_root != ast.invalid_node)
         info.int16_plan.eval_root
@@ -551,14 +554,14 @@ fn evalI16Vector(
             },
             .load_clip => |clip| {
                 const dst = acquireVec(b, free_vecs);
-                b.vecLoad(.cvt_u8_to_u16, dst, aj.Mem.indexed(src_row_ptrs[clip].?, x_gp, 0, col_disp));
+                b.vecLoad(.cvt_u8_to_u16, dst, row_ptr_resolver.rowMem(src_row_ptrs[clip].?, 0, col_disp));
                 slots[idx] = .{ .reg = dst, .owned = true };
             },
             .load_rel => |rel| {
                 const dst = acquireVec(b, free_vecs);
                 const row_ptr = row_ptr_resolver.rowPtrFor(rel.clip, rel.dy, rel.mode);
                 const eff_dx: i32 = interp.clampRelOffset(rel.dx, w_i32);
-                b.vecLoad(.cvt_u8_to_u16, dst, aj.Mem.indexed(row_ptr, x_gp, 0, eff_dx + col_disp));
+                b.vecLoad(.cvt_u8_to_u16, dst, row_ptr_resolver.rowMem(row_ptr, 0, eff_dx + col_disp));
                 slots[idx] = .{ .reg = dst, .owned = true };
             },
             .unary => |u| {
@@ -708,7 +711,7 @@ pub fn emitInteriorBody(
     var free_vecs: std.ArrayList(aj.Reg) = .empty;
     defer free_vecs.deinit(allocator);
     const res = try evalI16Vector(allocator, b, prog, info, width, x_gp, 0, src_row_ptrs, row_ptr_resolver, &free_vecs);
-    b.vecStoreU8FromI16(aj.Mem.indexed(dst_ptr, x_gp, 0, 0), res);
+    b.vecStoreU8FromI16(row_ptr_resolver.rowMem(dst_ptr, 0, 0), res);
 }
 
 /// 2x unrolled `i16` interior body (`4 * f32_lanes` pixels per iteration: 16 on 128b, 32 on AVX2, 64 on AVX-512)
@@ -729,7 +732,7 @@ pub fn emitInteriorBodyX2(
     const half_step: i32 = @intCast(b.cpu.f32_lanes * 2);
     const res0 = try evalI16Vector(allocator, b, prog, info, width, x_gp, 0, src_row_ptrs, row_ptr_resolver, &free_vecs);
     const res1 = try evalI16Vector(allocator, b, prog, info, width, x_gp, half_step, src_row_ptrs, row_ptr_resolver, &free_vecs);
-    b.vecStoreU8FromI16x2(aj.Mem.indexed(dst_ptr, x_gp, 0, 0), res0, res1);
+    b.vecStoreU8FromI16x2(row_ptr_resolver.rowMem(dst_ptr, 0, 0), res0, res1);
 }
 
 test "u8 and i16 fast paths match f32 oracle across u8 inputs including Y1 and Y2 edge cases" {
@@ -764,7 +767,7 @@ test "u8 and i16 fast paths match f32 oracle across u8 inputs including Y1 and Y
         try lower_mod.lower(allocator, &prog, profile);
         try optimize_mod.optimize(allocator, &prog, profile, .{});
 
-        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(tc.width), 3, aj.Builder.cpuSupportsFastLutU8(cpu));
+        var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(tc.width), 3, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
         try std.testing.expectEqual(tc.expect_u8, info.u8_plan.eligible);
         try std.testing.expectEqual(tc.expect_i16, info.int16_plan.eligible);
@@ -888,7 +891,7 @@ test "native u16 fast path matches f32 oracle across all host ISA tiers, u16, an
                 try lower_mod.lower(allocator, &prog, profile);
                 try optimize_mod.optimize(allocator, &prog, profile, .{});
 
-                var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt, @intCast(tc.width), 3, aj.Builder.cpuSupportsFastLutU8(cpu));
+                var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt, @intCast(tc.width), 3, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
                 defer info.deinit(allocator);
                 try std.testing.expectEqual(tc.expect_u16, info.u16_plan.eligible);
 

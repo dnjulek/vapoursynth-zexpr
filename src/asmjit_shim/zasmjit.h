@@ -291,7 +291,11 @@ void zj_gp32_from_vec(zj_ctx* ctx, zj_reg_t gp32, zj_reg_t vec);
 
 /* Minimal arch-specific escape hatches. */
 void zj_vec_cvt_f16_to_f32(zj_ctx* ctx, zj_reg_t dst, zj_mem_t mem);
+void zj_vec_cvt_f16_to_f32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem);
 void zj_vec_cvt_f32_to_f16(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src);
+void zj_vec_cvt_f32_to_f16x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0, zj_reg_t src1);
+void zj_vec_load_u_vecx2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem);
+void zj_vec_store_u_vecx2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0, zj_reg_t src1);
 void zj_vec_store_u8_from_i32(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i32);
 void zj_vec_store_u8_from_i32x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0_i32, zj_reg_t src1_i32);
 void zj_vec_store_u8_from_i16(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i16);
@@ -300,6 +304,16 @@ void zj_vec_store_u16_from_i32(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i32);
 void zj_vec_store_u16_from_i32x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0_i32, zj_reg_t src1_i32);
 uint8_t zj_cpu_supports_fast_lut_u8(const zj_cpu_info_t* cpu);
 void zj_vec_lut_u8_256(zj_ctx* ctx, zj_reg_t dst, zj_reg_t idx, const uint8_t* table_256);
+int32_t zj_compile_lut1d_u8_neon(
+    zj_runtime* rt,
+    const uint8_t* table_256,
+    uint32_t clip_idx,
+    uint32_t width,
+    uint32_t height,
+    void** out_fn,
+    size_t* out_size,
+    uint8_t* out_execmem_denied
+);
 void zj_vec_mul_c_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, float b_const);
 void zj_vec_add_c_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, float b_const);
 void zj_vec_sub_c_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, float b_const);

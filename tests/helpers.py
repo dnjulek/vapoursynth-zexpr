@@ -8,6 +8,15 @@ import sys
 import numpy as np
 import vapoursynth as vs
 
+# Shared SIMD / stride / two-phase boundary widths and heights (arm-review.md AR3).
+SIMD_WIDTHS = (
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 23, 24, 25, 31, 32, 33,
+    47, 48, 49, 63, 64, 65, 95, 97, 127, 128, 129, 191, 193, 255, 256, 257,
+)
+LARGE_WIDTHS = (720, 1366, 1925, 1930)
+POINT_HEIGHTS = (1, 3)
+SPATIAL_HEIGHTS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17)
+
 
 def plane_array(frame: vs.VideoFrame, plane: int) -> np.ndarray:
     return np.asarray(frame[plane]).copy()

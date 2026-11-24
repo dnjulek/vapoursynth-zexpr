@@ -77,6 +77,11 @@ fn addUsedClip(allocator: std.mem.Allocator, list: *std.ArrayList(ast.ClipId), c
     try list.append(allocator, clip);
 }
 
+pub const TargetHints = struct {
+    has_fast_u8_lut: bool = false,
+    f32_lanes: u32 = 8,
+};
+
 pub fn analyze(
     allocator: std.mem.Allocator,
     prog: *const ast.Program,
@@ -84,7 +89,7 @@ pub fn analyze(
     dst_fmt: ast.SampleFormat,
     plane_width: i32,
     plane_height: i32,
-    has_fast_u8_lut: bool,
+    hints: TargetHints,
 ) std.mem.Allocator.Error!Analysis {
     var res: Analysis = .{};
     errdefer res.deinit(allocator);
@@ -297,6 +302,8 @@ pub fn analyze(
         !res.uses_rel_access and !res.uses_abs_access;
 
     if (is_pure_point) {
+        const is_narrow_simd = hints.f32_lanes > 0 and hints.f32_lanes <= 4;
+        const scalar_lut_min_cost: u32 = if (is_narrow_simd) 16 else 24;
         if (res.used_clips.items.len == 1) {
             const c0 = res.used_clips.items[0];
             const fmt0 = src_fmts[c0];
@@ -307,17 +314,17 @@ pub fn analyze(
 
                     // 256-byte 1D u8->u8 LUT uses AVX2 vpshufb / AVX-512 VBMI vpermb / NEON tbl when
                     // `has_fast_u8_lut` is true; otherwise (non-u8 dst, or CPU lacking SIMD u8 LUT such
-                    // as AVX-512 without VBMI or SSE2-only) it uses a scalar or narrower LUT.
+                    // as AVX-512 without VBMI or SSE2-only) it uses a packed or scalar LUT.
                     // Always evaluate u8/i16 fast-path skips in both branches (M1) so cheap u8/i16 plans
                     // never regress onto the scalar table!
-                    const has_simd_u8_lut = has_fast_u8_lut and !dst_fmt.is_float and dst_fmt.bits_per_sample == 8;
+                    const has_simd_u8_lut = hints.has_fast_u8_lut and !dst_fmt.is_float and dst_fmt.bits_per_sample == 8;
                     const u8_limit: u32 = if (has_simd_u8_lut) 12 else 24;
                     const i16_limit: u32 = if (has_simd_u8_lut) 10 else 24;
                     const skip_for_u8 = res.u8_plan.eligible and cost <= u8_limit;
                     const skip_for_i16 = res.int16_plan.eligible and cost <= i16_limit;
-                    // Scalar non-u8 LUTs (~1.2k-1.4k fps 1T) lose to AVX2 f32 SIMD for prefilter/sqrt/div/poly8;
-                    // transcendentals (cost >= 24) still win strongly via LUT.
-                    const skip_scalar_lut = !has_simd_u8_lut and cost < 24; // V13 (non-u8 dst), K3
+                    // Packed non-u8 LUTs (512B u8->u16, 1KB u8->f32) win at cost >= 16 on 4-lane CPUs
+                    // and at cost >= 24 on 8/16-lane AVX2/AVX-512 (V13, K3).
+                    const skip_scalar_lut = !has_simd_u8_lut and cost < scalar_lut_min_cost;
                     if (!skip_for_u8 and !skip_for_i16 and !skip_scalar_lut) {
                         res.lut_clips[0] = c0;
                         res.lut_kind = .lut1d_u8;
@@ -325,14 +332,22 @@ pub fn analyze(
                 } else if (fmt0.bits_per_sample <= 16) {
                     res.fallback_lut_clips[0] = c0;
                     res.fallback_lut_kind = .lut1d_u16;
-                    // 128 KB 1D u16 LUT hits L2 (~1k fps 1T at 1080p); AVX2 f32 SIMD beats it for
-                    // prefilter masks, sqrt, div, and short polynomials (cost < 24), while
-                    // transcendentals (sin/cos/exp/log/pow, cost >= 24) still win via LUT.
-                    const u16_lut_min_cost: u32 = 24;
-                    if (cost >= u16_lut_min_cost) {
+                    // 128 KB 1D u16 LUT (64 KB for u8 dst): 8/16-lane AVX2/AVX-512 f32 SIMD beats it for
+                    // exp/log/prefilter/sqrt/div/poly8 (cost < 24), while 4-lane CPUs (NEON / SSE2) run
+                    // f32 SIMD at half width so our 8x u64-packed LUT wins from cost >= 16.
+                    if (cost >= scalar_lut_min_cost) {
                         res.lut_clips[0] = c0;
                         res.lut_kind = .lut1d_u16;
                     }
+                }
+            } else if (fmt0.bits_per_sample == 16) {
+                // 16-bit half-float (`f16`) has 65,536 raw bit patterns: 128 KB (`f16`/`u16` dst) or
+                // 64 KB (`u8` dst) fits in Apple Silicon's 128 KB L1D and reuses `lut1d_u16`.
+                res.fallback_lut_clips[0] = c0;
+                res.fallback_lut_kind = .lut1d_u16;
+                if (cost >= scalar_lut_min_cost) {
+                    res.lut_clips[0] = c0;
+                    res.lut_kind = .lut1d_u16;
                 }
             }
         } else if (res.used_clips.items.len == 2) {
@@ -343,9 +358,9 @@ pub fn analyze(
             {
                 res.fallback_lut_clips = .{ c0, c1 };
                 res.fallback_lut_kind = .lut2d_u8;
-                // 64 KB 2D u8x8 LUT hits L2 (~940 fps 1T / ~6.1k fps 16T); SIMD beats it for
-                // 2x sqrt / 2x div (cost < 24), while transcendentals / fine_sharp (cost >= 24) win via LUT.
-                if (!res.u8_plan.eligible and !res.int16_plan.eligible and cost >= 24) {
+                // 64 KB 2D u8x8 LUT (128 KB for u16 dst): wins from cost >= 16 on 4-lane CPUs
+                // (2.2x-5.8x on exp/finesharp/pow) and from cost >= 24 on 8/16-lane AVX2/AVX-512.
+                if (!res.u8_plan.eligible and !res.int16_plan.eligible and cost >= scalar_lut_min_cost) {
                     res.lut_clips = .{ c0, c1 };
                     res.lut_kind = .lut2d_u8;
                 }
@@ -836,7 +851,7 @@ test "analysis detects LUT, spatial reach, opt=1 types, and Y1 i16 rounding-bias
     {
         var p = try parser.parse(allocator, "x 128 * 127 + 2 /", .{ .num_clips = 1 });
         defer p.deinit(allocator);
-        var a = try analyze(allocator, &p, fmts[0..1], fmt8, 64, 64, true);
+        var a = try analyze(allocator, &p, fmts[0..1], fmt8, 64, 64, .{ .has_fast_u8_lut = true });
         defer a.deinit(allocator);
         try std.testing.expectEqual(LutKind.lut1d_u8, a.lut_kind);
         try std.testing.expect(!a.u8_plan.eligible);
@@ -846,7 +861,7 @@ test "analysis detects LUT, spatial reach, opt=1 types, and Y1 i16 rounding-bias
     {
         var p = try parser.parse(allocator, "x y - abs", .{ .num_clips = 2 });
         defer p.deinit(allocator);
-        var a = try analyze(allocator, &p, &fmts, fmt8, 64, 64, true);
+        var a = try analyze(allocator, &p, &fmts, fmt8, 64, 64, .{ .has_fast_u8_lut = true });
         defer a.deinit(allocator);
         try std.testing.expect(a.u8_plan.eligible);
         try std.testing.expectEqual(LutKind.none, a.lut_kind);
@@ -854,7 +869,7 @@ test "analysis detects LUT, spatial reach, opt=1 types, and Y1 i16 rounding-bias
     {
         var p = try parser.parse(allocator, "x y + 2 /", .{ .num_clips = 2 });
         defer p.deinit(allocator);
-        var a = try analyze(allocator, &p, &fmts, fmt8, 64, 64, true);
+        var a = try analyze(allocator, &p, &fmts, fmt8, 64, 64, .{ .has_fast_u8_lut = true });
         defer a.deinit(allocator);
         try std.testing.expect(a.int16_plan.eligible);
         try std.testing.expectEqual(LutKind.none, a.lut_kind);
@@ -864,7 +879,7 @@ test "analysis detects LUT, spatial reach, opt=1 types, and Y1 i16 rounding-bias
     {
         var p = try parser.parse(allocator, "x[-1,0] x + x[1,0] + x[0,-1] + 4 /", .{ .num_clips = 1 });
         defer p.deinit(allocator);
-        var a = try analyze(allocator, &p, fmts[0..1], fmt8, 64, 64, true);
+        var a = try analyze(allocator, &p, fmts[0..1], fmt8, 64, 64, .{ .has_fast_u8_lut = true });
         defer a.deinit(allocator);
         try std.testing.expectEqual(LutKind.none, a.lut_kind);
         try std.testing.expect(a.int16_plan.eligible);

@@ -46,8 +46,10 @@ const XMode = union(enum) {
     const_col: usize,
     /// Branchless interior vector loop (all relative horizontal accesses are in bounds).
     interior,
-    /// Fallback runtime loop for huge `|dx|` where unrolling > 8 edge vectors would bloat code.
-    dynamic_rel,
+    /// Fallback runtime loop for huge left-edge `|dx|`; holds `left_end` so `eff_dx >= 0` loads directly.
+    dynamic_left: usize,
+    /// Fallback runtime loop for huge right-edge `|dx|`; holds `right_start` so `eff_dx <= 0` loads directly.
+    dynamic_right: usize,
 };
 
 const Invariance = enum(u8) {
@@ -294,21 +296,51 @@ pub fn compilePlane(
     }
 
     // Phase 3 (LICM): fold compile-time width/height expressions, classify node invariance
-    // (including periodic `X % C` where `C | f32_lanes`), and hoist .frame/.row nodes.
+    // (including periodic `X % C` where `C | f32_lanes`, or `C | (2 * f32_lanes)` for 2-phase hoisting),
+    // and hoist .frame/.row nodes.
+    const lanes: usize = cpu.f32_lanes;
+    const has_horiz_rel = info.max_left > 0 or info.max_right > 0;
+    const use_u8_interior = info.u8_plan.eligible and !info.uses_abs_access;
+    const use_u16_interior = !use_u8_interior and info.u16_plan.eligible and !info.uses_abs_access;
+    const use_int16_interior = !use_u8_interior and !use_u16_interior and info.int16_plan.eligible and !info.uses_abs_access;
+    const can_unroll_x2 = !use_u8_interior and !use_u16_interior and !use_int16_interior and !info.uses_abs_access and info.live_node_count <= 40 and info.expr_cost <= 64;
+    const enable_licm = !info.u8_plan.eligible and !info.u16_plan.eligible and !info.int16_plan.eligible;
+
     const profile = interp.TargetProfile.fromCpu(cpu);
     const const_f32_vals = try computeCompileTimeF32Consts(allocator, prog, info, spec, profile);
     defer allocator.free(const_f32_vals);
 
-    const node_inv = try computeInvariance(allocator, prog, info, const_f32_vals, spec.width, cpu.f32_lanes);
+    var has_2x_periodic = false;
+    if (enable_licm and !has_horiz_rel and !prog.opt_int and !info.uses_abs_access and spec.width <= (1 << 24)) {
+        for (prog.nodes.items, 0..) |node, idx| {
+            if (idx != prog.root and info.use_counts.items[idx] == 0) continue;
+            if (periodicCoordXMod(prog, const_f32_vals, node, spec.width, lanes) == null and
+                periodicCoordXMod(prog, const_f32_vals, node, spec.width, lanes * 2) != null)
+            {
+                has_2x_periodic = true;
+                break;
+            }
+        }
+    }
+
+    var node_inv = try computeInvariance(allocator, prog, info, const_f32_vals, spec.width, if (has_2x_periodic) lanes * 2 else lanes);
     defer allocator.free(node_inv);
+    if (has_2x_periodic and node_inv[prog.root] == .pixel and !can_unroll_x2) {
+        has_2x_periodic = false;
+        allocator.free(node_inv);
+        node_inv = try computeInvariance(allocator, prog, info, const_f32_vals, spec.width, lanes);
+    }
+    const periodic_lanes: usize = if (has_2x_periodic) lanes * 2 else lanes;
 
     const n_nodes = prog.nodes.items.len;
     const hoisted_slots = try allocator.alloc(?RegSlot, n_nodes);
     defer allocator.free(hoisted_slots);
     @memset(hoisted_slots, null);
 
-    // Check if any non-trivial frame or row nodes exist; skip LICM for int_path kernels (which reject N/Y/props/width/height anyway).
-    const enable_licm = !info.u8_plan.eligible and !info.int16_plan.eligible;
+    const hoisted_slots_hi = try allocator.alloc(?RegSlot, if (has_2x_periodic) n_nodes else 0);
+    defer allocator.free(hoisted_slots_hi);
+    if (has_2x_periodic) @memset(hoisted_slots_hi, null);
+
     if (enable_licm) {
         const frame_env = BodyEnv{
             .dst_ptr = dst_ptr,
@@ -328,14 +360,14 @@ pub fn compilePlane(
             .hoisted_slots = hoisted_slots,
             .const_f32_vals = const_f32_vals,
         };
-        try evalHoistedStage(allocator, &b, prog, info, spec, frame_env, node_inv, hoisted_slots, .frame);
+        try evalHoistedStage(allocator, &b, prog, info, spec, frame_env, node_inv, hoisted_slots, .frame, periodic_lanes, 0);
+        if (has_2x_periodic) {
+            var frame_env_hi = frame_env;
+            frame_env_hi.hoisted_slots = hoisted_slots_hi;
+            try evalHoistedStage(allocator, &b, prog, info, spec, frame_env_hi, node_inv, hoisted_slots_hi, .frame, periodic_lanes, lanes);
+        }
     }
 
-    const lanes: usize = cpu.f32_lanes;
-    const has_horiz_rel = info.max_left > 0 or info.max_right > 0;
-    const use_u8_interior = info.u8_plan.eligible and !info.uses_abs_access;
-    const use_u16_interior = !use_u8_interior and info.u16_plan.eligible and !info.uses_abs_access;
-    const use_int16_interior = !use_u8_interior and !use_u16_interior and info.int16_plan.eligible and !info.uses_abs_access;
     const interior_step: usize = if (use_u8_interior)
         cpu.vec_bytes
     else if (use_u16_interior or use_int16_interior)
@@ -369,12 +401,19 @@ pub fn compilePlane(
         (spec.width - right_start + lanes - 1) / lanes
     else
         0;
-    // V12: only the oversized edge strips use a compact `.dynamic_rel` loop; the interior
-    // `[left_end, right_start)` ALWAYS keeps the branchless u8 / i16x2 / f32x2 fast path!
+    // V12: only the oversized edge strips use a compact `.dynamic_left`/`.dynamic_right` loop;
+    // the interior `[left_end, right_start)` ALWAYS keeps the branchless u8 / i16x2 / f32x2 fast path!
     const left_use_dynamic = has_horiz_rel and left_vecs > 8;
     const right_use_dynamic = has_horiz_rel and right_vecs > 8;
     const can_unroll_i16_x2 = use_int16_interior and info.live_node_count <= 32;
-    const can_unroll_f32_x2 = !use_u8_interior and !use_u16_interior and !use_int16_interior and !info.uses_abs_access and !prog.opt_int and info.live_node_count <= 40 and info.expr_cost <= 64;
+    const want_running_ptrs = (cpu.isa == .neon) and (info.used_clips.items.len + rel_row_keys.items.len <= 8);
+    const want_pair_mem = want_running_ptrs;
+
+    const run_src_ptrs = try allocator.alloc(?aj.Reg, n_clips);
+    defer allocator.free(run_src_ptrs);
+    @memset(run_src_ptrs, null);
+    const run_rel_ptrs = try allocator.alloc(aj.Reg, rel_row_keys.items.len);
+    defer allocator.free(run_rel_ptrs);
 
     const need_x_vec_i32 = left_use_dynamic or right_use_dynamic or (info.uses_x and prog.opt_int);
     // Only materialize runtime `v_x` if some unhoisted `.pixel` node actually consumes `.coord_x`.
@@ -503,16 +542,94 @@ pub fn compilePlane(
         .v_frame_n_i32 = v_frame_n_i32,
         .node_inv = node_inv,
         .hoisted_slots = hoisted_slots,
+        .hoisted_slots_hi = hoisted_slots_hi,
         .const_f32_vals = const_f32_vals,
     };
 
     if (enable_licm) {
-        try evalHoistedStage(allocator, &b, prog, info, spec, common_env, node_inv, hoisted_slots, .row);
+        try evalHoistedStage(allocator, &b, prog, info, spec, common_env, node_inv, hoisted_slots, .row, periodic_lanes, 0);
         common_env.hoisted_slots = hoisted_slots;
+        if (has_2x_periodic) {
+            var row_env_hi = common_env;
+            row_env_hi.hoisted_slots = hoisted_slots_hi;
+            try evalHoistedStage(allocator, &b, prog, info, spec, row_env_hi, node_inv, hoisted_slots_hi, .row, periodic_lanes, lanes);
+            common_env.hoisted_slots_hi = hoisted_slots_hi;
+        }
     }
 
+    const dst_bps_row: usize = spec.dst_fmt.bytesPerSample();
+    const makeRunningEnv = struct {
+        fn init(
+            builder: *aj.Builder,
+            base_env: BodyEnv,
+            used_clips: []const ast.ClipId,
+            src_fmts: []const ast.SampleFormat,
+            dst_bps: usize,
+            out_src: []?aj.Reg,
+            out_rel: []aj.Reg,
+            start_col: usize,
+            pair_mem: bool,
+        ) BodyEnv {
+            var renv = base_env;
+            const cd = builder.newGp64();
+            if (start_col == 0) {
+                builder.gpMov(cd, base_env.dst_ptr);
+            } else {
+                builder.gpOp3Imm(.add, cd, base_env.dst_ptr, @intCast(start_col * dst_bps));
+            }
+            renv.dst_ptr = cd;
+            for (used_clips) |clip| {
+                const cs = builder.newGp64();
+                const bps = src_fmts[clip].bytesPerSample();
+                if (start_col == 0) {
+                    builder.gpMov(cs, base_env.src_row_ptrs[clip].?);
+                } else {
+                    builder.gpOp3Imm(.add, cs, base_env.src_row_ptrs[clip].?, @intCast(start_col * bps));
+                }
+                out_src[clip] = cs;
+            }
+            for (base_env.rel_row_keys, 0..) |rk, ki| {
+                const cr = builder.newGp64();
+                const bps = src_fmts[rk.clip].bytesPerSample();
+                if (start_col == 0) {
+                    builder.gpMov(cr, base_env.rel_row_ptrs[ki]);
+                } else {
+                    builder.gpOp3Imm(.add, cr, base_env.rel_row_ptrs[ki], @intCast(start_col * bps));
+                }
+                out_rel[ki] = cr;
+            }
+            renv.src_row_ptrs = out_src;
+            renv.rel_row_ptrs = out_rel;
+            renv.use_running_ptrs = true;
+            renv.use_pair_mem = pair_mem;
+            return renv;
+        }
+    }.init;
+
+    const stepRunningEnv = struct {
+        fn step(
+            builder: *aj.Builder,
+            renv: BodyEnv,
+            used_clips: []const ast.ClipId,
+            src_fmts: []const ast.SampleFormat,
+            dst_bps: usize,
+            step_px: usize,
+        ) void {
+            if (!renv.use_running_ptrs) return;
+            builder.gpOp3Imm(.add, renv.dst_ptr, renv.dst_ptr, @intCast(step_px * dst_bps));
+            for (used_clips) |clip| {
+                const bps = src_fmts[clip].bytesPerSample();
+                builder.gpOp3Imm(.add, renv.src_row_ptrs[clip].?, renv.src_row_ptrs[clip].?, @intCast(step_px * bps));
+            }
+            for (renv.rel_row_keys, 0..) |rk, ki| {
+                const bps = src_fmts[rk.clip].bytesPerSample();
+                builder.gpOp3Imm(.add, renv.rel_row_ptrs[ki], renv.rel_row_ptrs[ki], @intCast(step_px * bps));
+            }
+        }
+    }.step;
+
     if (!has_horiz_rel) {
-        // Single runtime vector loop across the whole row (with u8 / 2x-unrolled i16 / 2x-unrolled f32 fast paths).
+        // Single runtime vector loop across the whole row (with u8 / u16 / 2x-unrolled i16 / 2x/4x-unrolled f32/opt1 fast paths).
         var env = common_env;
         if (need_v_x) {
             const vx = b.newVec();
@@ -530,120 +647,230 @@ pub fn compilePlane(
         const root_hoisted_u16 = enable_licm and hoisted_slots[prog.root] != null and
             !spec.dst_fmt.is_float and spec.dst_fmt.bits_per_sample > 8 and spec.dst_fmt.bits_per_sample <= 16 and
             (lanes == 4 or lanes == 8 or lanes == 16);
+        const root_hoisted_f32 = enable_licm and hoisted_slots[prog.root] != null and
+            spec.dst_fmt.is_float and spec.dst_fmt.bits_per_sample == 32 and
+            has_2x_periodic and lanes == 4;
 
         if (root_hoisted_u8) {
             // Root is row/frame-invariant (e.g. `deblock_qed` mask via periodic `X % 8`):
             // pack once per row via the exact D4 store path, broadcast/reload, and stream raw stores!
             const root_reg = hoisted_slots[prog.root].?.reg;
-            if (info.value_types.items[prog.root] == .i32) {
-                pixel.emitStoreI32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-            } else {
-                pixel.emitStoreF32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-            }
             const packed_vec = b.newVec();
             const step_bytes: usize = if (lanes == 4) 16 else if (lanes == 8) 32 else 64;
-            if (lanes == 4) {
-                b.vecLoad(.broadcast_u32, packed_vec, aj.Mem.ptr(dst_ptr, 0));
-            } else if (lanes == 8) {
-                b.vecLoad(.broadcast_u64, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+            if (has_2x_periodic) {
+                const root_hi = hoisted_slots_hi[prog.root].?.reg;
+                if (info.value_types.items[prog.root] == .i32) {
+                    pixel.emitStoreI32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes)), root_reg, root_hi, spec.dst_fmt, false);
+                } else {
+                    pixel.emitStoreF32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes)), root_reg, root_hi, spec.dst_fmt, false);
+                }
+                if (lanes == 4) {
+                    b.vecLoad(.broadcast_u64, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                } else if (lanes == 8) {
+                    // AVX2 stride is guaranteed a multiple of 32 bytes: duplicate 16B -> 32B once per row.
+                    b.vecLoad(.u128, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                    b.vecStore(.u128, aj.Mem.ptr(dst_ptr, 16), packed_vec);
+                    b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                } else {
+                    // AVX-512 stride is guaranteed a multiple of 64 bytes: duplicate 32B -> 64B once per row.
+                    b.vecLoad(.u256, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                    b.vecStore(.u256, aj.Mem.ptr(dst_ptr, 32), packed_vec);
+                    b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                }
             } else {
-                // AVX-512 frame stride is guaranteed a multiple of 64 bytes: widen 16B -> 32B -> 64B once per row.
-                b.vecLoad(.u128, packed_vec, aj.Mem.ptr(dst_ptr, 0));
-                b.vecStore(.u128, aj.Mem.ptr(dst_ptr, 16), packed_vec);
-                b.vecLoad(.u256, packed_vec, aj.Mem.ptr(dst_ptr, 0));
-                b.vecStore(.u256, aj.Mem.ptr(dst_ptr, 32), packed_vec);
-                b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                if (info.value_types.items[prog.root] == .i32) {
+                    pixel.emitStoreI32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
+                } else {
+                    pixel.emitStoreF32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
+                }
+                if (lanes == 4) {
+                    b.vecLoad(.broadcast_u32, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                } else if (lanes == 8) {
+                    b.vecLoad(.broadcast_u64, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                } else {
+                    // AVX-512 frame stride is guaranteed a multiple of 64 bytes: widen 16B -> 32B -> 64B once per row.
+                    b.vecLoad(.u128, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                    b.vecStore(.u128, aj.Mem.ptr(dst_ptr, 16), packed_vec);
+                    b.vecLoad(.u256, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                    b.vecStore(.u256, aj.Mem.ptr(dst_ptr, 32), packed_vec);
+                    b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                }
             }
-            const x_loop = b.newLabel();
-            b.bind(x_loop);
-            b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 0, 0), packed_vec);
-            b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_bytes));
-            b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            if (want_running_ptrs) {
+                const cur_dst = b.newGp64();
+                b.gpMov(cur_dst, dst_ptr);
+                const x_loop = b.newLabel();
+                b.bind(x_loop);
+                b.vecStore(.u_vec, aj.Mem.ptr(cur_dst, 0), packed_vec);
+                b.gpOp3Imm(.add, cur_dst, cur_dst, @intCast(step_bytes));
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_bytes));
+                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            } else {
+                const x_loop = b.newLabel();
+                b.bind(x_loop);
+                b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 0, 0), packed_vec);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_bytes));
+                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            }
         } else if (root_hoisted_u16) {
             // Row/frame-invariant u9..u16 root: pack once per row via exact D4 store path,
             // widen to a full 16/32/64-byte vector (safe within 32B / AVX-512 64B stride), and stream raw stores.
             const root_reg = hoisted_slots[prog.root].?.reg;
-            if (info.value_types.items[prog.root] == .i32) {
-                pixel.emitStoreI32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-            } else {
-                pixel.emitStoreF32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-            }
             const packed_vec = b.newVec();
             const step_px: usize = if (lanes == 4) 8 else if (lanes == 8) 16 else 32;
-            if (lanes == 4) {
-                b.vecLoad(.broadcast_u64, packed_vec, aj.Mem.ptr(dst_ptr, 0));
-            } else if (lanes == 8) {
-                b.vecLoad(.u128, packed_vec, aj.Mem.ptr(dst_ptr, 0));
-                b.vecStore(.u128, aj.Mem.ptr(dst_ptr, 16), packed_vec);
+            if (has_2x_periodic) {
+                const root_hi = hoisted_slots_hi[prog.root].?.reg;
+                if (info.value_types.items[prog.root] == .i32) {
+                    pixel.emitStoreI32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes * 2)), root_reg, root_hi, spec.dst_fmt, false);
+                } else {
+                    pixel.emitStoreF32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes * 2)), root_reg, root_hi, spec.dst_fmt, false);
+                }
                 b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
             } else {
-                b.vecLoad(.u256, packed_vec, aj.Mem.ptr(dst_ptr, 0));
-                b.vecStore(.u256, aj.Mem.ptr(dst_ptr, 32), packed_vec);
-                b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                if (info.value_types.items[prog.root] == .i32) {
+                    pixel.emitStoreI32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
+                } else {
+                    pixel.emitStoreF32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
+                }
+                if (lanes == 4) {
+                    b.vecLoad(.broadcast_u64, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                } else if (lanes == 8) {
+                    b.vecLoad(.u128, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                    b.vecStore(.u128, aj.Mem.ptr(dst_ptr, 16), packed_vec);
+                    b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                } else {
+                    b.vecLoad(.u256, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                    b.vecStore(.u256, aj.Mem.ptr(dst_ptr, 32), packed_vec);
+                    b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
+                }
             }
-            const x_loop = b.newLabel();
-            b.bind(x_loop);
-            b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 1, 0), packed_vec);
-            b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_px));
-            b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            if (want_running_ptrs) {
+                const cur_dst = b.newGp64();
+                b.gpMov(cur_dst, dst_ptr);
+                const x_loop = b.newLabel();
+                b.bind(x_loop);
+                b.vecStore(.u_vec, aj.Mem.ptr(cur_dst, 0), packed_vec);
+                b.gpOp3Imm(.add, cur_dst, cur_dst, @intCast(step_px * 2));
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_px));
+                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            } else {
+                const x_loop = b.newLabel();
+                b.bind(x_loop);
+                b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 1, 0), packed_vec);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_px));
+                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            }
+        } else if (root_hoisted_f32) {
+            const root_lo = hoisted_slots[prog.root].?.reg;
+            const root_hi = hoisted_slots_hi[prog.root].?.reg;
+            const step2 = lanes * 2;
+            const unroll_end = (spec.width / step2) * step2;
+            const cur_dst = b.newGp64();
+            b.gpMov(cur_dst, dst_ptr);
+            if (unroll_end > 0) {
+                const x_loop = b.newLabel();
+                b.bind(x_loop);
+                b.vecStoreUVecx2(aj.Mem.ptr(cur_dst, 0), root_lo, root_hi);
+                b.gpOp3Imm(.add, cur_dst, cur_dst, @intCast(step2 * 4));
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop);
+            }
+            if (unroll_end < spec.width) {
+                if (spec.width - unroll_end > lanes) {
+                    b.vecStoreUVecx2(aj.Mem.ptr(cur_dst, 0), root_lo, root_hi);
+                } else {
+                    b.vecStore(.u_vec, aj.Mem.ptr(cur_dst, 0), root_lo);
+                }
+            }
         } else if (use_u8_interior) {
+            const renv = if (want_running_ptrs)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
+            else
+                env;
             const x_loop = b.newLabel();
             b.bind(x_loop);
-            try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, dst_ptr, x_gp, src_row_ptrs, env);
+            try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+            stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
             b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
             b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
         } else if (use_u16_interior) {
+            const renv = if (want_running_ptrs)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
+            else
+                env;
             const x_loop = b.newLabel();
             b.bind(x_loop);
-            try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, dst_ptr, x_gp, src_row_ptrs, env);
+            try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+            stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
             b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
             b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
         } else if (use_int16_interior) {
+            const renv = if (want_running_ptrs)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
+            else
+                env;
             const step2 = lanes * 4;
             const unroll_end = if (can_unroll_i16_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
             if (unroll_end > 0) {
                 const x_loop2 = b.newLabel();
                 b.bind(x_loop2);
-                try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, dst_ptr, x_gp, src_row_ptrs, env);
+                try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
                 b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
                 b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
             }
             if (unroll_end < spec.width) {
                 const x_loop = b.newLabel();
                 b.bind(x_loop);
-                try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, dst_ptr, x_gp, src_row_ptrs, env);
+                try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
                 b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
                 b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
             }
-        } else if (can_unroll_f32_x2 and spec.width >= lanes * 2) {
+        } else if ((can_unroll_x2 and spec.width >= lanes * 2) or has_2x_periodic) {
+            const renv = if (want_running_ptrs)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
+            else
+                env;
             const step2 = lanes * 2;
             const unroll_end = (spec.width / step2) * step2;
-            const x_loop2 = b.newLabel();
-            b.bind(x_loop2);
-            try emitDagBodyX2(allocator, &b, prog, info, spec, env, v_lane_step_f32);
-            if (env.v_x) |vx| {
-                b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step2)));
+            if (unroll_end > 0) {
+                const x_loop2 = b.newLabel();
+                b.bind(x_loop2);
+                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
+                if (renv.v_x) |vx| {
+                    if (prog.opt_int) {
+                        b.vecOp3(.add_i32, vx, vx, b.constI32Splat(@intCast(step2)));
+                    } else {
+                        b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step2)));
+                    }
+                }
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
             }
-            b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-            b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
 
             if (unroll_end < spec.width) {
-                const x_loop = b.newLabel();
-                b.bind(x_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .interior);
-                if (env.v_x) |vx| {
-                    b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
+                if (spec.width - unroll_end > lanes) {
+                    // Remainder spans both phase 0 and phase 1; `width > unroll_end + lanes` guarantees
+                    // the 32B/64B-aligned stride accommodates all `2 * lanes` pixels of every src/dst format.
+                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
+                } else {
+                    try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
                 }
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
             }
         } else {
+            std.debug.assert(!has_2x_periodic);
+            const renv = if (want_running_ptrs and !info.uses_abs_access)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
+            else
+                env;
             const x_loop = b.newLabel();
             b.bind(x_loop);
 
-            try emitDagBody(allocator, &b, prog, info, spec, env, .interior);
+            try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
 
-            if (env.v_x) |vx| {
+            if (renv.v_x) |vx| {
                 if (prog.opt_int) {
                     b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
                 } else {
@@ -651,13 +878,14 @@ pub fn compilePlane(
                 }
             }
 
+            stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
             b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
             b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
         }
     } else {
         // B1 / S5 / V12 three-part dimension-specialized row split: Left Edge | Interior | Right Edge.
 
-        // 1. Left edge: unrolled B1 window loads when <= 8 vecs, else compact `.dynamic_rel` loop.
+        // 1. Left edge: unrolled B1 window loads when <= 8 vecs, else compact `.dynamic_left` loop.
         if (left_end > 0) {
             if (left_use_dynamic) {
                 var env = common_env;
@@ -675,7 +903,7 @@ pub fn compilePlane(
 
                 const left_loop = b.newLabel();
                 b.bind(left_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .dynamic_rel);
+                try emitDagBody(allocator, &b, prog, info, spec, env, .{ .dynamic_left = left_end });
                 if (env.v_x) |vx| {
                     if (prog.opt_int) {
                         b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
@@ -698,7 +926,7 @@ pub fn compilePlane(
             }
         }
 
-        // 2. Branchless interior vector loop (u8 4x / i16 2x-unrolled / f32 2x-unrolled).
+        // 2. Branchless interior vector loop (u8 / u16 / i16 2x-unrolled / f32/opt1 2x-unrolled).
         if (right_start > left_end) {
             var env = common_env;
             if (need_v_x) {
@@ -709,18 +937,24 @@ pub fn compilePlane(
             const x_gp = b.newGp64();
             b.gpMovImm(x_gp, @intCast(left_end));
             env.x_gp = x_gp;
+            const renv = if (want_running_ptrs and !info.uses_abs_access)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, left_end, want_pair_mem)
+            else
+                env;
 
             const span = right_start - left_end;
             if (use_u8_interior) {
                 const x_loop = b.newLabel();
                 b.bind(x_loop);
-                try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, dst_ptr, x_gp, src_row_ptrs, env);
+                try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
                 b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
                 b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
             } else if (use_u16_interior) {
                 const x_loop = b.newLabel();
                 b.bind(x_loop);
-                try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, dst_ptr, x_gp, src_row_ptrs, env);
+                try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
                 b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
                 b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
             } else if (use_int16_interior) {
@@ -729,56 +963,69 @@ pub fn compilePlane(
                 if (unroll_end > left_end) {
                     const x_loop2 = b.newLabel();
                     b.bind(x_loop2);
-                    try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, dst_ptr, x_gp, src_row_ptrs, env);
+                    try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
                     b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
                     b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
                 }
                 if (unroll_end < right_start) {
                     const x_loop = b.newLabel();
                     b.bind(x_loop);
-                    try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, dst_ptr, x_gp, src_row_ptrs, env);
+                    try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
                     b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
                     b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
                 }
-            } else if (can_unroll_f32_x2 and span >= lanes * 2) {
+            } else if (can_unroll_x2 and span >= lanes * 2) {
                 const step2 = lanes * 2;
                 const unroll_end = left_end + (span / step2) * step2;
                 const x_loop2 = b.newLabel();
                 b.bind(x_loop2);
-                try emitDagBodyX2(allocator, &b, prog, info, spec, env, v_lane_step_f32);
-                if (env.v_x) |vx| {
-                    b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step2)));
+                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
+                if (renv.v_x) |vx| {
+                    if (prog.opt_int) {
+                        b.vecOp3(.add_i32, vx, vx, b.constI32Splat(@intCast(step2)));
+                    } else {
+                        b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step2)));
+                    }
                 }
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
                 b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
                 b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
 
                 if (unroll_end < right_start) {
                     const x_loop = b.newLabel();
                     b.bind(x_loop);
-                    try emitDagBody(allocator, &b, prog, info, spec, env, .interior);
-                    if (env.v_x) |vx| {
-                        b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
+                    try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
+                    if (renv.v_x) |vx| {
+                        if (prog.opt_int) {
+                            b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
+                        } else {
+                            b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
+                        }
                     }
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
                     b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
                     b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
                 }
             } else {
                 const x_loop = b.newLabel();
                 b.bind(x_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .interior);
-                if (env.v_x) |vx| {
+                try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
+                if (renv.v_x) |vx| {
                     if (prog.opt_int) {
                         b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
                     } else {
                         b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
                     }
                 }
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
                 b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
                 b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
             }
         }
 
-        // 3. Right edge + tail: unrolled B1 window loads when <= 8 vecs, else compact `.dynamic_rel` loop.
+        // 3. Right edge + tail: unrolled B1 window loads when <= 8 vecs, else compact `.dynamic_right` loop.
         if (right_start < spec.width) {
             if (right_use_dynamic) {
                 var env = common_env;
@@ -796,7 +1043,7 @@ pub fn compilePlane(
 
                 const right_loop = b.newLabel();
                 b.bind(right_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .dynamic_rel);
+                try emitDagBody(allocator, &b, prog, info, spec, env, .{ .dynamic_right = right_start });
                 if (env.v_x) |vx| {
                     if (prog.opt_int) {
                         b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
@@ -872,7 +1119,10 @@ const BodyEnv = struct {
     v_frame_n_i32: ?aj.Reg,
     node_inv: []const Invariance = &.{},
     hoisted_slots: []const ?RegSlot = &.{},
+    hoisted_slots_hi: []const ?RegSlot = &.{},
     const_f32_vals: []const ?f32 = &.{},
+    use_running_ptrs: bool = false,
+    use_pair_mem: bool = false,
 
     pub fn rowPtrFor(self: BodyEnv, clip: ast.ClipId, dy: i32, mode: ast.BoundaryMode) aj.Reg {
         if (dy == 0) return self.src_row_ptrs[clip].?;
@@ -882,6 +1132,13 @@ const BodyEnv = struct {
             }
         }
         unreachable;
+    }
+
+    pub inline fn rowMem(self: BodyEnv, row_ptr: aj.Reg, shift: u8, disp: i32) aj.Mem {
+        return if (self.use_running_ptrs)
+            aj.Mem.ptr(row_ptr, disp)
+        else
+            aj.Mem.indexed(row_ptr, self.x_gp, shift, disp);
     }
 };
 
@@ -917,7 +1174,7 @@ fn emitRelLoad(
     switch (x_mode) {
         .interior => {
             const disp: i32 = (eff_dx + @as(i32, @intCast(col_disp))) * @as(i32, @intCast(bps));
-            const mem = aj.Mem.indexed(row_ptr, env.x_gp, shift, disp);
+            const mem = env.rowMem(row_ptr, shift, disp);
             if (out_ty == .i32) {
                 pixel.emitLoadI32(b, dst, mem, fmt);
             } else {
@@ -965,10 +1222,15 @@ fn emitRelLoad(
                 b.vecPermuteF32(dst, dst, perm[0..lanes]);
             }
         },
-        .dynamic_rel => {
-            // Runtime clamped/mirrored gather within `row_ptr` for huge `|dx|` offsets.
-            if (eff_dx == 0) {
-                const mem = aj.Mem.indexed(row_ptr, env.x_gp, shift, 0);
+        .dynamic_left, .dynamic_right => {
+            // Direct vector load when `eff_dx` is provably in-bounds across this edge strip!
+            const in_bounds = switch (x_mode) {
+                .dynamic_left => |left_end| eff_dx >= 0 and left_end + @as(usize, @intCast(eff_dx)) <= spec.width,
+                .dynamic_right => |right_start| eff_dx <= 0 and right_start >= @as(usize, @intCast(-eff_dx)),
+                else => false,
+            };
+            if (eff_dx == 0 or in_bounds) {
+                const mem = aj.Mem.indexed(row_ptr, env.x_gp, shift, eff_dx * @as(i32, @intCast(bps)));
                 if (out_ty == .i32) {
                     pixel.emitLoadI32(b, dst, mem, fmt);
                 } else {
@@ -1269,6 +1531,8 @@ fn evalHoistedStage(
     node_inv: []const Invariance,
     hoisted_slots: []?RegSlot,
     target_inv: Invariance,
+    periodic_lanes: usize,
+    phase_offset: usize,
 ) std.mem.Allocator.Error!void {
     const n_nodes = prog.nodes.items.len;
 
@@ -1353,10 +1617,10 @@ fn evalHoistedStage(
             .binary => |bin| {
                 const ta = info.value_types.items[bin.a];
                 const tb = info.value_types.items[bin.b];
-                if (periodicCoordXMod(prog, env.const_f32_vals, node, spec.width, b.cpu.f32_lanes)) |period| {
+                if (periodicCoordXMod(prog, env.const_f32_vals, node, spec.width, periodic_lanes)) |period| {
                     var lane_f: [16]f32 = @splat(0.0);
                     for (0..b.cpu.f32_lanes) |j| {
-                        lane_f[j] = @floatFromInt(j % period);
+                        lane_f[j] = @floatFromInt((j + phase_offset) % period);
                     }
                     hoisted_slots[idx] = .{
                         .reg = b.constBytes(std.mem.sliceAsBytes(lane_f[0..b.cpu.f32_lanes])),
@@ -1412,6 +1676,7 @@ fn evalDagVector(
     x_mode: XMode,
     col_disp: usize,
     use_const_mem: bool,
+    preloaded: ?[]const ?aj.Reg,
 ) std.mem.Allocator.Error!aj.Reg {
     const n_nodes = prog.nodes.items.len;
     const slots = try allocator.alloc(?RegSlot, n_nodes);
@@ -1421,6 +1686,13 @@ fn evalDagVector(
         @memcpy(slots, env.hoisted_slots);
     } else {
         @memset(slots, null);
+    }
+    if (preloaded) |pre| {
+        for (pre, 0..) |maybe_r, i| {
+            if (maybe_r) |r| {
+                slots[i] = .{ .reg = r, .owned = true };
+            }
+        }
     }
 
     // Cache shared Cody-Waite trig range reduction per operand node (speeds up `x sin x cos +`).
@@ -1546,7 +1818,8 @@ fn evalDagVector(
                 };
                 const mem = switch (x_mode) {
                     .const_col => |col| aj.Mem.ptr(env.src_row_ptrs[clip].?, @intCast((col + col_disp) * bps)),
-                    .interior, .dynamic_rel => aj.Mem.indexed(env.src_row_ptrs[clip].?, env.x_gp, shift, @intCast(col_disp * bps)),
+                    .interior => env.rowMem(env.src_row_ptrs[clip].?, shift, @intCast(col_disp * bps)),
+                    .dynamic_left, .dynamic_right => aj.Mem.indexed(env.src_row_ptrs[clip].?, env.x_gp, shift, @intCast(col_disp * bps)),
                 };
                 if (out_ty == .i32) {
                     pixel.emitLoadI32(b, dst, mem, fmt);
@@ -1903,7 +2176,7 @@ fn emitDagBody(
     // P2: use RIP-relative const-memory operands only on high-pressure / gather bodies;
     // small low-pressure kernels keep constants hoisted in vector registers.
     const use_const_mem = info.live_node_count > 24 or info.uses_abs_access;
-    const root_reg = try evalDagVector(allocator, b, prog, info, spec, env, x_mode, 0, use_const_mem);
+    const root_reg = try evalDagVector(allocator, b, prog, info, spec, env, x_mode, 0, use_const_mem, null);
     const dst_bps: usize = spec.dst_fmt.bytesPerSample();
     const dst_shift: u8 = switch (dst_bps) {
         1 => 0,
@@ -1912,7 +2185,8 @@ fn emitDagBody(
     };
     const dst_mem = switch (x_mode) {
         .const_col => |col| aj.Mem.ptr(env.dst_ptr, @intCast(col * dst_bps)),
-        .interior, .dynamic_rel => aj.Mem.indexed(env.dst_ptr, env.x_gp, dst_shift, 0),
+        .interior => env.rowMem(env.dst_ptr, dst_shift, 0),
+        .dynamic_left, .dynamic_right => aj.Mem.indexed(env.dst_ptr, env.x_gp, dst_shift, 0),
     };
     if (info.value_types.items[prog.root] == .i32) {
         pixel.emitStoreI32(b, dst_mem, root_reg, spec.dst_fmt);
@@ -1921,7 +2195,8 @@ fn emitDagBody(
     }
 }
 
-/// 2x unrolled `f32` interior body evaluating `x` and `x + f32_lanes` and pairing `u8`/`u16` stores.
+/// 2x unrolled interior body evaluating `x` and `x + f32_lanes`,
+/// pairing `f16`/`f32`/`u32` NEON loads and `u8`/`u16`/`f16`/`f32`/`u32` stores.
 fn emitDagBodyX2(
     allocator: std.mem.Allocator,
     b: *aj.Builder,
@@ -1930,20 +2205,74 @@ fn emitDagBodyX2(
     spec: CompileSpec,
     env: BodyEnv,
     v_lane_step_f32: ?aj.Reg,
+    v_lane_step_i32: ?aj.Reg,
 ) std.mem.Allocator.Error!void {
     const lanes: usize = b.cpu.f32_lanes;
-    // P2: small 2x-unrolled kernels keep constants hoisted in YMM registers;
+    // P2: small 2x-unrolled kernels keep constants hoisted in vector registers;
     // larger kernels (e.g. high-degree polyval) fold constants from RIP-relative memory to avoid spills.
     const use_const_mem = info.live_node_count > 24;
-    const res0 = try evalDagVector(allocator, b, prog, info, spec, env, .interior, 0, use_const_mem);
+
+    // On AArch64 NEON, preload paired `.load_clip` nodes via single 16B `ldr q + fcvtl/fcvtl2` (f16)
+    // or `ldp q0, q1` (f32/u32 with running pointers) before evaluating both halves.
+    const n_nodes = prog.nodes.items.len;
+    var pre0: ?[]?aj.Reg = null;
+    var pre1: ?[]?aj.Reg = null;
+    defer if (pre0) |p| allocator.free(p);
+    defer if (pre1) |p| allocator.free(p);
+
+    if (b.cpu.isa == .neon) {
+        var any_pair = false;
+        for (prog.nodes.items, 0..) |node, idx| {
+            if (idx != prog.root and info.use_counts.items[idx] == 0) continue;
+            if (node != .load_clip) continue;
+            const fmt = spec.src_fmts[node.load_clip];
+            const is_f16_pair = fmt.is_float and fmt.bits_per_sample == 16;
+            const is_32_pair = env.use_pair_mem and fmt.bits_per_sample == 32;
+            if (!is_f16_pair and !is_32_pair) continue;
+
+            if (!any_pair) {
+                pre0 = try allocator.alloc(?aj.Reg, n_nodes);
+                pre1 = try allocator.alloc(?aj.Reg, n_nodes);
+                @memset(pre0.?, null);
+                @memset(pre1.?, null);
+                any_pair = true;
+            }
+            const clip = node.load_clip;
+            const bps = fmt.bytesPerSample();
+            const shift: u8 = if (bps == 2) 1 else 2;
+            const mem0 = env.rowMem(env.src_row_ptrs[clip].?, shift, 0);
+            const r0 = b.newVec();
+            const r1 = b.newVec();
+            if (is_f16_pair) {
+                b.vecCvtF16ToF32x2(r0, r1, mem0);
+            } else {
+                b.vecLoadUVecx2(r0, r1, mem0);
+                if (!fmt.is_float and info.value_types.items[idx] == .f32) {
+                    b.vecOp2(.cvt_i32_to_f32, r0, r0);
+                    b.vecOp2(.cvt_i32_to_f32, r1, r1);
+                }
+            }
+            pre0.?[idx] = r0;
+            pre1.?[idx] = r1;
+        }
+    }
+
+    const res0 = try evalDagVector(allocator, b, prog, info, spec, env, .interior, 0, use_const_mem, pre0);
 
     var env1 = env;
+    if (env.hoisted_slots_hi.len == n_nodes) {
+        env1.hoisted_slots = env.hoisted_slots_hi;
+    }
     if (env.v_x) |vx0| {
         const vx1 = b.newVec();
-        b.vecOp3(.add_f32, vx1, vx0, v_lane_step_f32.?);
+        if (prog.opt_int) {
+            b.vecOp3(.add_i32, vx1, vx0, v_lane_step_i32.?);
+        } else {
+            b.vecOp3(.add_f32, vx1, vx0, v_lane_step_f32.?);
+        }
         env1.v_x = vx1;
     }
-    const res1 = try evalDagVector(allocator, b, prog, info, spec, env1, .interior, lanes, use_const_mem);
+    const res1 = try evalDagVector(allocator, b, prog, info, spec, env1, .interior, lanes, use_const_mem, pre1);
 
     const dst_bps: usize = spec.dst_fmt.bytesPerSample();
     const dst_shift: u8 = switch (dst_bps) {
@@ -1951,9 +2280,13 @@ fn emitDagBodyX2(
         2 => 1,
         else => 2,
     };
-    const dst_mem0 = aj.Mem.indexed(env.dst_ptr, env.x_gp, dst_shift, 0);
-    const dst_mem1 = aj.Mem.indexed(env.dst_ptr, env.x_gp, dst_shift, @intCast(lanes * dst_bps));
-    pixel.emitStoreF32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt);
+    const dst_mem0 = env.rowMem(env.dst_ptr, dst_shift, 0);
+    const dst_mem1 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * dst_bps));
+    if (info.value_types.items[prog.root] == .i32) {
+        pixel.emitStoreI32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt, env.use_pair_mem);
+    } else {
+        pixel.emitStoreF32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt, env.use_pair_mem);
+    }
 }
 
 fn emitUnaryF32(b: *aj.Builder, op: ast.UnaryOp, dst: aj.Reg, a: aj.Reg, use_const_mem: bool) void {
@@ -2328,7 +2661,7 @@ fn verifyBitExactF32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_st
         .enable_fma = profile.use_fma,
     });
 
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt, @intCast(width), @intCast(height), aj.Builder.cpuSupportsFastLutU8(cpu));
+    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
     defer info.deinit(allocator);
 
     var rt = try aj.Runtime.init();
@@ -2433,7 +2766,7 @@ fn verifyBitExactU8(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str
         .enable_fma = profile.use_fma,
     });
 
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(width), @intCast(height), aj.Builder.cpuSupportsFastLutU8(cpu));
+    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
     defer info.deinit(allocator);
 
     var rt = try aj.Runtime.init();
@@ -2508,7 +2841,7 @@ fn verifyBitExactF32ToU8(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, exp
         .enable_fma = profile.use_fma,
     });
 
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(width), @intCast(height), aj.Builder.cpuSupportsFastLutU8(cpu));
+    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
     defer info.deinit(allocator);
 
     var rt = try aj.Runtime.init();
@@ -2593,7 +2926,7 @@ fn verifyBitExactI32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_st
         .enable_fma = profile.use_fma,
     });
 
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt32, @intCast(width), @intCast(height), aj.Builder.cpuSupportsFastLutU8(cpu));
+    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt32, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
     defer info.deinit(allocator);
     // 32-bit integer inputs must never be routed into the 65536-entry u16 LUT.
     try std.testing.expectEqual(analysis_mod.LutKind.none, info.lut_kind);
@@ -2678,7 +3011,7 @@ fn verifyBitExactF32ToI32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, ex
         .enable_fma = profile.use_fma,
     });
 
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt32, @intCast(width), @intCast(height), aj.Builder.cpuSupportsFastLutU8(cpu));
+    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt32, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
     defer info.deinit(allocator);
 
     var rt = try aj.Runtime.init();
@@ -2906,7 +3239,7 @@ test "JIT-vs-oracle bit-exact parity across ISA tiers, widths, spatial, FMA, opt
             try lower_mod.lower(allocator, &prog_rs, profile);
             try optimize_mod.optimize(allocator, &prog_rs, profile, .{});
             const f32_fmts = [_]ast.SampleFormat{.{ .is_float = true, .bits_per_sample = 32 }};
-            var info_rs = try analysis_mod.analyze(allocator, &prog_rs, &f32_fmts, f32_fmts[0], 17, 1, aj.Builder.cpuSupportsFastLutU8(cpu));
+            var info_rs = try analysis_mod.analyze(allocator, &prog_rs, &f32_fmts, f32_fmts[0], 17, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
             defer info_rs.deinit(allocator);
             var comp_rs = try compilePlane(allocator, &rt_rs, cpu, &prog_rs, &info_rs, .{
                 .width = 17,
@@ -2941,10 +3274,101 @@ test "JIT-vs-oracle bit-exact parity across ISA tiers, widths, spatial, FMA, opt
         try verifyBitExactF32(allocator, cpu, "Y 0.5 * N +", 33, 3);
         try verifyBitExactF32(allocator, cpu, "x[-1,0] Y + N sin +", 33, 3);
         // Periodic `X % C` + hoisted-root pre-packing (`deblock_qed` mask), i16 cmp/logic/select,
-        // and native u8 saturating add/sub parity across all widths and ISA tiers.
-        for ([_]usize{ 1, 3, 7, 8, 9, 15, 16, 17, 33, 64 }) |w| {
+        // and native u8 saturating add/sub parity across all widths and ISA tiers (incl. AR1 two-phase tails).
+        for ([_]usize{ 1, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 25, 31, 32, 33, 63, 64, 65 }) |w| {
             try verifyBitExactU8(allocator, cpu, "X 8 % 7 % Y 8 % 7 % and 0 255 ?", w, 9, false);
             try verifyBitExactU8(allocator, cpu, "X 4 % 3 % Y 4 % 3 % and 0 255 ?", w, 5, false);
+            try verifyBitExactU8(allocator, cpu, "X 16 % 16 *", w, 3, false);
+            try verifyBitExactU8(allocator, cpu, "X 32 % 4 *", w, 3, false);
+            try verifyBitExactU8(allocator, cpu, "X 8 % x +", w, 3, false);
+            try verifyBitExactU8(allocator, cpu, "X 16 % x +", w, 3, false);
+            try verifyBitExactU8(allocator, cpu, "X 32 % x +", w, 3, false);
+            try verifyBitExactF32(allocator, cpu, "X 8 %", w, 3);
+            try verifyBitExactF32(allocator, cpu, "X 16 % 4 *", w, 3);
+            try verifyBitExactF32(allocator, cpu, "X 32 % 2 *", w, 3);
+            try verifyBitExactF32(allocator, cpu, "X 8 % 7 % Y 8 % 7 % and 0 1 ?", w, 9);
+            try verifyBitExactF32(allocator, cpu, "X 8 % x +", w, 3);
+            try verifyBitExactF32(allocator, cpu, "X 16 % x +", w, 3);
+            try verifyBitExactF32(allocator, cpu, "X 32 % x +", w, 3);
+            try verifyBitExactF32(allocator, cpu, "X 16 % x * y +", w, 3);
+            try verifyBitExactI32(allocator, cpu, "X 8 % x +", w, 3, false);
+            try verifyBitExactI32(allocator, cpu, "X 16 % 4 *", w, 3, false);
+            try verifyBitExactI32(allocator, cpu, "X 32 % x +", w, 3, false);
+        }
+        // AR1: also verify u16 & f16 two-phase `X % C` roots and pixel tails with tight 32B/64B strides.
+        {
+            const parser = @import("../expr/parser.zig");
+            const lower_mod = @import("../expr/lower.zig");
+            const optimize_mod = @import("../expr/optimize.zig");
+            const prof = interp.TargetProfile.fromCpu(cpu);
+            var rt_ar1 = try aj.Runtime.init();
+            defer rt_ar1.deinit();
+            const ar1_fmts = [_]ast.SampleFormat{
+                .{ .is_float = false, .bits_per_sample = 16 },
+                .{ .is_float = true, .bits_per_sample = 16 },
+            };
+            const ar1_exprs = [_][]const u8{
+                "X 8 % 7 % Y 8 % 7 % and 0 1 ?",
+                "X 16 % 4096 *",
+                "X 32 % 2 *",
+                "X 8 % x +",
+                "X 16 % x +",
+                "X 32 % x +",
+            };
+            const stride_align: usize = if (cpu.has_avx512) 64 else 32;
+            for (ar1_fmts) |fmt16| {
+                if (fmt16.is_float and !cpu.has_f16c and cpu.isa != .neon) continue;
+                const fmts16 = [_]ast.SampleFormat{fmt16};
+                for (ar1_exprs) |e| {
+                    var p16 = try parser.parse(allocator, e, .{ .num_clips = 1 });
+                    defer p16.deinit(allocator);
+                    try lower_mod.lower(allocator, &p16, prof);
+                    try optimize_mod.optimize(allocator, &p16, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
+                    for ([_]usize{ 1, 5, 7, 8, 9, 13, 15, 16, 17, 25, 31, 32, 33, 63, 65 }) |w| {
+                        var inf16 = try analysis_mod.analyze(allocator, &p16, &fmts16, fmt16, @intCast(w), 3, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
+                        defer inf16.deinit(allocator);
+                        var comp16 = try compilePlane(allocator, &rt_ar1, cpu, &p16, &inf16, .{
+                            .width = w,
+                            .height = 3,
+                            .src_fmts = &fmts16,
+                            .dst_fmt = fmt16,
+                        });
+                        defer comp16.deinit(allocator, &rt_ar1);
+                        const row_bytes = std.mem.alignForward(usize, w * 2, stride_align);
+                        const row_elems = row_bytes / 2;
+                        const src16 = try allocator.alignedAlloc(u16, .@"64", row_elems * 3);
+                        defer allocator.free(src16);
+                        const dj16 = try allocator.alignedAlloc(u16, .@"64", row_elems * 3);
+                        defer allocator.free(dj16);
+                        const dr16 = try allocator.alignedAlloc(u16, .@"64", row_elems * 3);
+                        defer allocator.free(dr16);
+                        for (0..row_elems * 3) |i| {
+                            src16[i] = if (fmt16.is_float) 0x3800 else @intCast((i * 137 + 19) & 0x3fff);
+                            dj16[i] = 0x5A5A;
+                            dr16[i] = 0x5A5A;
+                        }
+                        const s16 = [_][*]const u8{@ptrCast(src16.ptr)};
+                        const st16 = [_]isize{@intCast(row_bytes)};
+                        comp16.kernel.func(@ptrCast(dj16.ptr), @intCast(row_bytes), &s16, &st16, 0, null);
+                        try interp.evalPlane(allocator, &p16, prof, .{
+                            .dst = @ptrCast(dr16.ptr),
+                            .dst_stride = @intCast(row_bytes),
+                            .dst_fmt = fmt16,
+                            .srcs = &s16,
+                            .src_strides = &st16,
+                            .src_fmts = &fmts16,
+                            .width = w,
+                            .height = 3,
+                            .frame_n = 0,
+                            .props = &.{},
+                        });
+                        for (0..3) |y| {
+                            const off = y * row_elems;
+                            try std.testing.expectEqualSlices(u16, dr16[off .. off + w], dj16[off .. off + w]);
+                        }
+                    }
+                }
+            }
         }
         for ([_][]const u8{
             "x y -",

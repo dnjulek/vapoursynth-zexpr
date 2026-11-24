@@ -16,13 +16,16 @@ pub const TargetProfile = struct {
     isa_family: IsaFamily,
 
     pub fn fromCpu(cpu: cpu_mod.CpuInfo) TargetProfile {
+        const isa_family: IsaFamily = switch (cpu.isa) {
+            .neon => .aarch64,
+            .scalar => IsaFamily.host(),
+            else => .x86,
+        };
         return .{
-            .use_fma = cpu.has_fma,
-            .isa_family = switch (cpu.isa) {
-                .neon => .aarch64,
-                .scalar => IsaFamily.host(),
-                else => .x86,
-            },
+            // AR4: AArch64 NEON always fuses FMA, so level-0 scalar oracle on AArch64 uses FMA too.
+            // On x86, level-0 scalar stays non-FMA to match SSE2 (level 1) and x86-64-v2 (level 2).
+            .use_fma = cpu.has_fma or (cpu.isa == .scalar and isa_family == .aarch64),
+            .isa_family = isa_family,
         };
     }
 

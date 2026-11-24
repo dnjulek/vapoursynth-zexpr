@@ -156,13 +156,57 @@ pub fn emitStoreI32(b: *aj.Builder, mem: aj.Mem, src: aj.Reg, fmt: ast.SampleFor
     }
 }
 
+/// Store `2 * f32_lanes` `i32` values (`opt=1`) to `mem0` and `mem1`.
+pub fn emitStoreI32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, src1: aj.Reg, fmt: ast.SampleFormat, use_pair_mem: bool) void {
+    if (fmt.is_float) {
+        const f0 = b.newVec();
+        const f1 = b.newVec();
+        b.vecOp2(.cvt_i32_to_f32, f0, src0);
+        b.vecOp2(.cvt_i32_to_f32, f1, src1);
+        emitStoreF32x2(b, mem0, mem1, f0, f1, fmt, use_pair_mem);
+        return;
+    }
+    if (fmt.bits_per_sample == 32) {
+        if (use_pair_mem) {
+            b.vecStoreUVecx2(mem0, src0, src1);
+        } else {
+            b.vecStore(.u_vec, mem0, src0);
+            b.vecStore(.u_vec, mem1, src1);
+        }
+        return;
+    }
+
+    const peak_i = b.constI32Splat(@intCast(fmt.peakInt()));
+    const t0 = b.newVec();
+    const t1 = b.newVec();
+    b.vecOp3(.min_i32, t0, src0, peak_i);
+    b.vecOp3(.min_i32, t1, src1, peak_i);
+    if (b.cpu.has_avx512) {
+        const z = b.vecZero();
+        b.vecOp3(.max_i32, t0, t0, z);
+        b.vecOp3(.max_i32, t1, t1, z);
+    }
+    if (fmt.bits_per_sample <= 8) {
+        b.vecStoreU8FromI32x2(mem0, t0, t1);
+    } else {
+        b.vecStoreU16FromI32x2(mem0, t0, t1);
+    }
+}
+
 /// Store `2 * f32_lanes` `f32` values (`src0`, `src1`) to `mem0` and `mem1`,
-/// using paired `vpackssdw`/`vpackuswb`/`vpackusdw` for `u8`/`u16` outputs.
-pub fn emitStoreF32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, src1: aj.Reg, fmt: ast.SampleFormat) void {
+/// using paired `vpackssdw`/`vpackuswb`/`vpackusdw` for `u8`/`u16` outputs,
+/// paired `fcvtn`+`fcvtn2`+`str q` for NEON `f16`, and optional `stp` for NEON `f32`/`u32`.
+pub fn emitStoreF32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, src1: aj.Reg, fmt: ast.SampleFormat, use_pair_mem: bool) void {
     if (fmt.is_float) {
         if (fmt.bits_per_sample == 16) {
-            b.vecCvtF32ToF16(mem0, src0);
-            b.vecCvtF32ToF16(mem1, src1);
+            if (b.cpu.isa == .neon) {
+                b.vecCvtF32ToF16x2(mem0, src0, src1);
+            } else {
+                b.vecCvtF32ToF16(mem0, src0);
+                b.vecCvtF32ToF16(mem1, src1);
+            }
+        } else if (use_pair_mem) {
+            b.vecStoreUVecx2(mem0, src0, src1);
         } else {
             b.vecStore(.u_vec, mem0, src0);
             b.vecStore(.u_vec, mem1, src1);
@@ -186,6 +230,8 @@ pub fn emitStoreF32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, 
         b.vecStoreU8FromI32x2(mem0, t0, t1);
     } else if (fmt.bits_per_sample <= 16) {
         b.vecStoreU16FromI32x2(mem0, t0, t1);
+    } else if (use_pair_mem) {
+        b.vecStoreUVecx2(mem0, t0, t1);
     } else {
         b.vecStore(.u_vec, mem0, t0);
         b.vecStore(.u_vec, mem1, t1);

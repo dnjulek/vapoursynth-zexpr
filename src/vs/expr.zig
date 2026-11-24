@@ -417,9 +417,10 @@ fn createImpl(
         }
     }
 
-    // Oracle profile: when forced via ZEXPR_CPU_LEVEL=0, use_fma = false; otherwise match host_cpu.has_fma.
+    // Oracle profile: on x86, ZEXPR_CPU_LEVEL=0 uses use_fma=false (matching SSE2/v2);
+    // on AArch64, NEON always fuses FMA so level 0 uses use_fma=true (AR4).
     const profile: interp.TargetProfile = if (env_override != null and env_override.? == 0)
-        .{ .use_fma = false, .isa_family = cpu_mod.IsaFamily.host() }
+        .{ .use_fma = cpu_mod.IsaFamily.host() == .aarch64, .isa_family = cpu_mod.IsaFamily.host() }
     else if (cpu.isa == .scalar)
         .{ .use_fma = cpu_mod.detectWithOverride(null).has_fma, .isa_family = cpu_mod.IsaFamily.host() }
     else
@@ -443,7 +444,7 @@ fn createImpl(
         out_vi.format.sampleType == vi0.format.sampleType and
         out_vi.format.bitsPerSample == vi0.format.bitsPerSample;
 
-    // Phase 1: check LRU cache for each non-empty plane (instant hit in FrameEval / shared U/V).
+    // Phase 1: check LRU cache for each non-empty plane (instant hit in FrameEval / shared U/V / shared LUT).
     for (0..num_planes) |p| {
         const expr_str = plane_exprs[p];
         if (expr_str.len == 0) {
@@ -464,7 +465,11 @@ fn createImpl(
             .profile = profile,
         };
         if (!force_scalar) {
-            if (global_plane_cache.get(plane_keys[p])) |entry| {
+            var dim_key = plane_keys[p];
+            dim_key.width = 0;
+            dim_key.height = 0;
+            const hit = global_plane_cache.get(plane_keys[p]) orelse global_plane_cache.get(dim_key);
+            if (hit) |entry| {
                 planes[p] = .{ .cached = entry };
                 continue;
             }
@@ -501,9 +506,13 @@ fn createImpl(
         if (!needs_compile[p]) continue;
 
         // Re-check cache in case an earlier plane in this same Create compiled an identical key
-        // (e.g., YUV420 U and V planes sharing the same expression and dimensions).
+        // (e.g., YUV420 U and V planes sharing the same expression, or Y/U/V sharing a dimension-independent LUT).
         if (!force_scalar) {
-            if (global_plane_cache.get(plane_keys[p])) |entry| {
+            var dim_key = plane_keys[p];
+            dim_key.width = 0;
+            dim_key.height = 0;
+            const hit = global_plane_cache.get(plane_keys[p]) orelse global_plane_cache.get(dim_key);
+            if (hit) |entry| {
                 planes[p] = .{ .cached = entry };
                 continue;
             }
@@ -523,7 +532,10 @@ fn createImpl(
         const ph = plane_keys[p].height;
 
         const has_fast_u8_lut = rt_ptr != null and aj.Builder.cpuSupportsFastLutU8(cpu);
-        var info = try analysis_mod.analyze(allocator, &prog, src_fmts, dst_fmt, @intCast(pw), @intCast(ph), has_fast_u8_lut);
+        var info = try analysis_mod.analyze(allocator, &prog, src_fmts, dst_fmt, @intCast(pw), @intCast(ph), .{
+            .has_fast_u8_lut = has_fast_u8_lut,
+            .f32_lanes = cpu.f32_lanes,
+        });
         defer info.deinit(allocator);
 
         // Automatic 1D/2D LUT fast path (B4, Y14) unless forced to scalar via ZEXPR_CPU_LEVEL=0.
@@ -550,10 +562,15 @@ fn createImpl(
                 }
                 planes[p] = .{ .lut_unshared = lut };
             } else {
+                var store_key = plane_keys[p];
+                if (lut.simd_kernel == null) {
+                    store_key.width = 0;
+                    store_key.height = 0;
+                }
                 const entry = cache_blk: {
                     var exec: plane_cache.CompiledPlane = .{ .lut = lut };
                     errdefer exec.deinit(allocator, rt_ptr);
-                    break :cache_blk try global_plane_cache.putOrGet(allocator, plane_keys[p], exec);
+                    break :cache_blk try global_plane_cache.putOrGet(allocator, store_key, exec);
                 };
                 planes[p] = .{ .cached = entry };
             }

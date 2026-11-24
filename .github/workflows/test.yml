@@ -69,6 +69,13 @@ jobs:
         timeout-minutes: 30
         run: pytest -v -p no:cacheprovider tests
 
+      - name: Run pytest at SSE2 / x86-64-v2 tiers (${{ matrix.optimize }})
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        run: |
+          ZEXPR_CPU_LEVEL=1 pytest -q -p no:cacheprovider tests
+          ZEXPR_CPU_LEVEL=2 pytest -q -p no:cacheprovider tests
+
   test-musl:
     strategy:
       fail-fast: false

@@ -6,7 +6,17 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from helpers import assert_div255_f32, assert_same_clip, make_clip, make_f32_clip, plane_array
+from helpers import (
+    LARGE_WIDTHS,
+    POINT_HEIGHTS,
+    SIMD_WIDTHS,
+    SPATIAL_HEIGHTS,
+    assert_div255_f32,
+    assert_same_clip,
+    make_clip,
+    make_f32_clip,
+    plane_array,
+)
 
 
 def test_r3_mod_never_fma_fused(core: vs.Core) -> None:
@@ -378,3 +388,112 @@ def test_frameeval_plane_cache_reuse_and_eviction(core: vs.Core) -> None:
     opt1_out = core.zexpr.Expr([c16], ["x 0 * 16777217 + 1 + 16777216 -"], opt=1)
     assert np.all(plane_array(opt0_out.get_frame(0), 0) == 0)
     assert np.all(plane_array(opt1_out.get_frame(0), 0) == 2)
+
+
+def test_periodic_x_mod_all_formats_and_widths(core: vs.Core) -> None:
+    """AR1: Two-phase `X % (2 * lanes)` hoisting matches exact NumPy oracle across all formats,
+    all SIMD / two-phase tail widths (1..257 + real-world residues), and YUV420 chroma planes."""
+    all_widths = SIMD_WIDTHS + LARGE_WIDTHS
+    gray_formats = (
+        (vs.GRAY8, np.uint8, 255),
+        (vs.GRAY10, np.uint16, 1023),
+        (vs.GRAY16, np.uint16, 65535),
+        (vs.GRAY32, np.uint32, 2147483520),
+        (vs.GRAYH, np.float16, None),
+        (vs.GRAYS, np.float32, None),
+    )
+
+    def quantize_f32(val: np.ndarray, dtype, peak: int | None) -> np.ndarray:
+        if peak is None:
+            return val.astype(dtype)
+        clamped = np.clip(val, np.float32(0.0), np.float32(peak))
+        return np.rint(clamped).astype(dtype)
+
+    for fmt, dtype, peak in gray_formats:
+        for h in POINT_HEIGHTS:
+            for w in all_widths:
+                xs = np.broadcast_to(np.arange(w, dtype=np.float32)[None, :], (h, w))
+                src = make_clip(core, width=w, height=h, fmt=fmt, length=1, seed=1000 + w * 7 + h)
+                src_y = make_clip(core, width=w, height=h, fmt=fmt, length=1, seed=2000 + w * 7 + h)
+                raw_x = plane_array(src.get_frame(0), 0)
+                raw_y = plane_array(src_y.get_frame(0), 0)
+                ax = (raw_x.view(np.int32) if fmt == vs.GRAY32 else raw_x).astype(np.float32)
+                ay = (raw_y.view(np.int32) if fmt == vs.GRAY32 else raw_y).astype(np.float32)
+
+                cases = (
+                    ("X 4 %", [src], xs % np.float32(4.0)),
+                    ("X 8 %", [src], xs % np.float32(8.0)),
+                    ("X 16 % 4 *", [src], (xs % np.float32(16.0)) * np.float32(4.0)),
+                    ("X 32 % 2 *", [src], (xs % np.float32(32.0)) * np.float32(2.0)),
+                    ("X 8 % x +", [src], (xs % np.float32(8.0)) + ax),
+                    ("X 16 % x +", [src], (xs % np.float32(16.0)) + ax),
+                    ("X 32 % x +", [src], (xs % np.float32(32.0)) + ax),
+                    ("X 16 % x * y +", [src, src_y], (xs % np.float32(16.0)) * ax + ay),
+                )
+                for expr, clips, expected_f32 in cases:
+                    got = plane_array(core.zexpr.Expr(clips, [expr]).get_frame(0), 0)
+                    exp = quantize_f32(expected_f32, dtype, peak)
+                    if expr == "X 16 % x * y +":
+                        # Matches exact unfused (L0-L2) or exact FMA (L3/L4/NEON, computed in f64->f32).
+                        exp_fma_f32 = (
+                            (xs.astype(np.float64) % 16.0) * ax.astype(np.float64) + ay.astype(np.float64)
+                        ).astype(np.float32)
+                        exp_fma = quantize_f32(exp_fma_f32, dtype, peak)
+                        assert np.all((got == exp) | (got == exp_fma)), f"FMA/unfused mismatch on {fmt} w={w} h={h}"
+                    else:
+                        np.testing.assert_array_equal(got, exp)
+
+    # Float & integer `deblock_qed` mask across spatial heights (including h=2..17) and awkward widths.
+    for fmt, dtype, hi_str, hi_val in (
+        (vs.GRAY8, np.uint8, "255", 255),
+        (vs.GRAY16, np.uint16, "65535", 65535),
+        (vs.GRAYH, np.float16, "1", np.float16(1.0)),
+        (vs.GRAYS, np.float32, "1", np.float32(1.0)),
+    ):
+        for h in SPATIAL_HEIGHTS:
+            for w in (1, 5, 6, 7, 8, 9, 13, 15, 16, 17, 25, 31, 33, 63, 65, 1366):
+                yy, xx = np.mgrid[0:h, 0:w]
+                mask8 = ((xx % 8 % 7) > 0) & ((yy % 8 % 7) > 0)
+                mask16 = ((xx % 16 % 15) > 0) & ((yy % 8 % 7) > 0)
+                c = core.std.BlankClip(width=w, height=h, format=fmt, length=1)
+                got8 = plane_array(core.zexpr.Expr([c], [f"X 8 % 7 % Y 8 % 7 % and 0 {hi_str} ?"]).get_frame(0), 0)
+                np.testing.assert_array_equal(got8, np.where(mask8, 0, hi_val).astype(dtype))
+                got16 = plane_array(core.zexpr.Expr([c], [f"X 16 % 15 % Y 8 % 7 % and 0 {hi_str} ?"]).get_frame(0), 0)
+                np.testing.assert_array_equal(got16, np.where(mask16, 0, hi_val).astype(dtype))
+
+    # YUV420 covers half-width chroma planes (e.g. 1366 -> 683, 26 -> 13).
+    for w in (10, 14, 26, 30, 62, 1366):
+        cyuv = core.std.BlankClip(width=w, height=6, format=vs.YUV420PS, length=1)
+        out = core.zexpr.Expr([cyuv], ["X 8 % 7 % Y 8 % 7 % and 0 1 ?"])
+        f = out.get_frame(0)
+        for p in range(3):
+            got = plane_array(f, p)
+            ph, pw = got.shape
+            yy, xx = np.mgrid[0:ph, 0:pw]
+            exp = np.where(((xx % 8 % 7) > 0) & ((yy % 8 % 7) > 0), 0.0, 1.0).astype(np.float32)
+            np.testing.assert_array_equal(got, exp)
+
+
+def test_lut_cache_key_width_height_invariant(core: vs.Core) -> None:
+    """AR3: Dimension-free LUT caching must never conflate expressions that depend on `width`/`height`."""
+    expr_w = "x 65535 / 2.2 pow width * 0.5 +"
+    expr_h = "x 65535 / 2.2 pow height * 0.5 +"
+
+    # Same YUV420P16 clip: Y plane (32x16) and U/V planes (16x8) must see their own plane dimensions.
+    cyuv = core.std.BlankClip(width=32, height=16, format=vs.YUV420P16, color=[40000, 40000, 40000], length=1)
+    fy_w = core.zexpr.Expr([cyuv], [expr_w]).get_frame(0)
+    fy_h = core.zexpr.Expr([cyuv], [expr_h]).get_frame(0)
+    base_val = np.float32(40000.0 / 65535.0) ** np.float32(2.2)
+    for p, (pw, ph) in enumerate(((32, 16), (16, 8), (16, 8))):
+        exp_w = int(np.rint(base_val * np.float32(pw) + np.float32(0.5)))
+        exp_h = int(np.rint(base_val * np.float32(ph) + np.float32(0.5)))
+        assert np.all(plane_array(fy_w, p) == exp_w), f"width mismatch on plane {p}"
+        assert np.all(plane_array(fy_h, p) == exp_h), f"height mismatch on plane {p}"
+
+    # Separate GRAY16 Creates with different widths/heights must never share a dimension-free LUT entry.
+    for w, h in ((32, 8), (64, 16), (128, 32)):
+        cg = core.std.BlankClip(width=w, height=h, format=vs.GRAY16, color=[40000], length=1)
+        got_w = plane_array(core.zexpr.Expr([cg], [expr_w]).get_frame(0), 0)
+        got_h = plane_array(core.zexpr.Expr([cg], [expr_h]).get_frame(0), 0)
+        assert np.all(got_w == int(np.rint(base_val * np.float32(w) + np.float32(0.5))))
+        assert np.all(got_h == int(np.rint(base_val * np.float32(h) + np.float32(0.5))))

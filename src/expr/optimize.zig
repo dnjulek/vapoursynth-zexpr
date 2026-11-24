@@ -224,7 +224,26 @@ fn rewriteAndCsePass(
                 }
 
                 // Exact identities (all bit-exact for every float32 input):
-                if (!prog.opt_int) {
+                if (prog.opt_int) {
+                    // Under opt=1, `/` always promotes to f32. Rewrite constant divisor to `* const_f32(1/C)`
+                    // (preserving `.f32` type via `.const_f32`, never simplifying `/ 1` to `a`).
+                    if (b.op == .div and cb != null) {
+                        const div_c = cb.?.asF32();
+                        if (isExactPow2Divisor(div_c)) {
+                            changed = true;
+                            const inv_node = try intern(allocator, &new_nodes, &cse, .{ .const_f32 = 1.0 / div_c });
+                            break :blk try intern(allocator, &new_nodes, &cse, .{ .binary = .{ .op = .mul, .a = a, .b = inv_node } });
+                        }
+                        if (opts.enable_value_changing) {
+                            const inv = 1.0 / div_c;
+                            if (std.math.isFinite(inv)) {
+                                changed = true;
+                                const inv_node = try intern(allocator, &new_nodes, &cse, .{ .const_f32 = inv });
+                                break :blk try intern(allocator, &new_nodes, &cse, .{ .binary = .{ .op = .mul, .a = a, .b = inv_node } });
+                            }
+                        }
+                    }
+                } else {
                     if (b.op == .mul) {
                         if (cb != null and cb.?.asF32() == 1.0) {
                             changed = true;

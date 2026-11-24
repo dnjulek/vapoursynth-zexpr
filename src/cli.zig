@@ -115,11 +115,11 @@ fn run(init: std.process.Init) !void {
     const expr = expr_str orelse return error.MissingExpression;
     const cpu = cpu_mod.detect();
     const profile = interp.TargetProfile.fromCpu(cpu);
-    const fmts = [_]ast.SampleFormat{ fmt, fmt };
+    const fmts = [_]ast.SampleFormat{ fmt, fmt, fmt, fmt };
 
     var prog = try parser.parse(gpa, expr, .{
         .mode = .expr,
-        .num_clips = 2,
+        .num_clips = 4,
         .default_boundary = boundary,
         .opt_int = opt_int,
     });
@@ -131,7 +131,10 @@ fn run(init: std.process.Init) !void {
         .enable_fma = profile.use_fma,
     });
 
-    var info = try analysis_mod.analyze(gpa, &prog, &fmts, fmt, @intCast(width), @intCast(height), aj.Builder.cpuSupportsFastLutU8(cpu));
+    var info = try analysis_mod.analyze(gpa, &prog, &fmts, fmt, @intCast(width), @intCast(height), .{
+        .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu),
+        .f32_lanes = cpu.f32_lanes,
+    });
     defer info.deinit(gpa);
 
     if (is_disasm) {
@@ -165,6 +168,10 @@ fn run(init: std.process.Init) !void {
     defer gpa.free(src0);
     const src1 = try gpa.alignedAlloc(u8, .@"64", total_bytes);
     defer gpa.free(src1);
+    const src2 = try gpa.alignedAlloc(u8, .@"64", total_bytes);
+    defer gpa.free(src2);
+    const src3 = try gpa.alignedAlloc(u8, .@"64", total_bytes);
+    defer gpa.free(src3);
     const dst = try gpa.alignedAlloc(u8, .@"64", total_bytes);
     defer gpa.free(dst);
     @memset(dst, 0);
@@ -176,20 +183,26 @@ fn run(init: std.process.Init) !void {
     if (fmt.is_float and fmt.bits_per_sample == 32) {
         const s0: [*]f32 = @ptrCast(@alignCast(src0.ptr));
         const s1: [*]f32 = @ptrCast(@alignCast(src1.ptr));
+        const s2: [*]f32 = @ptrCast(@alignCast(src2.ptr));
+        const s3: [*]f32 = @ptrCast(@alignCast(src3.ptr));
         const elems = total_bytes / 4;
         for (0..elems) |idx| {
             s0[idx] = @as(f32, @floatFromInt(idx & 255)) / 255.0;
             s1[idx] = @as(f32, @floatFromInt((idx * 3 + 7) & 255)) / 255.0;
+            s2[idx] = @as(f32, @floatFromInt((idx * 5 + 13) & 255)) / 255.0;
+            s3[idx] = @as(f32, @floatFromInt((idx * 7 + 29) & 255)) / 255.0;
         }
     } else {
         for (0..total_bytes) |idx| {
             src0[idx] = @intCast(idx & 255);
             src1[idx] = @intCast((idx * 3 + 7) & 255);
+            src2[idx] = @intCast((idx * 5 + 13) & 255);
+            src3[idx] = @intCast((idx * 7 + 29) & 255);
         }
     }
 
-    const srcs = [_][*]const u8{ src0.ptr, src1.ptr };
-    const strides = [_]isize{ @intCast(stride_bytes), @intCast(stride_bytes) };
+    const srcs = [_][*]const u8{ src0.ptr, src1.ptr, src2.ptr, src3.ptr };
+    const strides = [_]isize{ @intCast(stride_bytes), @intCast(stride_bytes), @intCast(stride_bytes), @intCast(stride_bytes) };
     var code_size: usize = 0;
 
     if (cpu.isa == .scalar) {

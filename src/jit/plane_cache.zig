@@ -374,7 +374,7 @@ test "PlaneCache LRU hit, eviction, active ref survival, and key isolation" {
                 .enable_value_changing = true,
                 .enable_fma = k.profile.use_fma,
             });
-            var info = try analysis_mod.analyze(a, &prog, k.src_fmts, k.dst_fmt, @intCast(k.width), @intCast(k.height), false);
+            var info = try analysis_mod.analyze(a, &prog, k.src_fmts, k.dst_fmt, @intCast(k.width), @intCast(k.height), .{ .f32_lanes = k.cpu.f32_lanes });
             defer info.deinit(a);
             const props = try buildPropBindings(a, &prog);
             errdefer freePropBindings(a, props);

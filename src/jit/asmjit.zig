@@ -452,8 +452,55 @@ pub const Builder = struct {
         c.zj_vec_cvt_f16_to_f32(self.raw, dst.raw, mem.raw);
     }
 
+    pub fn vecCvtF16ToF32x2(self: *Builder, dst0: Reg, dst1: Reg, mem: Mem) void {
+        c.zj_vec_cvt_f16_to_f32x2(self.raw, dst0.raw, dst1.raw, mem.raw);
+    }
+
     pub fn vecCvtF32ToF16(self: *Builder, mem: Mem, src: Reg) void {
         c.zj_vec_cvt_f32_to_f16(self.raw, mem.raw, src.raw);
+    }
+
+    pub fn vecCvtF32ToF16x2(self: *Builder, mem: Mem, src0: Reg, src1: Reg) void {
+        c.zj_vec_cvt_f32_to_f16x2(self.raw, mem.raw, src0.raw, src1.raw);
+    }
+
+    pub fn vecLoadUVecx2(self: *Builder, dst0: Reg, dst1: Reg, mem: Mem) void {
+        c.zj_vec_load_u_vecx2(self.raw, dst0.raw, dst1.raw, mem.raw);
+    }
+
+    pub fn vecStoreUVecx2(self: *Builder, mem: Mem, src0: Reg, src1: Reg) void {
+        c.zj_vec_store_u_vecx2(self.raw, mem.raw, src0.raw, src1.raw);
+    }
+
+    pub fn compileLut1dU8Neon(
+        rt: *Runtime,
+        table_256: *const [256]u8,
+        clip_idx: u32,
+        width: usize,
+        height: usize,
+    ) JitError!CompiledKernel {
+        var fn_ptr: ?*anyopaque = null;
+        var code_size: usize = 0;
+        var execmem_denied: u8 = 0;
+        const rc = c.zj_compile_lut1d_u8_neon(
+            rt.raw,
+            table_256,
+            clip_idx,
+            @intCast(width),
+            @intCast(height),
+            &fn_ptr,
+            &code_size,
+            &execmem_denied,
+        );
+        if (rc != 0) {
+            if (execmem_denied != 0) return error.ExecMemDenied;
+            return error.CompileFailed;
+        }
+        const ptr = fn_ptr orelse return error.CompileFailed;
+        return .{
+            .func = @ptrCast(@alignCast(ptr)),
+            .code_size = code_size,
+        };
     }
 
     pub fn vecStoreU8FromI32(self: *Builder, mem: Mem, src_i32: Reg) void {
