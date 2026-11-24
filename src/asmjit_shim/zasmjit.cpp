@@ -17,9 +17,20 @@
 #error "zasmjit.cpp requires x86-64 or AArch64 host architecture"
 #endif
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace aj = asmjit;
 namespace ujit = asmjit::ujit;
@@ -280,6 +291,49 @@ void zj_runtime_release(zj_runtime* rt, void* fn_ptr) {
         rt->rt.release(fn_ptr);
     }
 }
+
+static std::atomic<zj_teardown_fn> g_dso_teardown{nullptr};
+static std::atomic<bool> g_emit_shutdown_marker{false};
+
+void zj_set_dso_teardown(zj_teardown_fn fn) {
+    if (fn != nullptr) {
+        const char* env = std::getenv("ZEXPR_TEST_SHUTDOWN_MARKER");
+        const bool enable = (env != nullptr && env[0] != '\0' && env[0] != '0');
+        g_emit_shutdown_marker.store(enable, std::memory_order_release);
+    }
+    g_dso_teardown.store(fn, std::memory_order_release);
+}
+
+void zj_run_dso_teardown_now(void) {
+    if (zj_teardown_fn fn = g_dso_teardown.exchange(nullptr, std::memory_order_acq_rel)) {
+        fn();
+    }
+}
+
+void zj_emit_shutdown_marker_if_enabled(void) {
+    if (!g_emit_shutdown_marker.load(std::memory_order_acquire)) {
+        return;
+    }
+    static constexpr char kMarker[] = "zexpr:shutdown:ok\n";
+#if defined(_WIN32)
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        (void)WriteFile(h, kMarker, DWORD(sizeof(kMarker) - 1u), &written, nullptr);
+    }
+#else
+    const ssize_t ignored = write(STDERR_FILENO, kMarker, sizeof(kMarker) - 1u);
+    (void)ignored;
+#endif
+}
+
+#if !defined(_WIN32)
+// Linux ELF emits this into .fini_array; macOS Mach-O lowers it to
+// __DATA,__mod_init_func calling ___cxa_atexit(..., &___dso_handle) for dyld4.
+__attribute__((destructor)) static void zj_dso_destructor(void) {
+    zj_run_dso_teardown_now();
+}
+#endif
 
 void zj_cpu_detect(zj_cpu_info_t* out, int32_t max_isa_override) {
     if (out == nullptr) return;

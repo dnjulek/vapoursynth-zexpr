@@ -225,6 +225,10 @@ pub fn readFrameProp(zapi: ZAPI, props: ?*const vs.Map, name_z: [*:0]const u8, m
 
 var cached_core_align: std.atomic.Value(u32) = .init(0);
 
+pub fn resetCoreAlignmentCache() void {
+    cached_core_align.store(0, .release);
+}
+
 /// S5: Probe the running core's frame row alignment once per process via a 1x1 GRAY8 frame.
 pub fn probeCoreAlignment(zapi: ZAPI) u32 {
     const cached = cached_core_align.load(.acquire);

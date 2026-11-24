@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug symbols from the plugin library") orelse (optimize != .debug);
+    const win_dllmain = b.option(bool, "win-dllmain", "Link Windows DllMain teardown hook (disable only for negative-control leak tests)") orelse true;
 
     const asmjit_bundle = asmjit_build.create(b, target, optimize);
 
@@ -34,6 +35,12 @@ pub fn build(b: *std.Build) void {
     plugin_mod.addImport("vapoursynth", vs_dep.module("vapoursynth"));
     plugin_mod.addOptions("zon", zon_options);
     asmjit_build.wireShim(b, asmjit_bundle, plugin_mod);
+    if (target.result.os.tag == .windows and win_dllmain) {
+        plugin_mod.addCSourceFile(.{
+            .file = b.path("src/vs/win_dllmain.c"),
+            .flags = &.{"-std=c11"},
+        });
+    }
 
     const lib = b.addLibrary(.{
         .name = "zexpr",

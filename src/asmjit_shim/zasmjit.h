@@ -241,6 +241,12 @@ void zj_runtime_destroy(zj_runtime* rt);
 void zj_runtime_release(zj_runtime* rt, void* fn_ptr);
 void zj_cpu_detect(zj_cpu_info_t* out, int32_t max_isa_override);
 
+/* DSO unload teardown hook (hidden visibility; zero extra dynamic exports). */
+typedef void (*zj_teardown_fn)(void);
+void zj_set_dso_teardown(zj_teardown_fn fn);
+void zj_run_dso_teardown_now(void);
+void zj_emit_shutdown_marker_if_enabled(void);
+
 /* Compiler context & function lifecycle. */
 zj_ctx* zj_ctx_create(zj_runtime* rt, const zj_cpu_info_t* cpu, uint8_t capture_disasm);
 void zj_ctx_destroy(zj_ctx* ctx);

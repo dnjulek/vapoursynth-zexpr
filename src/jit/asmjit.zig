@@ -265,6 +265,16 @@ pub const Runtime = struct {
     }
 };
 
+pub const DsoTeardownFn = *const fn () callconv(.c) void;
+
+pub fn setDsoTeardown(cb: ?DsoTeardownFn) void {
+    c.zj_set_dso_teardown(cb);
+}
+
+pub fn emitShutdownMarkerIfEnabled() void {
+    c.zj_emit_shutdown_marker_if_enabled();
+}
+
 pub const Builder = struct {
     raw: *c.zj_ctx,
     cpu: CpuInfo,

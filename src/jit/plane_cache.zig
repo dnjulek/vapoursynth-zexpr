@@ -165,13 +165,35 @@ fn entryLutBytes(exec: *const CompiledPlane) usize {
     };
 }
 
+pub const CacheState = enum(u8) {
+    open,
+    closed,
+};
+
+pub const PutError = std.mem.Allocator.Error || error{CacheClosed};
+
+pub const RuntimeLease = struct {
+    rt: *aj.Runtime,
+};
+
+pub const RuntimeAcquireResult = union(enum) {
+    lease: RuntimeLease,
+    /// `aj.Runtime.init()` failed (e.g. ExecMemDenied or OOM); scalar fallback is permitted.
+    unavailable,
+    /// Cache has been closed by DSO teardown; caller must abort without admitting new entries.
+    closed,
+};
+
 pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: usize) type {
     comptime std.debug.assert(capacity > 0);
     return struct {
         const Self = @This();
 
         mutex: std.Io.Mutex = .init,
+        state: CacheState = .open,
         rt: ?aj.Runtime = null,
+        live_external_refs: usize = 0,
+        active_rt_users: usize = 0,
         /// Packed active entries in `slots[0..count]` with parallel `hashes[0..count]` so lookups
         /// scan only live entries without chasing cold pointers on hash misses.
         slots: [capacity]?*Entry = @splat(null),
@@ -182,13 +204,26 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
         hits: u64 = 0,
         misses: u64 = 0,
 
-        pub fn ensureRuntime(self: *Self) ?*aj.Runtime {
+        /// Lazily initialize the shared `aj.Runtime` and acquire an in-flight lease that keeps
+        /// the runtime alive across compilation and insertion until `releaseRuntime()` is called.
+        pub fn acquireRuntime(self: *Self) RuntimeAcquireResult {
             self.mutex.lockUncancelable(cache_io);
             defer self.mutex.unlock(cache_io);
+            if (self.state == .closed) return .closed;
             if (self.rt == null) {
                 self.rt = aj.Runtime.init() catch null;
             }
-            return if (self.rt != null) &self.rt.? else null;
+            if (self.rt == null) return .unavailable;
+            self.active_rt_users += 1;
+            return .{ .lease = .{ .rt = &self.rt.? } };
+        }
+
+        /// Release one in-flight runtime lease acquired via `acquireRuntime()`.
+        pub fn releaseRuntime(self: *Self) void {
+            self.mutex.lockUncancelable(cache_io);
+            defer self.mutex.unlock(cache_io);
+            std.debug.assert(self.active_rt_users > 0);
+            self.active_rt_users -= 1;
         }
 
         fn runtimePtrLocked(self: *Self) ?*aj.Runtime {
@@ -201,6 +236,7 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
             const h = hashKey(key);
             self.mutex.lockUncancelable(cache_io);
             defer self.mutex.unlock(cache_io);
+            if (self.state == .closed) return null;
 
             for (0..self.count) |i| {
                 if (self.hashes[i] != h) continue;
@@ -209,6 +245,7 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
                     self.stamp +%= 1;
                     e.last_used = self.stamp;
                     e.ref_count += 1;
+                    self.live_external_refs += 1;
                     self.hits += 1;
                     return e;
                 }
@@ -224,6 +261,7 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
             const h_dim = hashKey(dim_key);
             self.mutex.lockUncancelable(cache_io);
             defer self.mutex.unlock(cache_io);
+            if (self.state == .closed) return null;
 
             var dim_hit: ?*Entry = null;
             for (0..self.count) |i| {
@@ -234,6 +272,7 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
                         self.stamp +%= 1;
                         e.last_used = self.stamp;
                         e.ref_count += 1;
+                        self.live_external_refs += 1;
                         self.hits += 1;
                         return e;
                     }
@@ -249,6 +288,7 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
                 self.stamp +%= 1;
                 e.last_used = self.stamp;
                 e.ref_count += 1;
+                self.live_external_refs += 1;
                 self.hits += 1;
                 return e;
             }
@@ -260,8 +300,8 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
         /// `exec` on success) and return a refcounted handle for the caller.
         /// If another thread inserted the same key concurrently, destroys the
         /// duplicate `exec` and returns a handle to the existing entry.
-        /// On OOM while allocating the cache entry, leaves `exec` untouched for the caller.
-        pub fn putOrGet(self: *Self, allocator: std.mem.Allocator, key: Key, exec: CompiledPlane) std.mem.Allocator.Error!*Entry {
+        /// On `OutOfMemory` or `CacheClosed`, leaves `exec` untouched in caller ownership.
+        pub fn putOrGet(self: *Self, allocator: std.mem.Allocator, key: Key, exec: CompiledPlane) PutError!*Entry {
             const h = hashKey(key);
             const new_lut_bytes = entryLutBytes(&exec);
 
@@ -289,10 +329,12 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
             var dead_buf: [capacity]*Entry = undefined;
             var dead_count: usize = 0;
             var rt_ptr: ?*aj.Runtime = null;
+            var held_rt_user = false;
 
             const result: *Entry = blk: {
                 self.mutex.lockUncancelable(cache_io);
                 defer self.mutex.unlock(cache_io);
+                if (self.state == .closed) return error.CacheClosed;
                 rt_ptr = self.runtimePtrLocked();
 
                 for (0..self.count) |i| {
@@ -302,7 +344,10 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
                         self.stamp +%= 1;
                         e.last_used = self.stamp;
                         e.ref_count += 1;
+                        self.live_external_refs += 1;
                         duplicate_exec = exec;
+                        self.active_rt_users += 1;
+                        held_rt_user = true;
                         break :blk e;
                     }
                 }
@@ -370,9 +415,15 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
                 self.slots[target_slot] = new_entry;
                 self.hashes[target_slot] = h;
                 self.lut_bytes += new_lut_bytes;
+                self.live_external_refs += 1;
+                if (dead_count > 0) {
+                    self.active_rt_users += 1;
+                    held_rt_user = true;
+                }
                 break :blk new_entry;
             };
 
+            defer if (held_rt_user) self.releaseRuntime();
             if (duplicate_exec) |*dup| {
                 dup.deinit(allocator, rt_ptr);
                 allocator.free(owned_expr);
@@ -389,34 +440,83 @@ pub fn PlaneCacheWithLutCap(comptime capacity: usize, comptime max_lut_bytes: us
         /// Drop one caller reference to `entry`. Destroys the entry once evicted
         /// from the cache and no active filters hold a reference.
         pub fn release(self: *Self, allocator: std.mem.Allocator, entry: *Entry) void {
+            self.releaseImpl(allocator, entry, null, null);
+        }
+
+        fn releaseImpl(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            entry: *Entry,
+            after_unlock_hook: ?*const fn (?*anyopaque) void,
+            hook_ctx: ?*anyopaque,
+        ) void {
             var destroy = false;
             var rt_ptr: ?*aj.Runtime = null;
             {
                 self.mutex.lockUncancelable(cache_io);
                 defer self.mutex.unlock(cache_io);
                 std.debug.assert(entry.ref_count > 0);
+                std.debug.assert(self.live_external_refs > 0);
                 entry.ref_count -= 1;
+                self.live_external_refs -= 1;
                 if (entry.ref_count == 0) {
                     destroy = true;
                     rt_ptr = self.runtimePtrLocked();
+                    // Keep `self.rt` alive until deferred `destroyEntry` finishes outside the lock.
+                    self.active_rt_users += 1;
                 }
             }
             if (destroy) {
+                defer self.releaseRuntime();
+                if (after_unlock_hook) |hook| hook(hook_ctx);
                 destroyEntry(allocator, entry, rt_ptr);
             }
         }
 
-        /// Release all cached entries and the shared `JitRuntime` (for tests;
-        /// callers must have released all active entries first).
-        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            self.mutex.lockUncancelable(cache_io);
+        /// Non-blocking DSO teardown hook: closes the cache, frees cached entry heap payloads,
+        /// and destroys `self.rt` in a single bulk `JitAllocator::reset(kHard)` pass when quiescent.
+        /// Returns `true` iff teardown ran to completion; returns `false` (skipping teardown safely)
+        /// if the mutex is contended, the cache is already closed, or any external ref or in-flight
+        /// runtime user is active (dirty process exit).
+        pub fn shutdown(self: *Self, allocator: std.mem.Allocator) bool {
+            if (!self.mutex.tryLock()) return false;
             defer self.mutex.unlock(cache_io);
-            const rt_ptr = self.runtimePtrLocked();
+            if (self.state == .closed) return false;
+            if (self.live_external_refs != 0 or self.active_rt_users != 0) return false;
+
+            self.state = .closed;
             for (0..self.count) |i| {
                 const e = self.slots[i].?;
                 e.ref_count -= 1;
                 std.debug.assert(e.ref_count == 0);
-                destroyEntry(allocator, e, rt_ptr);
+                // Pass `rt = null` so per-kernel `Runtime.release` (and its internal lock) is
+                // skipped; `self.rt.deinit()` reclaims all executable blocks in one bulk reset.
+                destroyEntry(allocator, e, null);
+                self.slots[i] = null;
+                self.hashes[i] = 0;
+            }
+            self.count = 0;
+            self.lut_bytes = 0;
+            if (self.rt) |*r| {
+                r.deinit();
+                self.rt = null;
+            }
+            return true;
+        }
+
+        /// Release all cached entries and the shared `JitRuntime` (for tests;
+        /// callers must have released all active entries and runtime leases first).
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.mutex.lockUncancelable(cache_io);
+            defer self.mutex.unlock(cache_io);
+            std.debug.assert(self.live_external_refs == 0);
+            std.debug.assert(self.active_rt_users == 0);
+            self.state = .closed;
+            for (0..self.count) |i| {
+                const e = self.slots[i].?;
+                e.ref_count -= 1;
+                std.debug.assert(e.ref_count == 0);
+                destroyEntry(allocator, e, null);
                 self.slots[i] = null;
                 self.hashes[i] = 0;
             }
@@ -527,7 +627,11 @@ test "PlaneCache LRU hit, eviction, active ref survival, and key isolation" {
 
     var cache: PlaneCache(2) = .{};
     defer cache.deinit(alloc);
-    const rt = cache.ensureRuntime() orelse return error.OutOfMemory;
+    const rt = switch (cache.acquireRuntime()) {
+        .lease => |l| l.rt,
+        else => return error.OutOfMemory,
+    };
+    defer cache.releaseRuntime();
 
     const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
     const src_fmts = [_]ast.SampleFormat{u8_fmt};
@@ -629,7 +733,11 @@ test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase 
 
     var cache: PlaneCache(8) = .{};
     defer cache.deinit(alloc);
-    const rt = cache.ensureRuntime() orelse return error.OutOfMemory;
+    const rt = switch (cache.acquireRuntime()) {
+        .lease => |l| l.rt,
+        else => return error.OutOfMemory,
+    };
+    defer cache.releaseRuntime();
 
     const f32_fmt: ast.SampleFormat = .{ .is_float = true, .bits_per_sample = 32 };
     const u16_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 16 };
@@ -768,7 +876,11 @@ test "PlaneCache Phase B limited YUV16 LUT sharing (D3) and partial-variant refc
 
     var cache: PlaneCache(8) = .{};
     defer cache.deinit(alloc);
-    const rt = cache.ensureRuntime() orelse return error.OutOfMemory;
+    const rt = switch (cache.acquireRuntime()) {
+        .lease => |l| l.rt,
+        else => return error.OutOfMemory,
+    };
+    defer cache.releaseRuntime();
 
     const u16_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 16 };
     const u16_srcs = [_]ast.SampleFormat{u16_fmt};
@@ -925,7 +1037,11 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
     // 8 total slots, but only 150 KiB LUT cap -> holds at most ONE 128 KiB u16 LUT, never two.
     var cache: PlaneCacheWithLutCap(8, 150 * 1024) = .{};
     defer cache.deinit(alloc);
-    const rt = cache.ensureRuntime() orelse return error.OutOfMemory;
+    const rt = switch (cache.acquireRuntime()) {
+        .lease => |l| l.rt,
+        else => return error.OutOfMemory,
+    };
+    defer cache.releaseRuntime();
 
     const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
     const u16_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 16 };
@@ -1017,4 +1133,193 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
     const lut_hit = cache.getOrDim(exact_lut2, dim_lut2) orelse return error.TestUnexpectedResult;
     defer cache.release(alloc, lut_hit);
     try std.testing.expectEqual(e_lut2, lut_hit);
+}
+
+test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy lock, and late closed admission" {
+    const parser = @import("../expr/parser.zig");
+    const lower_mod = @import("../expr/lower.zig");
+    const optimize_mod = @import("../expr/optimize.zig");
+    const analysis_mod = @import("../expr/analysis.zig");
+    const codegen = @import("codegen.zig");
+
+    const alloc = std.testing.allocator;
+    const cpu = cpu_mod.detectWithOverride(null);
+    if (cpu.isa == .scalar) return;
+    const profile = interp.TargetProfile.fromCpu(cpu);
+    const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
+    const src_fmts = [_]ast.SampleFormat{u8_fmt};
+
+    const makeJit = struct {
+        fn run(
+            a: std.mem.Allocator,
+            r: *aj.Runtime,
+            c_info: cpu_mod.CpuInfo,
+            prof: interp.TargetProfile,
+            expr_s: []const u8,
+        ) !CompiledPlane {
+            var pr = try parser.parse(a, expr_s, .{ .mode = .expr, .num_clips = 1 });
+            defer pr.deinit(a);
+            try lower_mod.lower(a, &pr, prof);
+            try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
+            var inf = try analysis_mod.analyze(a, &pr, &src_fmts, u8_fmt, 32, 4, .{ .f32_lanes = c_info.f32_lanes });
+            defer inf.deinit(a);
+            const props = try buildPropBindings(a, &pr);
+            errdefer freePropBindings(a, props);
+            const compiled = try codegen.compilePlane(a, r, c_info, &pr, &inf, .{
+                .width = 32,
+                .height = 4,
+                .src_fmts = &src_fmts,
+                .dst_fmt = u8_fmt,
+            });
+            return .{ .jit = .{ .kernel = compiled.kernel, .props = props } };
+        }
+    }.run;
+
+    const base_key: Key = .{
+        .expr = "x 1 +",
+        .src_fmts = &src_fmts,
+        .dst_fmt = u8_fmt,
+        .width = 32,
+        .height = 4,
+        .opt_int = false,
+        .default_boundary = .clamp,
+        .cpu = cpu,
+        .profile = profile,
+    };
+
+    // 1. Cold compiler paused after `acquireRuntime()`: shutdown sees active_rt_users == 1
+    //    and skips teardown; once lease is released, shutdown drains and destroys `rt`.
+    {
+        var cache: PlaneCache(2) = .{};
+        defer cache.deinit(alloc);
+
+        const lease_rt = switch (cache.acquireRuntime()) {
+            .lease => |l| l.rt,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(@as(usize, 1), cache.active_rt_users);
+        try std.testing.expect(!cache.shutdown(alloc));
+        try std.testing.expectEqual(CacheState.open, cache.state);
+        try std.testing.expect(cache.rt != null);
+
+        // Compilation still succeeds safely against the borrowed runtime.
+        var exec = try makeJit(alloc, lease_rt, cpu, profile, "x 1 +");
+        errdefer exec.deinit(alloc, lease_rt);
+        const e1 = try cache.putOrGet(alloc, base_key, exec);
+        cache.releaseRuntime();
+
+        // While caller holds `e1` (live_external_refs == 1), shutdown must still refuse.
+        try std.testing.expectEqual(@as(usize, 1), cache.live_external_refs);
+        try std.testing.expect(!cache.shutdown(alloc));
+        try std.testing.expectEqual(CacheState.open, cache.state);
+
+        // Release caller ref; now quiescent -> shutdown drains entry + destroys runtime.
+        cache.release(alloc, e1);
+        try std.testing.expectEqual(@as(usize, 0), cache.live_external_refs);
+        try std.testing.expectEqual(@as(usize, 0), cache.active_rt_users);
+        try std.testing.expect(cache.shutdown(alloc));
+        try std.testing.expectEqual(CacheState.closed, cache.state);
+        try std.testing.expectEqual(@as(usize, 0), cache.count);
+        try std.testing.expect(cache.rt == null);
+        // Second shutdown is an idempotent no-op returning false.
+        try std.testing.expect(!cache.shutdown(alloc));
+    }
+
+    // 2. Final `release()` of an evicted entry paused after unlock and before `destroyEntry`:
+    //    `shutdown()` invoked inside the hook must observe active_rt_users == 1 and skip teardown
+    //    so `destroyEntry` safely releases the kernel against the still-alive runtime.
+    {
+        const Cache1 = PlaneCache(1);
+        var cache: Cache1 = .{};
+        defer cache.deinit(alloc);
+
+        const lease_rt = switch (cache.acquireRuntime()) {
+            .lease => |l| l.rt,
+            else => return error.TestUnexpectedResult,
+        };
+        var exec1 = try makeJit(alloc, lease_rt, cpu, profile, "x 1 +");
+        errdefer exec1.deinit(alloc, lease_rt);
+        const e1 = try cache.putOrGet(alloc, base_key, exec1);
+
+        var k2 = base_key;
+        k2.expr = "x 2 +";
+        var exec2 = try makeJit(alloc, lease_rt, cpu, profile, "x 2 +");
+        errdefer exec2.deinit(alloc, lease_rt);
+        const e2 = try cache.putOrGet(alloc, k2, exec2);
+        cache.releaseRuntime();
+        // Drop e2's caller ref (still cached in slot 0); e1 is evicted and pinned only by caller.
+        cache.release(alloc, e2);
+        try std.testing.expectEqual(@as(usize, 1), e1.ref_count);
+
+        const HookCtx = struct {
+            c: *Cache1,
+            a: std.mem.Allocator,
+            shutdown_ran: bool = false,
+            seen_active_users: usize = 0,
+            rt_alive: bool = false,
+        };
+        var hctx: HookCtx = .{ .c = &cache, .a = alloc };
+        const hookFn = struct {
+            fn call(raw: ?*anyopaque) void {
+                const ctx: *HookCtx = @ptrCast(@alignCast(raw.?));
+                ctx.seen_active_users = ctx.c.active_rt_users;
+                ctx.shutdown_ran = ctx.c.shutdown(ctx.a);
+                ctx.rt_alive = ctx.c.rt != null;
+            }
+        }.call;
+
+        cache.releaseImpl(alloc, e1, hookFn, &hctx);
+        try std.testing.expectEqual(@as(usize, 1), hctx.seen_active_users);
+        try std.testing.expect(!hctx.shutdown_ran);
+        try std.testing.expect(hctx.rt_alive);
+        try std.testing.expectEqual(CacheState.open, cache.state);
+
+        // Once releaseImpl finishes, active_rt_users drops back to 0 and shutdown succeeds.
+        try std.testing.expectEqual(@as(usize, 0), cache.active_rt_users);
+        try std.testing.expect(cache.shutdown(alloc));
+        try std.testing.expectEqual(CacheState.closed, cache.state);
+        try std.testing.expect(cache.rt == null);
+    }
+
+    // 3. Contended mutex during dirty exit: shutdown must not block and returns false.
+    {
+        var cache: PlaneCache(2) = .{};
+        defer cache.deinit(alloc);
+        cache.mutex.lockUncancelable(cache_io);
+        try std.testing.expect(!cache.shutdown(alloc));
+        cache.mutex.unlock(cache_io);
+        try std.testing.expectEqual(CacheState.open, cache.state);
+        try std.testing.expect(cache.shutdown(alloc));
+    }
+
+    // 4. Late admission after `shutdown()`: `acquireRuntime` returns `.closed`, `get`/`getOrDim`
+    //    return null, and late scalar `putOrGet` returns `error.CacheClosed`, leaving the cache
+    //    empty and leaving payload ownership with the caller (verified leak-free by testing.allocator).
+    {
+        var cache: PlaneCache(4) = .{};
+        defer cache.deinit(alloc);
+        try std.testing.expect(cache.shutdown(alloc));
+
+        try std.testing.expectEqual(RuntimeAcquireResult.closed, cache.acquireRuntime());
+        try std.testing.expect(cache.get(base_key) == null);
+        var dim_key = base_key;
+        dim_key.width = 0;
+        dim_key.height = 0;
+        try std.testing.expect(cache.getOrDim(base_key, dim_key) == null);
+
+        var sp = try parser.parse(alloc, "x 1 +", .{ .mode = .expr, .num_clips = 1 });
+        var owns_sp = true;
+        errdefer if (owns_sp) sp.deinit(alloc);
+        const sprops = try buildPropBindings(alloc, &sp);
+        var owns_sprops = true;
+        errdefer if (owns_sprops) freePropBindings(alloc, sprops);
+        var scalar_exec: CompiledPlane = .{ .scalar = .{ .prog = sp, .props = sprops } };
+        owns_sp = false;
+        owns_sprops = false;
+        defer scalar_exec.deinit(alloc, null);
+
+        try std.testing.expectError(error.CacheClosed, cache.putOrGet(alloc, base_key, scalar_exec));
+        try std.testing.expectEqual(@as(usize, 0), cache.count);
+        try std.testing.expectEqual(@as(usize, 0), cache.live_external_refs);
+    }
 }

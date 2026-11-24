@@ -29,6 +29,18 @@ const max_planes = 3;
 const PlaneCacheType = plane_cache.PlaneCache(plane_cache.default_capacity);
 var global_plane_cache: PlaneCacheType = .{};
 
+pub fn registerTeardownHook(cb: aj.DsoTeardownFn) void {
+    aj.setDsoTeardown(cb);
+}
+
+pub fn shutdownCache() void {
+    const drained = global_plane_cache.shutdown(allocator);
+    common.resetCoreAlignmentCache();
+    if (drained) {
+        aj.emitShutdownMarkerIfEnabled();
+    }
+}
+
 const SinglePlaneExec = plane_cache.SinglePlaneExec(PlaneCacheType);
 const RangeVariants = plane_cache.RangeVariants(PlaneCacheType, vs.VideoFormat);
 
@@ -284,7 +296,19 @@ fn compileDynamicPlane(
 
     const pw = plane_key.width;
     const ph = plane_key.height;
-    const rt_ptr: ?*aj.Runtime = if (dyn.cpu.isa != .scalar) global_plane_cache.ensureRuntime() else null;
+    var leased_rt = false;
+    const rt_ptr: ?*aj.Runtime = if (dyn.cpu.isa != .scalar) switch (global_plane_cache.acquireRuntime()) {
+        .lease => |l| blk: {
+            leased_rt = true;
+            break :blk l.rt;
+        },
+        .unavailable => null,
+        .closed => {
+            setFilterErrorFmt(zapi, "plugin is shutting down", .{});
+            return error.CompileFailed;
+        },
+    } else null;
+    defer if (leased_rt) global_plane_cache.releaseRuntime();
 
     const has_fast_u8_lut = rt_ptr != null and aj.Builder.cpuSupportsFastLutU8(dyn.cpu);
     var info = try analysis_mod.analyze(allocator, &prog, src_fmts, dst_fmt, @intCast(pw), @intCast(ph), .{
@@ -319,7 +343,13 @@ fn compileDynamicPlane(
         }
         var exec: plane_cache.CompiledPlane = .{ .lut = lut };
         errdefer exec.deinit(allocator, rt_ptr);
-        return try global_plane_cache.putOrGet(allocator, store_key, exec);
+        return global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.CacheClosed => {
+                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
+                return error.CompileFailed;
+            },
+        };
     }
 
     const prop_bindings = try common.buildPropBindings(allocator, &prog);
@@ -361,7 +391,13 @@ fn compileDynamicPlane(
         owns_props = false;
         var exec: plane_cache.CompiledPlane = .{ .jit = .{ .kernel = kernel, .props = prop_bindings } };
         errdefer exec.deinit(allocator, rt_ptr);
-        return try global_plane_cache.putOrGet(allocator, plane_key, exec);
+        return global_plane_cache.putOrGet(allocator, plane_key, exec) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.CacheClosed => {
+                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
+                return error.CompileFailed;
+            },
+        };
     } else if ((rt_ptr == null or jit_execmem_denied) and info.fallback_lut_kind != .none) {
         info.lut_kind = info.fallback_lut_kind;
         info.lut_clips = info.fallback_lut_clips;
@@ -386,7 +422,13 @@ fn compileDynamicPlane(
         store_key.height = 0;
         var exec: plane_cache.CompiledPlane = .{ .lut = lut };
         errdefer exec.deinit(allocator, null);
-        return try global_plane_cache.putOrGet(allocator, store_key, exec);
+        return global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.CacheClosed => {
+                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
+                return error.CompileFailed;
+            },
+        };
     } else {
         // F3: Cache unsupported-JIT / ExecMemDenied scalar program under `plane_key` so repeated
         // frames (e.g. non-LUT `f16` on SSE2/v2) avoid per-frame re-parse/lower/optimize.
@@ -395,7 +437,13 @@ fn compileDynamicPlane(
         // `prog` ownership transfers to `exec`; prevent outer `errdefer prog.deinit` from double-freeing on OOM.
         prog = .{};
         errdefer exec.deinit(allocator, null);
-        return try global_plane_cache.putOrGet(allocator, plane_key, exec);
+        return global_plane_cache.putOrGet(allocator, plane_key, exec) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.CacheClosed => {
+                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
+                return error.CompileFailed;
+            },
+        };
     }
 }
 
@@ -1028,7 +1076,10 @@ fn compileSinglePlane(
         const entry = cache_blk: {
             var exec: plane_cache.CompiledPlane = .{ .lut = lut };
             errdefer exec.deinit(allocator, rt_ptr);
-            break :cache_blk try global_plane_cache.putOrGet(allocator, store_key, exec);
+            break :cache_blk global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
+            };
         };
         return .{ .cached = entry };
     }
@@ -1074,7 +1125,10 @@ fn compileSinglePlane(
         const entry = cache_blk: {
             var exec: plane_cache.CompiledPlane = .{ .jit = .{ .kernel = kernel, .props = prop_bindings } };
             errdefer exec.deinit(allocator, rt_ptr);
-            break :cache_blk try global_plane_cache.putOrGet(allocator, plane_key, exec);
+            break :cache_blk global_plane_cache.putOrGet(allocator, plane_key, exec) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
+            };
         };
         return .{ .cached = entry };
     } else if (!force_scalar and (rt_ptr == null or jit_execmem_denied) and info.fallback_lut_kind != .none) {
@@ -1104,7 +1158,10 @@ fn compileSinglePlane(
         const entry = cache_blk: {
             var exec: plane_cache.CompiledPlane = .{ .lut = lut };
             errdefer exec.deinit(allocator, null);
-            break :cache_blk try global_plane_cache.putOrGet(allocator, store_key, exec);
+            break :cache_blk global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
+            };
         };
         return .{ .cached = entry };
     } else {
@@ -1476,7 +1533,16 @@ fn createImpl(
 
         if (!use_dynamic) {
             // Phase 3: compile missed planes (or precompile 2^k variants for 1 <= k <= 2) against the shared JitRuntime.
-            const rt_ptr: ?*aj.Runtime = if (any_miss and cpu.isa != .scalar) global_plane_cache.ensureRuntime() else null;
+            var leased_rt = false;
+            const rt_ptr: ?*aj.Runtime = if (any_miss and cpu.isa != .scalar) switch (global_plane_cache.acquireRuntime()) {
+                .lease => |l| blk: {
+                    leased_rt = true;
+                    break :blk l.rt;
+                },
+                .unavailable => null,
+                .closed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
+            } else null;
+            defer if (leased_rt) global_plane_cache.releaseRuntime();
             var execmem_warned = false;
 
             for (0..num_planes) |p| {
