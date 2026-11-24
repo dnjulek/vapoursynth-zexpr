@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const builtins = @import("builtins.zig");
 
 pub const Literal = struct {
     /// Exact float32 value (used when `opt=0` or when literal is non-integer).
@@ -56,6 +57,7 @@ pub const TokenKind = union(enum) {
     plane_width,
     plane_height,
     pi,
+    builtin_const: builtins.BuiltinSpec,
 };
 
 pub const Token = struct {
@@ -111,7 +113,21 @@ pub fn classify(text: []const u8) TokenError!TokenKind {
         return try parseBracketAccess(text, lbrack);
     }
 
-    // 7. Plain clip reference: `x`, `y`, `z`, `a`..`w`, `srcN`.
+    // 7. Scoped built-in constant: `<clip>:<const>` or `dst:<const>` (checked after `[` so `:c`/`:m` stay spatial).
+    if (std.mem.findScalar(u8, text, ':')) |colon| {
+        const left = text[0..colon];
+        const right = text[colon + 1 ..];
+        const target: builtins.BuiltinTarget = if (std.mem.eql(u8, left, "dst"))
+            .dst
+        else if (parseClipPrefix(left)) |clip|
+            .{ .clip = clip }
+        else
+            return error.InvalidToken;
+        const kind = builtins.matchKind(right) orelse return error.InvalidToken;
+        return .{ .builtin_const = .{ .target = target, .kind = kind } };
+    }
+
+    // 8. Plain clip reference: `x`, `y`, `z`, `a`..`w`, `srcN`.
     if (parseClipPrefix(text)) |clip| {
         return .{ .clip_load = clip };
     }
@@ -279,6 +295,13 @@ fn matchKeyword(s: []const u8) ?TokenKind {
         .{ "pi", TokenKind.pi },
         .{ "width", TokenKind.plane_width },
         .{ "height", TokenKind.plane_height },
+        .{ "range_min", TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .range_min } } },
+        .{ "range_max", TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .range_max } } },
+        .{ "range_size", TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .range_size } } },
+        .{ "mask_max", TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .mask_max } } },
+        .{ "neutral", TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .neutral } } },
+        .{ "plane_min", TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .plane_min } } },
+        .{ "plane_max", TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .plane_max } } },
     });
     return map.get(s);
 }
@@ -525,4 +548,27 @@ test "clip, spatial, prop, var, and stack token classification" {
     try std.testing.expectError(error.InvalidToken, classify("polyvalx"));
     try std.testing.expectError(error.InvalidToken, classify("polyeval-1"));
     try std.testing.expectError(error.InvalidToken, classify("polyval1_0"));
+
+    // Built-in constants (bare, scoped clip, dst) and non-collision with vars/props/spatial.
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .neutral } }, try classify("neutral"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .range_min } }, try classify("range_min"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .range_max } }, try classify("range_max"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .range_size } }, try classify("range_size"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .mask_max } }, try classify("mask_max"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .plane_min } }, try classify("plane_min"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 0 }, .kind = .plane_max } }, try classify("plane_max"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 1 }, .kind = .mask_max } }, try classify("y:mask_max"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .{ .clip = 26 }, .kind = .range_max } }, try classify("src26:range_max"));
+    try std.testing.expectEqual(TokenKind{ .builtin_const = .{ .target = .dst, .kind = .plane_max } }, try classify("dst:plane_max"));
+    try std.testing.expectEqualStrings("neutral", (try classify("neutral!")).var_store);
+    try std.testing.expectEqualStrings("neutral", (try classify("neutral@")).var_load);
+    try std.testing.expectEqual(TokenKind{ .clip_load = 7 }, try classify("e"));
+    try std.testing.expectError(error.InvalidToken, classify("range_half"));
+    try std.testing.expectError(error.InvalidToken, classify("x:range_half"));
+    try std.testing.expectError(error.InvalidToken, classify("x:bits"));
+    try std.testing.expectError(error.InvalidToken, classify("x:width"));
+    try std.testing.expectError(error.InvalidToken, classify("foo:neutral"));
+    try std.testing.expectError(error.InvalidToken, classify(":neutral"));
+    try std.testing.expectError(error.InvalidToken, classify("dst:"));
+    try std.testing.expectError(error.InvalidToken, classify("x:neutral:m"));
 }

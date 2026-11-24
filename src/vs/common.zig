@@ -3,6 +3,7 @@
 const std = @import("std");
 const vapoursynth = @import("vapoursynth");
 const ast = @import("../expr/ast.zig");
+const builtins = @import("../expr/builtins.zig");
 const plane_cache = @import("../jit/plane_cache.zig");
 
 const vs = vapoursynth.vapoursynth4;
@@ -23,6 +24,108 @@ pub fn fail(map_out: ZAPI.ZMap(?*vs.Map), comptime prefix: []const u8, comptime 
 pub const PropBinding = plane_cache.PropBinding;
 pub const freePropBindings = plane_cache.freePropBindings;
 pub const buildPropBindings = plane_cache.buildPropBindings;
+
+/// Per-frame scalar slot binding for `Select` and `PropExpr` (D2: `.load_prop` serves both
+/// frame properties and built-in constants without modifying `ast.Node`).
+pub const ScalarPropBinding = union(enum) {
+    frame_prop: PropBinding,
+    builtin: builtins.BuiltinSpec,
+};
+
+pub fn freeScalarPropBindings(allocator: std.mem.Allocator, props: []ScalarPropBinding) void {
+    for (props) |p| {
+        switch (p) {
+            .frame_prop => |fp| allocator.free(fp.name_z),
+            .builtin => {},
+        }
+    }
+    allocator.free(props);
+}
+
+pub fn buildScalarPropBindings(
+    allocator: std.mem.Allocator,
+    prog: *const ast.Program,
+) std.mem.Allocator.Error![]ScalarPropBinding {
+    const out = try allocator.alloc(ScalarPropBinding, prog.props.items.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |p| {
+            switch (p) {
+                .frame_prop => |fp| allocator.free(fp.name_z),
+                .builtin => {},
+            }
+        }
+        allocator.free(out);
+    }
+    for (prog.props.items, 0..) |p, i| {
+        out[i] = switch (p) {
+            .frame_prop => |fp| .{ .frame_prop = .{
+                .clip = fp.clip,
+                .name_z = try allocator.dupeSentinel(u8, fp.name, 0),
+            } },
+            .builtin => |spec| .{ .builtin = spec },
+        };
+        built += 1;
+    }
+    return out;
+}
+
+pub fn colorFamilyFromVs(cf: vs.ColorFamily) ?builtins.ColorFamily {
+    return switch (cf) {
+        .Gray => .gray,
+        .RGB => .rgb,
+        .YUV => .yuv,
+        else => null,
+    };
+}
+
+/// C7 + D11: Unified per-frame `_Range` resolver (`_Range` exact int -> legacy `_ColorRange` -> family default).
+pub fn readFrameIsFullRange(zapi: ZAPI, props: ?*const vs.Map, vf: vs.VideoFormat) bool {
+    const cf = colorFamilyFromVs(vf.colorFamily) orelse .gray;
+    if (vf.sampleType == .Float) return true;
+    const opt_range: ?i64 = if (props != null) getOptInt64(zapi, props, "_Range") else null;
+    const opt_legacy: ?i64 = if (props != null and (opt_range == null or (opt_range.? != 0 and opt_range.? != 1)))
+        getOptInt64(zapi, props, "_ColorRange")
+    else
+        null;
+    return builtins.resolveRangeFlag(opt_range, opt_legacy, false, cf);
+}
+
+/// F5: Build `ClipMeta` directly from `VideoFormat` without calling `toSampleFormat`, so `Select`/`PropExpr`
+/// continue accepting 17..31-bit integer clips (e.g. `GRAY24`).
+pub fn clipMetaFromVi(vf: vs.VideoFormat, plane_idx: u8, is_full_range: bool) ?builtins.ClipMeta {
+    const cf = colorFamilyFromVs(vf.colorFamily) orelse return null;
+    return .{
+        .is_float = vf.sampleType == .Float,
+        .bits_per_sample = @intCast(vf.bitsPerSample),
+        .color_family = cf,
+        .plane_idx = plane_idx,
+        .is_full_range = if (vf.sampleType == .Float) true else is_full_range,
+    };
+}
+
+pub fn clipMetaFromFrame(
+    zapi: ZAPI,
+    frame: ?*const vs.Frame,
+    vf: vs.VideoFormat,
+    plane_idx: u8,
+    read_range: bool,
+) ?builtins.ClipMeta {
+    const cf = colorFamilyFromVs(vf.colorFamily) orelse return null;
+    const is_full = if (vf.sampleType == .Float)
+        true
+    else if (read_range)
+        readFrameIsFullRange(zapi, zapi.vsapi.getFramePropertiesRO.?(frame), vf)
+    else
+        (cf == .rgb);
+    return .{
+        .is_float = vf.sampleType == .Float,
+        .bits_per_sample = @intCast(vf.bitsPerSample),
+        .color_family = cf,
+        .plane_idx = plane_idx,
+        .is_full_range = is_full,
+    };
+}
 
 pub inline fn clampFrameIdx(n: c_int, num_frames: i32) c_int {
     if (num_frames <= 0) return n;

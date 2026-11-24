@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const ast = @import("expr/ast.zig");
+const builtins_mod = @import("expr/builtins.zig");
 const parser = @import("expr/parser.zig");
 const lower_mod = @import("expr/lower.zig");
 const optimize_mod = @import("expr/optimize.zig");
@@ -49,7 +50,7 @@ fn run(init: std.process.Init) !void {
     const stdout = &stdout_writer.interface;
 
     if (args.len < 2) {
-        try stdout.print("Usage: zexpr-cli <run|disasm> [--format u8|u10|u16|u32|f16|f32] [--size WxH] [--opt 0|1] [--boundary 0|1] <expr>\n", .{});
+        try stdout.print("Usage: zexpr-cli <run|disasm> [--format u8|u10|u16|u32|f16|f32] [--size WxH] [--opt 0|1] [--boundary 0|1] [--plane 0|1|2] [--color-family gray|rgb|yuv] [--range limited|full] [--canonical-nan] <expr>\n", .{});
         try stdout.flush();
         return error.InvalidArgs;
     }
@@ -64,6 +65,10 @@ fn run(init: std.process.Init) !void {
     var height: usize = 16;
     var opt_int = false;
     var boundary: ast.BoundaryMode = .clamp;
+    var plane_idx: u8 = 0;
+    var color_family: builtins_mod.ColorFamily = .gray;
+    var opt_full_range: ?bool = null;
+    var canonical_nan = false;
     var expr_str: ?[]const u8 = null;
 
     var i: usize = 2;
@@ -104,6 +109,42 @@ fn run(init: std.process.Init) !void {
             } else {
                 return error.InvalidArgs;
             }
+        } else if (std.mem.eql(u8, a, "--plane")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (std.mem.eql(u8, args[i], "0")) {
+                plane_idx = 0;
+            } else if (std.mem.eql(u8, args[i], "1")) {
+                plane_idx = 1;
+            } else if (std.mem.eql(u8, args[i], "2")) {
+                plane_idx = 2;
+            } else {
+                return error.InvalidArgs;
+            }
+        } else if (std.mem.eql(u8, a, "--color-family")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (std.mem.eql(u8, args[i], "gray")) {
+                color_family = .gray;
+            } else if (std.mem.eql(u8, args[i], "rgb")) {
+                color_family = .rgb;
+            } else if (std.mem.eql(u8, args[i], "yuv")) {
+                color_family = .yuv;
+            } else {
+                return error.InvalidArgs;
+            }
+        } else if (std.mem.eql(u8, a, "--range")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (std.mem.eql(u8, args[i], "limited")) {
+                opt_full_range = false;
+            } else if (std.mem.eql(u8, args[i], "full")) {
+                opt_full_range = true;
+            } else {
+                return error.InvalidArgs;
+            }
+        } else if (std.mem.eql(u8, a, "--canonical-nan")) {
+            canonical_nan = true;
         } else if (std.mem.startsWith(u8, a, "--")) {
             return error.UnknownFlag;
         } else {
@@ -114,14 +155,32 @@ fn run(init: std.process.Init) !void {
 
     const expr = expr_str orelse return error.MissingExpression;
     const cpu = cpu_mod.detect();
-    const profile = interp.TargetProfile.fromCpu(cpu);
+    const profile = interp.TargetProfile.fromCpuWithOracleFma(cpu, cpu_mod.readOracleFmaOverride());
     const fmts = [_]ast.SampleFormat{ fmt, fmt, fmt, fmt };
+    const is_full = if (fmt.is_float)
+        true
+    else
+        opt_full_range orelse (color_family == .rgb);
+    const meta: builtins_mod.ClipMeta = .{
+        .is_float = fmt.is_float,
+        .bits_per_sample = fmt.bits_per_sample,
+        .color_family = color_family,
+        .plane_idx = plane_idx,
+        .is_full_range = is_full,
+    };
+    const metas = [_]builtins_mod.ClipMeta{ meta, meta, meta, meta };
+    const builtin_ctx: builtins_mod.ResolveContext = .{
+        .src_metas = &metas,
+        .dst_meta = meta,
+        .opt_int = opt_int,
+    };
 
     var prog = try parser.parse(gpa, expr, .{
         .mode = .expr,
         .num_clips = 4,
         .default_boundary = boundary,
         .opt_int = opt_int,
+        .builtin_ctx = &builtin_ctx,
     });
     defer prog.deinit(gpa);
 
@@ -242,11 +301,43 @@ fn run(init: std.process.Init) !void {
     }
 
     var hash: u64 = 14695981039346656037;
-    for (0..height) |y| {
-        const row = dst[y * stride_bytes ..][0 .. width * bps];
-        for (row) |byte| {
-            hash ^= byte;
-            hash *%= 1099511628211;
+    if (canonical_nan and fmt.is_float and fmt.bits_per_sample == 16) {
+        for (0..height) |y| {
+            const row = dst[y * stride_bytes ..][0 .. width * 2];
+            for (0..width) |x| {
+                const raw = std.mem.readInt(u16, row[x * 2 ..][0..2], .little);
+                const is_nan = (raw & 0x7C00) == 0x7C00 and (raw & 0x03FF) != 0;
+                const norm: u16 = if (is_nan) 0x7E00 else raw;
+                var bytes: [2]u8 = undefined;
+                std.mem.writeInt(u16, &bytes, norm, .little);
+                for (bytes) |byte| {
+                    hash ^= byte;
+                    hash *%= 1099511628211;
+                }
+            }
+        }
+    } else if (canonical_nan and fmt.is_float and fmt.bits_per_sample == 32) {
+        for (0..height) |y| {
+            const row = dst[y * stride_bytes ..][0 .. width * 4];
+            for (0..width) |x| {
+                const raw = std.mem.readInt(u32, row[x * 4 ..][0..4], .little);
+                const is_nan = (raw & 0x7F80_0000) == 0x7F80_0000 and (raw & 0x007F_FFFF) != 0;
+                const norm: u32 = if (is_nan) 0x7FC0_0000 else raw;
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes, norm, .little);
+                for (bytes) |byte| {
+                    hash ^= byte;
+                    hash *%= 1099511628211;
+                }
+            }
+        }
+    } else {
+        for (0..height) |y| {
+            const row = dst[y * stride_bytes ..][0 .. width * bps];
+            for (row) |byte| {
+                hash ^= byte;
+                hash *%= 1099511628211;
+            }
         }
     }
     try stdout.print("ok isa={s} size={d}x{d} code_size={d} fnv64=0x{x:0>16}\n", .{

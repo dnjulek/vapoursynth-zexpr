@@ -7,6 +7,7 @@
 const std = @import("std");
 const vapoursynth = @import("vapoursynth");
 const ast = @import("../expr/ast.zig");
+const builtins = @import("../expr/builtins.zig");
 const parser = @import("../expr/parser.zig");
 const lower_mod = @import("../expr/lower.zig");
 const optimize_mod = @import("../expr/optimize.zig");
@@ -26,11 +27,11 @@ const max_planes = 3;
 
 const PlaneExpr = struct {
     prog: ast.Program,
-    props: []common.PropBinding,
+    props: []common.ScalarPropBinding,
 
     fn deinit(self: *PlaneExpr) void {
         self.prog.deinit(allocator);
-        common.freePropBindings(allocator, self.props);
+        common.freeScalarPropBindings(allocator, self.props);
     }
 };
 
@@ -122,8 +123,30 @@ fn selectGetFrame(
                     const prop_vals: []f32 = if (prop_heap) |ph| ph else prop_stack[0..pe.props.len];
 
                     for (pe.props, 0..) |pb, pi| {
-                        const fprops = zapi.vsapi.getFramePropertiesRO.?(prop_frames[pb.clip]);
-                        prop_vals[pi] = common.readFrameProp(zapi, fprops, pb.name_z.ptr, 0.0);
+                        switch (pb) {
+                            .frame_prop => |fp| {
+                                const fprops = zapi.vsapi.getFramePropertiesRO.?(prop_frames[fp.clip]);
+                                prop_vals[pi] = common.readFrameProp(zapi, fprops, fp.name_z.ptr, 0.0);
+                            },
+                            .builtin => |spec| {
+                                const meta = switch (spec.target) {
+                                    .dst => common.clipMetaFromVi(d.out_vi.format, @intCast(p), true),
+                                    .clip => |cid| blk_m: {
+                                        const f = prop_frames[cid];
+                                        const vf = zapi.vsapi.getVideoFrameFormat.?(f).*;
+                                        break :blk_m common.clipMetaFromFrame(zapi, f, vf, @intCast(p), builtins.isRangeKind(spec.kind));
+                                    },
+                                } orelse {
+                                    zapi.setFilterError("Select: unsupported clip format for built-in constant");
+                                    return null;
+                                };
+                                const bv = builtins.resolveMeta(spec.kind, meta) catch {
+                                    zapi.setFilterError("Select: built-in constants are unsupported on >16-bit integer clips");
+                                    return null;
+                                };
+                                prop_vals[pi] = bv.f32Val();
+                            },
+                        }
                     }
 
                     // V6: Select exposes full clip width/height on every plane (matches akarin & cranexpr).
@@ -331,13 +354,41 @@ fn createImpl(
         };
         errdefer prog.deinit(allocator);
 
+        // C2 + C4/F5: Reject range-dependent `dst:` constants and >16-bit integer targets in Create,
+        // inspecting only targeted clips so unrelated GRAY24 inputs remain accepted.
+        for (prog.builtins.items) |spec| {
+            if (spec.target == .dst and builtins.isRangeKind(spec.kind)) {
+                return common.fail(
+                    map_out,
+                    filter_name,
+                    "plane {d}: dst:{s} is unsupported in Select",
+                    .{ p, builtins.kindName(spec.kind) },
+                );
+            }
+            const vf = switch (spec.target) {
+                .dst => vi0.format,
+                .clip => |cid| zapi.getVideoInfo(prop_src[cid]).format,
+            };
+            if (common.colorFamilyFromVs(vf.colorFamily) == null) {
+                return common.fail(map_out, filter_name, "plane {d}: unsupported clip color family for built-in '{s}'", .{ p, builtins.kindName(spec.kind) });
+            }
+            if (vf.sampleType == .Integer and (vf.bitsPerSample < 8 or vf.bitsPerSample > 16)) {
+                return common.fail(
+                    map_out,
+                    filter_name,
+                    "plane {d}: built-in '{s}' is unsupported on {d}-bit integer clip",
+                    .{ p, builtins.kindName(spec.kind), vf.bitsPerSample },
+                );
+            }
+        }
+
         try lower_mod.lower(allocator, &prog, profile);
         try optimize_mod.optimize(allocator, &prog, profile, .{
             .enable_value_changing = true,
             .enable_fma = false,
         });
 
-        const bindings = try common.buildPropBindings(allocator, &prog);
+        const bindings = try common.buildScalarPropBindings(allocator, &prog);
         planes[p] = .{ .prog = prog, .props = bindings };
         built += 1;
     }

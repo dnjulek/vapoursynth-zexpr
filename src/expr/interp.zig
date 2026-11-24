@@ -15,18 +15,26 @@ pub const TargetProfile = struct {
     use_fma: bool,
     isa_family: IsaFamily,
 
-    pub fn fromCpu(cpu: cpu_mod.CpuInfo) TargetProfile {
+    pub fn fromCpuWithOracleFma(cpu: cpu_mod.CpuInfo, oracle_fma: ?bool) TargetProfile {
         const isa_family: IsaFamily = switch (cpu.isa) {
             .neon => .aarch64,
             .scalar => IsaFamily.host(),
             else => .x86,
         };
+        const scalar_fma = if (cpu.isa == .scalar)
+            oracle_fma orelse (isa_family == .aarch64)
+        else
+            false;
         return .{
             // AR4: AArch64 NEON always fuses FMA, so level-0 scalar oracle on AArch64 uses FMA too.
-            // On x86, level-0 scalar stays non-FMA to match SSE2 (level 1) and x86-64-v2 (level 2).
-            .use_fma = cpu.has_fma or (cpu.isa == .scalar and isa_family == .aarch64),
+            // On x86, level-0 scalar defaults to non-FMA (matching SSE2/v2) unless ZEXPR_ORACLE_FMA=1 (N4).
+            .use_fma = cpu.has_fma or scalar_fma,
             .isa_family = isa_family,
         };
+    }
+
+    pub fn fromCpu(cpu: cpu_mod.CpuInfo) TargetProfile {
+        return fromCpuWithOracleFma(cpu, null);
     }
 
     pub fn hostDefault() TargetProfile {
@@ -1202,4 +1210,17 @@ test "polynomial transcendentals meet §6 finite-domain accuracy bounds vs f64 l
         try std.testing.expectEqual(std.math.inf(f32), evalUnaryF32(prof, .ceil, std.math.inf(f32)));
         try std.testing.expectEqual(-std.math.inf(f32), evalUnaryF32(prof, .ceil, -std.math.inf(f32)));
     }
+}
+
+test "TargetProfile.fromCpuWithOracleFma honors scalar override only" {
+    const scalar_cpu = cpu_mod.detectWithOverride(0);
+    const default_scalar = TargetProfile.fromCpuWithOracleFma(scalar_cpu, null);
+    try std.testing.expectEqual(IsaFamily.host() == .aarch64, default_scalar.use_fma);
+    try std.testing.expectEqual(true, TargetProfile.fromCpuWithOracleFma(scalar_cpu, true).use_fma);
+    try std.testing.expectEqual(false, TargetProfile.fromCpuWithOracleFma(scalar_cpu, false).use_fma);
+
+    // Non-scalar SIMD tiers always follow cpu.has_fma regardless of oracle override.
+    const host_cpu = cpu_mod.detectWithOverride(null);
+    try std.testing.expectEqual(host_cpu.has_fma, TargetProfile.fromCpuWithOracleFma(host_cpu, true).use_fma);
+    try std.testing.expectEqual(host_cpu.has_fma, TargetProfile.fromCpuWithOracleFma(host_cpu, false).use_fma);
 }

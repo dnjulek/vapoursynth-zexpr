@@ -659,11 +659,9 @@ pub fn compilePlane(
             const step_bytes: usize = if (lanes == 4) 16 else if (lanes == 8) 32 else 64;
             if (has_2x_periodic) {
                 const root_hi = hoisted_slots_hi[prog.root].?.reg;
-                if (info.value_types.items[prog.root] == .i32) {
-                    pixel.emitStoreI32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes)), root_reg, root_hi, spec.dst_fmt, false);
-                } else {
-                    pixel.emitStoreF32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes)), root_reg, root_hi, spec.dst_fmt, false);
-                }
+                // `has_2x_periodic` requires `!prog.opt_int`, so the root value type is always `.f32`.
+                std.debug.assert(info.value_types.items[prog.root] == .f32);
+                pixel.emitStoreF32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes)), root_reg, root_hi, spec.dst_fmt, false);
                 if (lanes == 4) {
                     b.vecLoad(.broadcast_u64, packed_vec, aj.Mem.ptr(dst_ptr, 0));
                 } else if (lanes == 8) {
@@ -720,11 +718,9 @@ pub fn compilePlane(
             const step_px: usize = if (lanes == 4) 8 else if (lanes == 8) 16 else 32;
             if (has_2x_periodic) {
                 const root_hi = hoisted_slots_hi[prog.root].?.reg;
-                if (info.value_types.items[prog.root] == .i32) {
-                    pixel.emitStoreI32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes * 2)), root_reg, root_hi, spec.dst_fmt, false);
-                } else {
-                    pixel.emitStoreF32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes * 2)), root_reg, root_hi, spec.dst_fmt, false);
-                }
+                // `has_2x_periodic` requires `!prog.opt_int`, so the root value type is always `.f32`.
+                std.debug.assert(info.value_types.items[prog.root] == .f32);
+                pixel.emitStoreF32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes * 2)), root_reg, root_hi, spec.dst_fmt, false);
                 b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
             } else {
                 if (info.value_types.items[prog.root] == .i32) {

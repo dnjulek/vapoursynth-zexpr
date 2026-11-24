@@ -116,6 +116,21 @@ pub fn readHwGatherOverride() ?bool {
     return parseHwGatherOverride(std.mem.span(raw));
 }
 
+/// Parse optional `ZEXPR_ORACLE_FMA` override (`0` = non-FMA, `1` = FMA) for the level-0 scalar oracle (N4).
+/// On x86, level-0 defaults to non-FMA (matching SSE2/v2) unless `ZEXPR_ORACLE_FMA=1` is set.
+/// On AArch64, NEON always fuses FMA so level-0 defaults to FMA unless `ZEXPR_ORACLE_FMA=0` is set.
+pub fn parseOracleFmaOverride(text: []const u8) ?bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "0")) return false;
+    if (std.mem.eql(u8, trimmed, "1")) return true;
+    return null;
+}
+
+pub fn readOracleFmaOverride() ?bool {
+    const raw = std.c.getenv("ZEXPR_ORACLE_FMA") orelse return null;
+    return parseOracleFmaOverride(std.mem.span(raw));
+}
+
 pub fn detectWithOverride(override: ?i32) CpuInfo {
     var raw: c.zj_cpu_info_t = undefined;
     c.zj_cpu_detect(&raw, override orelse -1);
@@ -137,6 +152,10 @@ test "parseEnvOverride handles per-arch levels" {
     try std.testing.expectEqual(@as(?bool, false), parseHwGatherOverride(" 0 "));
     try std.testing.expectEqual(@as(?bool, true), parseHwGatherOverride("1"));
     try std.testing.expectEqual(@as(?bool, null), parseHwGatherOverride("2"));
+    try std.testing.expectEqual(@as(?bool, null), parseOracleFmaOverride(""));
+    try std.testing.expectEqual(@as(?bool, false), parseOracleFmaOverride(" 0 "));
+    try std.testing.expectEqual(@as(?bool, true), parseOracleFmaOverride("1"));
+    try std.testing.expectEqual(@as(?bool, null), parseOracleFmaOverride("yes"));
     try std.testing.expectEqual(@as(?i32, null), parseEnvOverride("", .x86));
     try std.testing.expectEqual(@as(?i32, null), parseEnvOverride("bogus", .x86));
     try std.testing.expectEqual(@as(?i32, null), parseEnvOverride("-1", .x86));

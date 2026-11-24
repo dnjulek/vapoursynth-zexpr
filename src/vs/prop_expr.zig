@@ -8,6 +8,7 @@
 const std = @import("std");
 const vapoursynth = @import("vapoursynth");
 const ast = @import("../expr/ast.zig");
+const builtins = @import("../expr/builtins.zig");
 const parser = @import("../expr/parser.zig");
 const lower_mod = @import("../expr/lower.zig");
 const optimize_mod = @import("../expr/optimize.zig");
@@ -24,11 +25,11 @@ pub const params = "clips:vnode[];dict:func:opt;any";
 
 const CompiledExpr = struct {
     prog: ast.Program,
-    props: []common.PropBinding,
+    props: []common.ScalarPropBinding,
 
     fn deinit(self: *CompiledExpr) void {
         self.prog.deinit(allocator);
-        common.freePropBindings(allocator, self.props);
+        common.freeScalarPropBindings(allocator, self.props);
     }
 };
 
@@ -167,8 +168,37 @@ fn propExprGetFrame(
                                 const prop_vals: []f32 = if (prop_heap) |ph| ph else prop_stack[0..ce.props.len];
 
                                 for (ce.props, 0..) |pb, pi| {
-                                    const fprops = zapi.vsapi.getFramePropertiesRO.?(src_frames[pb.clip]);
-                                    prop_vals[pi] = common.readFrameProp(zapi, fprops, pb.name_z.ptr, 0.0);
+                                    switch (pb) {
+                                        .frame_prop => |fp| {
+                                            const fprops = zapi.vsapi.getFramePropertiesRO.?(src_frames[fp.clip]);
+                                            prop_vals[pi] = common.readFrameProp(zapi, fprops, fp.name_z.ptr, 0.0);
+                                        },
+                                        .builtin => |bspec| {
+                                            const cid: usize = switch (bspec.target) {
+                                                .clip => |c| c,
+                                                .dst => 0,
+                                            };
+                                            const f = src_frames[cid];
+                                            const vf = zapi.vsapi.getVideoFrameFormat.?(f).*;
+                                            const meta = common.clipMetaFromFrame(zapi, f, vf, 0, builtins.isRangeKind(bspec.kind)) orelse {
+                                                var ebuf: [512]u8 = undefined;
+                                                var ew: std.Io.Writer = .fixed(ebuf[0 .. ebuf.len - 1]);
+                                                ew.print("PropExpr: key '{s}': unsupported clip format for built-in constant '{s}'", .{ spec.key_z, @tagName(bspec.kind) }) catch {};
+                                                ebuf[ew.end] = 0;
+                                                zapi.setFilterError(ebuf[0..ew.end :0]);
+                                                return null;
+                                            };
+                                            const bv = builtins.resolveMeta(bspec.kind, meta) catch {
+                                                var ebuf: [512]u8 = undefined;
+                                                var ew: std.Io.Writer = .fixed(ebuf[0 .. ebuf.len - 1]);
+                                                ew.print("PropExpr: key '{s}': built-in constant '{s}' is unsupported on >16-bit integer clips", .{ spec.key_z, @tagName(bspec.kind) }) catch {};
+                                                ebuf[ew.end] = 0;
+                                                zapi.setFilterError(ebuf[0..ew.end :0]);
+                                                return null;
+                                            };
+                                            prop_vals[pi] = bv.f32Val();
+                                        },
+                                    }
                                 }
 
                                 const val = interp.evalScalar(allocator, &ce.prog, d.profile, .{
@@ -216,7 +246,7 @@ fn parseDataKeySpec(
     zapi: ZAPI,
     map: ?*const vs.Map,
     key_z_in: [*:0]const u8,
-    num_clips: u16,
+    nodes: []*vs.Node,
     profile: interp.TargetProfile,
     map_out: ZAPI.ZMap(?*vs.Map),
 ) !KeySpec {
@@ -248,7 +278,7 @@ fn parseDataKeySpec(
         }
         var prog = parser.parse(allocator, expr_str, .{
             .mode = .prop_expr,
-            .num_clips = num_clips,
+            .num_clips = @intCast(nodes.len),
             .default_boundary = .clamp,
             .opt_int = false,
         }) catch |err| {
@@ -256,12 +286,35 @@ fn parseDataKeySpec(
         };
         errdefer prog.deinit(allocator);
 
+        // C4/F5: Reject >16-bit integer targets in Create when the targeted clip has a known constant format;
+        // variable-format clips are checked per frame in `propExprGetFrame`.
+        for (prog.builtins.items) |spec| {
+            const cid: usize = switch (spec.target) {
+                .clip => |c| c,
+                .dst => 0,
+            };
+            const vf = zapi.getVideoInfo(nodes[cid]).format;
+            if (vf.colorFamily != .Undefined) {
+                if (common.colorFamilyFromVs(vf.colorFamily) == null) {
+                    return common.fail(map_out, filter_name, "property '{s}': unsupported clip color family for built-in '{s}'", .{ std.mem.span(key_z_in), builtins.kindName(spec.kind) });
+                }
+                if (vf.sampleType == .Integer and (vf.bitsPerSample < 8 or vf.bitsPerSample > 16)) {
+                    return common.fail(
+                        map_out,
+                        filter_name,
+                        "property '{s}': built-in '{s}' is unsupported on {d}-bit integer clip",
+                        .{ std.mem.span(key_z_in), builtins.kindName(spec.kind), vf.bitsPerSample },
+                    );
+                }
+            }
+        }
+
         try lower_mod.lower(allocator, &prog, profile);
         try optimize_mod.optimize(allocator, &prog, profile, .{
             .enable_value_changing = true,
             .enable_fma = false,
         });
-        const bindings = try common.buildPropBindings(allocator, &prog);
+        const bindings = try common.buildScalarPropBindings(allocator, &prog);
         elems[ei] = .{ .expr = .{ .prog = prog, .props = bindings } };
         built += 1;
     }
@@ -407,7 +460,7 @@ fn createImpl(
                     try specs_list.append(allocator, .{ .key_z = key_z, .value = .{ .const_floats = vals } });
                 },
                 .Data => {
-                    var spec = try parseDataKeySpec(zapi, call_out, k, @intCast(nodes.len), profile, map_out);
+                    var spec = try parseDataKeySpec(zapi, call_out, k, nodes, profile, map_out);
                     errdefer spec.deinit();
                     try specs_list.append(allocator, spec);
                 },
@@ -425,7 +478,7 @@ fn createImpl(
             if (vsapi.?.mapGetType.?(in, k) != .Data) {
                 return common.fail(map_out, filter_name, "keyword argument '{s}' must be a string expression", .{ks});
             }
-            var spec = try parseDataKeySpec(zapi, in, k, @intCast(nodes.len), profile, map_out);
+            var spec = try parseDataKeySpec(zapi, in, k, nodes, profile, map_out);
             errdefer spec.deinit();
             try specs_list.append(allocator, spec);
         }

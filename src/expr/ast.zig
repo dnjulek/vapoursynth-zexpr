@@ -1,6 +1,7 @@
 //! Flat arena DAG / SSA IR types for `zexpr`.
 
 const std = @import("std");
+const builtins_mod = @import("builtins.zig");
 
 pub const NodeIdx = u32;
 pub const ClipId = u16;
@@ -125,9 +126,13 @@ pub const ArgExtremaKind = enum(u8) {
     argmax,
 };
 
-pub const PropSpec = struct {
-    clip: ClipId,
-    name: []u8,
+pub const PropSpec = union(enum) {
+    frame_prop: struct {
+        clip: ClipId,
+        name: []u8,
+    },
+    /// Built-in constant slot used by scalar filters (`Select`, `PropExpr`) reusing `.load_prop` (D2).
+    builtin: builtins_mod.BuiltinSpec,
 };
 
 pub const ArgSortSpec = struct {
@@ -201,11 +206,26 @@ const PropKeyContext = struct {
     }
 };
 
+const BuiltinSpecContext = struct {
+    pub fn hash(_: @This(), k: builtins_mod.BuiltinSpec) u64 {
+        var h = std.hash.Wyhash.init(0);
+        k.hashInto(&h);
+        return h.final();
+    }
+
+    pub fn eql(_: @This(), a: builtins_mod.BuiltinSpec, b: builtins_mod.BuiltinSpec) bool {
+        return a.eql(b);
+    }
+};
+
 pub const Program = struct {
     nodes: std.ArrayList(Node) = .empty,
     root: NodeIdx = invalid_node,
     props: std.ArrayList(PropSpec) = .empty,
     prop_map: std.HashMapUnmanaged(PropKey, u32, PropKeyContext, std.hash_map.default_max_load_percentage) = .empty,
+    builtin_prop_map: std.HashMapUnmanaged(builtins_mod.BuiltinSpec, u32, BuiltinSpecContext, std.hash_map.default_max_load_percentage) = .empty,
+    builtins: std.ArrayList(builtins_mod.BuiltinSpec) = .empty,
+    builtin_map: std.HashMapUnmanaged(builtins_mod.BuiltinSpec, u32, BuiltinSpecContext, std.hash_map.default_max_load_percentage) = .empty,
     extra_args: std.ArrayList(NodeIdx) = .empty,
     arg_sorts: std.ArrayList(ArgSortSpec) = .empty,
     opt_int: bool = false,
@@ -213,8 +233,14 @@ pub const Program = struct {
 
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
         self.prop_map.deinit(allocator);
+        self.builtin_prop_map.deinit(allocator);
+        self.builtin_map.deinit(allocator);
+        self.builtins.deinit(allocator);
         for (self.props.items) |prop| {
-            allocator.free(prop.name);
+            switch (prop) {
+                .frame_prop => |fp| allocator.free(fp.name),
+                .builtin => {},
+            }
         }
         self.props.deinit(allocator);
         self.extra_args.deinit(allocator);
@@ -236,9 +262,31 @@ pub const Program = struct {
         const duped = try allocator.dupe(u8, name);
         errdefer allocator.free(duped);
         const idx: u32 = @intCast(self.props.items.len);
-        try self.props.append(allocator, .{ .clip = clip, .name = duped });
+        try self.props.append(allocator, .{ .frame_prop = .{ .clip = clip, .name = duped } });
         errdefer _ = self.props.pop();
         try self.prop_map.put(allocator, .{ .clip = clip, .name = duped }, idx);
+        return idx;
+    }
+
+    pub fn internBuiltinProp(self: *Program, allocator: std.mem.Allocator, spec: builtins_mod.BuiltinSpec) std.mem.Allocator.Error!u32 {
+        if (self.builtin_prop_map.get(spec)) |existing| {
+            return existing;
+        }
+        const idx: u32 = @intCast(self.props.items.len);
+        try self.props.append(allocator, .{ .builtin = spec });
+        errdefer _ = self.props.pop();
+        try self.builtin_prop_map.put(allocator, spec, idx);
+        return idx;
+    }
+
+    pub fn internBuiltin(self: *Program, allocator: std.mem.Allocator, spec: builtins_mod.BuiltinSpec) std.mem.Allocator.Error!u32 {
+        if (self.builtin_map.get(spec)) |existing| {
+            return existing;
+        }
+        const idx: u32 = @intCast(self.builtins.items.len);
+        try self.builtins.append(allocator, spec);
+        errdefer _ = self.builtins.pop();
+        try self.builtin_map.put(allocator, spec, idx);
         return idx;
     }
 };

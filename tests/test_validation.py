@@ -88,10 +88,13 @@ def test_invalid_arguments_and_formats_rejected(core: vs.Core) -> None:
     with pytest.raises(vs.Error, match="invalid format id"):
         core.zexpr.Expr([c8], ["x"], format=12345)
 
-    # Variable format input rejected
-    var_fmt = core.std.Splice([c8, make_clip(core, width=16, height=8, fmt=vs.GRAY16, length=1)], mismatch=True)
-    with pytest.raises(vs.Error):
-        core.zexpr.Expr([var_fmt], ["x"])
+    # Variable format input accepted (Phase C dynamic mode)
+    c16 = make_clip(core, width=16, height=8, fmt=vs.GRAY16, length=1, seed=42)
+    var_fmt = core.std.Splice([c8, c16], mismatch=True)
+    var_out = core.zexpr.Expr([var_fmt], ["x"])
+    assert var_out.format.id == vs.NONE
+    assert np.array_equal(np.asarray(var_out.get_frame(0)[0]), np.asarray(c8.get_frame(0)[0]))
+    assert np.array_equal(np.asarray(var_out.get_frame(1)[0]), np.asarray(c16.get_frame(0)[0]))
 
 
 @pytest.mark.skipif(

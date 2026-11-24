@@ -475,7 +475,29 @@ def test_periodic_x_mod_all_formats_and_widths(core: vs.Core) -> None:
 
 
 def test_lut_cache_key_width_height_invariant(core: vs.Core) -> None:
-    """AR3: Dimension-free LUT caching must never conflate expressions that depend on `width`/`height`."""
+    """AR3/N6: Dimension-free LUT caching shares Y/U/V tables across dimensions and never
+    conflates expressions that depend on `width`/`height`."""
+    # Positive companion (N6): YUV420P16 gamma builds a dimension-free 1D u16 LUT on Y (32x16)
+    # and reuses that exact cached table on subsampled U/V (16x8) and separate odd-width clips.
+    gamma_expr = "x 65535 / 2.2 pow 65535 *"
+    cyuv_rand = make_clip(core, width=32, height=16, fmt=vs.YUV420P16, length=2, seed=942)
+    got_lut = core.zexpr.Expr([cyuv_rand], [gamma_expr])
+    # Reference via f32 input (exact for u16 samples, never eligible for lut1d_u16 -> runs SIMD/scalar JIT).
+    cyuv_f32 = core.zexpr.Expr([cyuv_rand], ["x"], format=vs.YUV420PS)
+    ref_jit = core.zexpr.Expr([cyuv_f32], [gamma_expr], format=vs.YUV420P16)
+    assert_same_clip(got_lut, ref_jit)
+    # Confirm U and V received distinct plane data (not aliased to Y or to each other).
+    f0 = got_lut.get_frame(0)
+    assert not np.array_equal(plane_array(f0, 1), plane_array(f0, 2))
+    # Separate odd-width GRAY16 clip hitting the same cached dimension-free table.
+    cg_odd = make_clip(core, width=47, height=13, fmt=vs.GRAY16, length=1, seed=943)
+    cg_odd_f32 = core.zexpr.Expr([cg_odd], ["x"], format=vs.GRAYS)
+    assert_same_clip(
+        core.zexpr.Expr([cg_odd], [gamma_expr]),
+        core.zexpr.Expr([cg_odd_f32], [gamma_expr], format=vs.GRAY16),
+    )
+
+    # Negative guard (AR3): expressions referencing `width`/`height` must never share a dimension-free entry.
     expr_w = "x 65535 / 2.2 pow width * 0.5 +"
     expr_h = "x 65535 / 2.2 pow height * 0.5 +"
 

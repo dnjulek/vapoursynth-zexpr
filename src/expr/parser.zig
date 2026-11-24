@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const builtins_mod = @import("builtins.zig");
 const token = @import("token.zig");
 const lexer = @import("lexer.zig");
 const sortnet = @import("sortnet.zig");
@@ -11,9 +12,11 @@ pub const ParseOptions = struct {
     num_clips: u16 = 1,
     default_boundary: ast.BoundaryMode = .clamp,
     opt_int: bool = false,
+    /// Optional built-in resolution context for compile-time literal emission in `Expr` (D6).
+    builtin_ctx: ?*const builtins_mod.ResolveContext = null,
 };
 
-pub const ParseError = token.TokenError || std.mem.Allocator.Error || error{
+pub const ParseError = token.TokenError || builtins_mod.ResolveError || std.mem.Allocator.Error || error{
     EmptyExpression,
     StackUnderflow,
     StackNotEmpty,
@@ -60,6 +63,31 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8, opts: ParseOption
             .pi => {
                 const idx = try prog.appendNode(allocator, .{ .const_f32 = std.math.pi });
                 try stack.append(allocator, idx);
+            },
+            .builtin_const => |spec| {
+                switch (spec.target) {
+                    .clip => |cid| if (cid >= opts.num_clips) return error.ClipOutOfRange,
+                    .dst => {},
+                }
+                _ = try prog.internBuiltin(allocator, spec);
+                if (opts.builtin_ctx) |ctx| {
+                    const val = try builtins_mod.resolveOne(spec, ctx.src_metas, ctx.dst_meta);
+                    const node: ast.Node = if (ctx.opt_int and val.i32_val != null)
+                        .{ .const_i32 = val.i32_val.? }
+                    else
+                        .{ .const_f32 = val.f32Val() };
+                    const idx = try prog.appendNode(allocator, node);
+                    try stack.append(allocator, idx);
+                } else if (opts.mode == .expr) {
+                    // Validation / spec-collection parse for Expr (never compiled or evaluated).
+                    const idx = try prog.appendNode(allocator, .{ .const_f32 = 0.0 });
+                    try stack.append(allocator, idx);
+                } else {
+                    // Select / PropExpr: intern into props as a `.builtin` slot reusing `.load_prop` (D2/F1).
+                    const prop_id = try prog.internBuiltinProp(allocator, spec);
+                    const idx = try prog.appendNode(allocator, .{ .load_prop = prop_id });
+                    try stack.append(allocator, idx);
+                }
             },
             .frame_n => {
                 const idx = try prog.appendNode(allocator, .frame_n);
@@ -499,14 +527,49 @@ test "parser handles basic, spatial, var, sort289, sort1025, and 5000-op chain" 
         defer p.deinit(allocator);
         try std.testing.expect(p.nodes.items.len > 10_000);
     }
+
+    // Built-in constants: parser-level literal resolution (D1/D6), prop slots in Select/PropExpr (D2), C4 rejection.
+    {
+        const u8_meta: builtins_mod.ClipMeta = .{ .is_float = false, .bits_per_sample = 8, .color_family = .gray, .plane_idx = 0, .is_full_range = false };
+        const f32_meta: builtins_mod.ClipMeta = .{ .is_float = true, .bits_per_sample = 32, .color_family = .gray, .plane_idx = 0, .is_full_range = true };
+        const u32_meta: builtins_mod.ClipMeta = .{ .is_float = false, .bits_per_sample = 32, .color_family = .gray, .plane_idx = 0, .is_full_range = false };
+
+        // D1: under opt=1, integer target emits const_i32, float target emits const_f32 even for 1.0.
+        const ctx_u8: builtins_mod.ResolveContext = .{ .src_metas = &.{u8_meta}, .dst_meta = u8_meta, .opt_int = true };
+        var p_u8 = try parse(allocator, "range_max", .{ .num_clips = 1, .opt_int = true, .builtin_ctx = &ctx_u8 });
+        defer p_u8.deinit(allocator);
+        try std.testing.expectEqual(ast.Node{ .const_i32 = 255 }, p_u8.nodes.items[p_u8.root]);
+        try std.testing.expectEqual(@as(usize, 0), p_u8.props.items.len);
+
+        const ctx_f32: builtins_mod.ResolveContext = .{ .src_metas = &.{f32_meta}, .dst_meta = f32_meta, .opt_int = true };
+        var p_f32 = try parse(allocator, "range_max", .{ .num_clips = 1, .opt_int = true, .builtin_ctx = &ctx_f32 });
+        defer p_f32.deinit(allocator);
+        try std.testing.expectEqual(ast.Node{ .const_f32 = 1.0 }, p_f32.nodes.items[p_f32.root]);
+
+        // C4: >16-bit integer target returns UnsupportedIntBitDepthConstant.
+        const ctx_u32: builtins_mod.ResolveContext = .{ .src_metas = &.{u32_meta}, .dst_meta = u32_meta, .opt_int = false };
+        try std.testing.expectError(
+            error.UnsupportedIntBitDepthConstant,
+            parse(allocator, "neutral", .{ .num_clips = 1, .builtin_ctx = &ctx_u32 }),
+        );
+        try std.testing.expectError(error.ClipOutOfRange, parse(allocator, "y:neutral", .{ .num_clips = 1 }));
+
+        // D2: Select / PropExpr intern built-ins into props as `.builtin` and emit `.load_prop`.
+        var p_sel = try parse(allocator, "x:range_max x:range_max + dst:range_min +", .{ .mode = .select, .num_clips = 1 });
+        defer p_sel.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), p_sel.props.items.len);
+        try std.testing.expect(p_sel.props.items[0] == .builtin);
+        try std.testing.expect(p_sel.props.items[1] == .builtin);
+        try std.testing.expectEqual(@as(usize, 2), p_sel.builtins.items.len);
+    }
 }
 
 test "parser OOM and remap failure sweep" {
     const Runner = struct {
         fn run(allocator: std.mem.Allocator) anyerror!void {
             const exprs = [_][]const u8{
-                "x y + t! t@ x[-1,0]:m + x.PropA + X Y src0[]:m + x 1 2 3 4 sort5 drop4 + x y 0.3 lerp + 1 2 3 4 5 6 x polyval5 +",
-                "x.A x.B x.C argsort3 drop2",
+                "x y + t! t@ x[-1,0]:m + x.PropA + X Y src0[]:m + x 1 2 3 4 sort5 drop4 + x y 0.3 lerp + 1 2 3 4 5 6 x polyval5 + neutral + dst:range_max +",
+                "x.A x.B x.C argsort3 drop2 x:neutral + dst:range_max +",
             };
             var p0 = try parse(allocator, exprs[0], .{ .num_clips = 2, .default_boundary = .mirror });
             p0.deinit(allocator);
