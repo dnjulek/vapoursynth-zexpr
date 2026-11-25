@@ -910,13 +910,15 @@ test "PlaneCache LRU hit, eviction, active ref survival, and key isolation" {
     cache.release(alloc, e3);
 
     // e1 must remain valid and executable even after LRU eviction because caller holds a ref!
-    var src_buf: [32 * 4]u8 = @splat(10);
-    var dst_buf: [32 * 4]u8 = @splat(0);
+    // VapourSynth aligns row strides to 64 bytes on AVX-512 (32 on AVX2), so allocate 64B rows.
+    const row_stride = 64;
+    var src_buf: [row_stride * 4]u8 align(64) = @splat(10);
+    var dst_buf: [row_stride * 4]u8 align(64) = @splat(0);
     const srcs = [_][*]const u8{&src_buf};
-    const strides = [_]isize{32};
-    e1.exec.jit.kernel.func(&dst_buf, 32, &srcs, &strides, 0, null);
+    const strides = [_]isize{row_stride};
+    e1.exec.jit.kernel.func(&dst_buf, row_stride, &srcs, &strides, 0, null);
     try std.testing.expectEqual(11, dst_buf[0]);
-    try std.testing.expectEqual(11, dst_buf[127]);
+    try std.testing.expectEqual(11, dst_buf[3 * row_stride + 31]);
 
     cache.release(alloc, e1);
 }
