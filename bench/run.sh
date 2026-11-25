@@ -67,13 +67,20 @@ PROBE_SECONDS="${PROBE_SECONDS:-0.25}"
 # Ordered by zexpr's speedup over akarin (geometric mean of p8/p16/ps), biggest first.
 ALL_CASES=(
     deblock.py
+    pad_repeat.py
+    rg_mode2.py
+    rp_mode19.py
     gamma.py
     kirsch.py
     morpho.py
     median3x3.py
+    fine_sharp.py
+    side_box_pick.py
     sobel.py
+    adg_mask.py
     exp.py
     rotate.py
+    mandelbrot.py
     box3x3.py
     wide-reach.py
 )

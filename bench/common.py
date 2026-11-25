@@ -133,6 +133,7 @@ def run_case(
     num_clips: int = 1,
     boundary: int | None = None,
     format_out: dict[str, vs.PresetVideoFormat] | None = None,
+    props: dict[str, Any] | None = None,
 ) -> None:
     """Register 0..2 YUV420P8, 3..5 YUV420P16, 6..8 YUV420PS (zexpr/akarin/cranexpr; cranexpr's 2/5/8 only if installed)."""
     core = setup(script_globals)
@@ -145,6 +146,8 @@ def run_case(
         if only is not None and tag != only:
             continue
         clips = [random_source(core, fmt, seed_offset=i * 100, eager=only is not None) for i in range(num_clips)]
+        if props:
+            clips = [c.std.SetFrameProps(**props) for c in clips]
         fmt_expr = expr[tag] if isinstance(expr, dict) else expr
         kwargs: dict[str, Any] = {}
         if boundary is not None:
