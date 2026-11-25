@@ -566,3 +566,197 @@ def test_simd_u8_lut_runtime_dims_yuv420_odd_chroma_and_plane_max(core: vs.Core)
         assert np.all(plane_array(f_full, p) == exp_val), f"full plane {p} expected {exp_val}"
     for p, exp_val in enumerate((235, 240, 240)):
         assert np.all(plane_array(f_lim, p) == exp_val), f"limited plane {p} expected {exp_val}"
+
+
+def test_perf_codegen_paths_interleave_x4_int32plan_remat_licm_and_math(core: vs.Core) -> None:
+    """Cover AVX2/AVX-512/NEON perf paths: 4x serial interleave, Int32Plan u9..u16, 32-reg remat + bare-load select,
+    pad_repeat frame/row LICM + abs_row_ptrs, and 2x-interleaved multi-transcendentals."""
+    # 1. 4x-interleaved serial FP chain (`can_interleave_x4`: >40 nodes, peak_live <= 5, e.g. mandelbrot-like).
+    # 12 iterations of `z = z*z + c` (well-bounded `c in [0, 0.2]`) produces >48 nodes and peak_live <= 4.
+    iter_step = "dup * c@ + "
+    serial_expr = "x 0.1 * c! c@ " + (iter_step * 14) + "200 *"
+    for fmt in (vs.GRAY8, vs.GRAY16, vs.GRAYS):
+        for w in (17, 65, 131):
+            src = make_clip(core, width=w, height=3, fmt=fmt, length=1, seed=1100 + w)
+            if fmt == vs.GRAYS:
+                got = plane_array(core.zexpr.Expr([src], [serial_expr]).get_frame(0), 0)
+                c_np = plane_array(src.get_frame(0), 0).astype(np.float64) * 0.1
+                z = c_np.copy()
+                for _ in range(14):
+                    z = z * z + c_np
+                np.testing.assert_allclose(got, (z * 200.0).astype(np.float32), rtol=1e-4, atol=1e-4)
+            else:
+                # Normalize input into [0, 1] first so 14 squarings stay finite and non-trivial.
+                peak = 255 if fmt == vs.GRAY8 else 65535
+                norm_expr = f"x {peak} / 0.2 * c! c@ " + (iter_step * 14) + f"{peak} *"
+                fsrc = core.std.Expr([src], ["x"], format=vs.GRAYS)
+                assert_same_clip(
+                    core.zexpr.Expr([src], [norm_expr]),
+                    core.zexpr.Expr([fsrc], [norm_expr], format=fmt),
+                )
+
+    # 2. Int32Plan (u10/u12/u16 signed i32 interior fast path): box3x3, sobel, rp_mode19, rg_mode5, contra_median,
+    # non-power-of-2 constant multiply, and i32 overflow guard.
+    int32_exprs = (
+        "x[-1,-1] x[0,-1] + x[1,-1] + x[-1,0] + x + x[1,0] + x[-1,1] + x[0,1] + x[1,1] + 9 /",
+        "x[-1,-1] x[1,-1] - x[-1,0] 2 * + x[1,0] 2 * - x[-1,1] + x[1,1] - abs "
+        "x[-1,-1] x[0,-1] 2 * + x[1,-1] + x[-1,1] - x[0,1] 2 * - x[1,1] - abs +",
+        "x[-1,-1] x[0,-1] + x[1,-1] + x[-1,0] + x[1,0] + x[-1,1] + x[0,1] + x[1,1] + 8 /",
+        "x y - 3 * 500 +",
+        "y z - D1! y 32768 - D2! D1@ D2@ xor x x D1@ abs D2@ abs < D1@ D2@ ? - ?",
+    )
+    for fmt in (vs.GRAY10, vs.GRAY12, vs.GRAY16):
+        for w in (17, 33, 65):
+            c0 = make_clip(core, width=w, height=5, fmt=fmt, length=1, seed=1200 + w)
+            c1 = make_clip(core, width=w, height=5, fmt=fmt, length=1, seed=1210 + w)
+            c2 = make_clip(core, width=w, height=5, fmt=fmt, length=1, seed=1220 + w)
+            f0 = core.std.Expr([c0], ["x"], format=vs.GRAYS)
+            f1 = core.std.Expr([c1], ["x"], format=vs.GRAYS)
+            f2 = core.std.Expr([c2], ["x"], format=vs.GRAYS)
+            for expr in int32_exprs:
+                assert_same_clip(
+                    core.zexpr.Expr([c0, c1, c2], [expr]),
+                    core.zexpr.Expr([f0, f1, f2], [expr], format=fmt),
+                )
+    # i32 overflow guard: 65535 * 65535 overflows signed i32 -> must fall back to f32 and clamp to 65535 (never wrap negative/0).
+    hi16 = core.std.BlankClip(width=65, height=3, format=vs.GRAY16, color=[65535], length=1)
+    assert np.all(plane_array(core.zexpr.Expr([hi16], ["x 65535 * 2 /"]).get_frame(0), 0) == 65535)
+
+    # 3. 32-reg int_path SU scheduling + load remat (>48 nodes, >12 loads) + bare-load select regression (91b92f3).
+    taps_5x5 = [f"x[{dx},{dy}]" for dy in (-2, -1, 0, 1, 2) for dx in (-2, -1, 0, 1, 2)]
+    sum_24 = taps_5x5[1] + " " + " ".join(f"{t} +" for t in taps_5x5[2:]) + " 24 /"
+    # Bare-load select condition `x[-2,-2]` + >48-node 25-tap stencil.
+    bare_sel_remat = f"x[-2,-2] 7 {sum_24} ?"
+    kirsch_like = (
+        "x[-1,-1] x[0,-1] + x[1,-1] + 5 * x[-1,0] x[1,0] + x[-1,1] + x[0,1] + x[1,1] + 3 * - abs "
+        "x[0,-1] x[1,-1] + x[1,0] + 5 * x[-1,-1] x[-1,0] + x[-1,1] + x[0,1] + x[1,1] + 3 * - abs max "
+        "x[1,-1] x[1,0] + x[1,1] + 5 * x[-1,-1] x[0,-1] + x[-1,0] + x[-1,1] + x[0,1] + 3 * - abs max "
+        "x[1,0] x[1,1] + x[0,1] + 5 * x[-1,-1] x[0,-1] + x[1,-1] + x[-1,0] + x[-1,1] + 3 * - abs max 8 /"
+    )
+    for fmt in (vs.GRAY8, vs.GRAY10, vs.GRAY16):
+        for w in (33, 65):
+            src = make_clip(core, width=w, height=7, fmt=fmt, length=1, seed=1300 + w)
+            fsrc = core.std.Expr([src], ["x"], format=vs.GRAYS)
+            for expr in (bare_sel_remat, kirsch_like):
+                assert_same_clip(
+                    core.zexpr.Expr([src], [expr]),
+                    core.zexpr.Expr([fsrc], [expr], format=fmt),
+                )
+
+    # 4. Frame/row LICM & contiguous abs_row_ptrs (`pad_repeat`-style corners, edges, contiguous rows, incl. width < 16).
+    pad_expr = (
+        "X 4 < L! Y 2 < T! X 12 > R! Y 4 > B! T@ B@ or L@ R@ or and "
+        "L@ T@ 4 2 x[] 4 4 x[] ? T@ 12 2 x[] 12 4 x[] ? ? "
+        "L@ 4 Y x[] R@ 12 Y x[] T@ X 2 x[] B@ X 4 x[] x ? ? ? ? ?"
+    )
+    for fmt in (vs.GRAY8, vs.GRAY10, vs.GRAY16, vs.GRAYH, vs.GRAYS):
+        for w in (9, 65):
+            src = make_clip(core, width=w, height=7, fmt=fmt, length=1, seed=1400 + w)
+            arr = plane_array(src.get_frame(0), 0)
+            h = arr.shape[0]
+            yy, xx = np.mgrid[0:h, 0:w]
+            cx = np.clip(np.where(xx < 4, 4, np.where(xx > 12, 12, xx)), 0, w - 1)
+            cy = np.clip(np.where(yy < 2, 2, np.where(yy > 4, 4, yy)), 0, h - 1)
+            expected = arr[cy, cx]
+            for boundary in (0, 1):
+                got = plane_array(core.zexpr.Expr([src], [pad_expr], boundary=boundary).get_frame(0), 0)
+                np.testing.assert_array_equal(got, expected)
+
+    # 5. 2x-interleaved multi-transcendentals + props (`interleave_x2`: adg_mask / sigmoid_inv / fine_sharp patterns).
+    for fmt, peak in ((vs.GRAY8, 255), (vs.GRAY16, 65535), (vs.GRAYS, 1)):
+        for w in (17, 65, 131):
+            base = make_clip(core, width=w, height=3, fmt=fmt, length=1, seed=1500 + w)
+            src = base.std.SetFrameProps(PAverage=0.35)
+            fsrc = core.std.Expr([src], ["x"], format=vs.GRAYS)
+            expr = f"x {peak} / 0.001 max 0.999 min V! 1 V@ - V@ / log 0.1 * x.PAverage + exp 0.5 * {peak} *"
+            if fmt == vs.GRAYS:
+                got = plane_array(core.zexpr.Expr([src], [expr]).get_frame(0), 0)
+                v = np.clip(plane_array(base.get_frame(0), 0).astype(np.float64), 0.001, 0.999)
+                ref = np.exp(np.log((1.0 - v) / v) * 0.1 + 0.35) * 0.5
+                np.testing.assert_allclose(got, ref.astype(np.float32), rtol=2e-5, atol=2e-5)
+            else:
+                assert_same_clip(
+                    core.zexpr.Expr([src], [expr]),
+                    core.zexpr.Expr([fsrc], [expr], format=fmt),
+                )
+
+
+def test_unaligned_crop_lut2d_crossfmt_and_cache_isolation(core: vs.Core) -> None:
+    """Odd-byte cropped inputs across LUT/int/spatial/gather paths, 2D u8 LUT cross-format & odd-chroma, and PlaneCache key isolation."""
+    from helpers import repack
+
+    # 1. Odd-byte unaligned Crop(left=1, top=1) on GRAY8 (breaks 16/32/64B alignment) and GRAY16.
+    c8_big = make_clip(core, width=68, height=10, fmt=vs.GRAY8, length=1, seed=1601)
+    c8_b_big = make_clip(core, width=68, height=10, fmt=vs.GRAY8, length=1, seed=1602)
+    c8_crop = c8_big.std.Crop(left=1, right=2, top=1, bottom=1)     # width=65, 1-byte misaligned!
+    c8_b_crop = c8_b_big.std.Crop(left=3, right=0, top=1, bottom=1)  # width=65, 3-byte misaligned!
+    c8_rep = repack(core, c8_crop)
+    c8_b_rep = repack(core, c8_b_crop)
+
+    for expr in (
+        "x 255 / 2.2 pow 255 *",                                  # SIMD u8 1D LUT
+        "x 255 / 2.2 pow y 255 / 1.8 pow + 127.5 *",              # 2D u8x8 LUT
+        "x[-1,0] x + x[1,0] + x[0,-1] + 4 /",                     # i16 spatial fast path
+        "x y - abs",                                              # u8 fast path
+        "width 1 - X - Y x[]:c",                                  # gather
+        "X 4 < 4 Y x[] X 2 x[] ?",                                # abs_row_ptrs + row LICM
+    ):
+        assert_same_clip(
+            core.zexpr.Expr([c8_crop, c8_b_crop], [expr]),
+            core.zexpr.Expr([c8_rep, c8_b_rep], [expr]),
+        )
+
+    c16_big = make_clip(core, width=68, height=10, fmt=vs.GRAY16, length=1, seed=1603)
+    c16_crop = c16_big.std.Crop(left=1, right=2, top=1, bottom=1)  # 2-byte misaligned u16
+    c16_rep = repack(core, c16_crop)
+    for expr in (
+        "x 65535 / 2.2 pow 65535 *",                              # 1D u16 LUT
+        "x[-1,0] x + x[1,0] + 3 /",                               # i32 spatial fast path
+        "width 1 - X - Y x[]:c",                                  # u16 gather
+    ):
+        assert_same_clip(core.zexpr.Expr([c16_crop], [expr]), core.zexpr.Expr([c16_rep], [expr]))
+
+    # 2. 2D u8 LUT cross-format (`format=GRAY16/GRAYS/GRAYH`) and odd-chroma YUV420P8 (34->17, 66->33).
+    lut2d_expr = "x 255 / 2.2 pow y 255 / 1.8 pow + 0.5 *"
+    g8_0 = make_clip(core, width=65, height=4, fmt=vs.GRAY8, length=1, seed=1610)
+    g8_1 = make_clip(core, width=65, height=4, fmt=vs.GRAY8, length=1, seed=1611)
+    fg_0 = core.std.Expr([g8_0], ["x"], format=vs.GRAYS)
+    fg_1 = core.std.Expr([g8_1], ["x"], format=vs.GRAYS)
+    for dst_fmt, scale in ((vs.GRAY16, "65535 *"), (vs.GRAYS, "1.0 *"), (vs.GRAYH, "1.0 *")):
+        e = f"{lut2d_expr} {scale}"
+        assert_same_clip(
+            core.zexpr.Expr([g8_0, g8_1], [e], format=dst_fmt),
+            core.zexpr.Expr([fg_0, fg_1], [e], format=dst_fmt),
+        )
+    for w in (34, 66):
+        ya = make_clip(core, width=w, height=6, fmt=vs.YUV420P8, length=1, seed=1620 + w)
+        yb = make_clip(core, width=w, height=6, fmt=vs.YUV420P8, length=1, seed=1630 + w)
+        fya = core.zexpr.Expr([ya], ["x"], format=vs.YUV420PS)
+        fyb = core.zexpr.Expr([yb], ["x"], format=vs.YUV420PS)
+        assert_same_clip(
+            core.zexpr.Expr([ya, yb], [f"{lut2d_expr} 255 *"]),
+            core.zexpr.Expr([fya, fyb], [f"{lut2d_expr} 255 *"], format=vs.YUV420P8),
+        )
+
+    # 3. PlaneCache key isolation across dst_fmt (`format=`) and mixed src1_fmt on identical expressions.
+    c_in8 = make_clip(core, width=32, height=4, fmt=vs.GRAY8, length=1, seed=1640)
+    c_in16 = make_clip(core, width=32, height=4, fmt=vs.GRAY16, length=1, seed=1641)
+    for dst_fmt, expected_dtype in ((vs.GRAY10, np.uint16), (vs.GRAY16, np.uint16), (vs.GRAYS, np.float32)):
+        out_f = core.zexpr.Expr([c_in8], ["x 10 *"], format=dst_fmt).get_frame(0)
+        arr = plane_array(out_f, 0)
+        assert arr.dtype == expected_dtype
+        src_a = plane_array(c_in8.get_frame(0), 0).astype(np.float32) * np.float32(10.0)
+        if dst_fmt == vs.GRAY10:
+            np.testing.assert_array_equal(arr, np.clip(src_a, 0, 1023).astype(np.uint16))
+        elif dst_fmt == vs.GRAY16:
+            np.testing.assert_array_equal(arr, np.clip(src_a, 0, 65535).astype(np.uint16))
+        else:
+            np.testing.assert_array_equal(arr, src_a)
+    # Same expression "x y +" with [GRAY8, GRAY8] vs [GRAY8, GRAY16] must never collide in PlaneCache.
+    s88 = plane_array(core.zexpr.Expr([c_in8, c_in8], ["x y +"], format=vs.GRAYS).get_frame(0), 0)
+    s816 = plane_array(core.zexpr.Expr([c_in8, c_in16], ["x y +"], format=vs.GRAYS).get_frame(0), 0)
+    np.testing.assert_array_equal(s88, plane_array(c_in8.get_frame(0), 0).astype(np.float32) * 2.0)
+    np.testing.assert_array_equal(
+        s816,
+        plane_array(c_in8.get_frame(0), 0).astype(np.float32) + plane_array(c_in16.get_frame(0), 0).astype(np.float32),
+    )

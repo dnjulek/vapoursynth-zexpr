@@ -186,3 +186,86 @@ def test_u32_cross_format_d4_and_multiplane(core: vs.Core) -> None:
     assert np.all(plane_array(f_yuv, 0) == 100000005)
     assert np.all(plane_array(f_yuv, 1) == 200000000)
     assert np.all(plane_array(f_yuv, 2) == 299999950)
+
+
+def test_f16_edge_values_yuv420ph_and_cross_format(core: vs.Core) -> None:
+    """f16 NaN/+-inf/subnormal/overflow/-0.0, YUV420PH subsampled spatial, and u8/u16/f32 <-> f16 conversions."""
+    # 1. Edge f16 values via f32 -> GRAYH and GRAYH -> GRAYS (incl. overflow > 65504 -> +inf, subnormal, -0.0, NaN).
+    in_vals = np.array(
+        [[np.nan, np.inf, -np.inf, -0.0, 0.0, 6e-8, 6.1035e-5, 1.5, 65504.0, 70000.0, -70000.0]],
+        dtype=np.float32,
+    )
+    fsrc = core.std.BlankClip(width=in_vals.shape[1], height=1, format=vs.GRAYS, length=1)
+
+    def fill_f(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
+        _ = n
+        out = f.copy()
+        np.asarray(out[0])[:] = in_vals
+        return out
+
+    fsrc = fsrc.std.ModifyFrame(fsrc, fill_f)
+    h_clip = core.zexpr.Expr([fsrc], ["x"], format=vs.GRAYH)
+    got_h = plane_array(h_clip.get_frame(0), 0)[0]
+    assert np.isnan(got_h[0])
+    assert np.isinf(got_h[1]) and got_h[1] > 0
+    assert np.isinf(got_h[2]) and got_h[2] < 0
+    assert got_h[3].view(np.uint16) == 0x8000  # -0.0 preserved in f16
+    assert got_h[4].view(np.uint16) == 0x0000
+    assert got_h[5].view(np.uint16) == np.float16(6e-8).view(np.uint16)  # subnormal round-trip
+    assert got_h[8] == np.float16(65504.0)
+    assert np.isinf(got_h[9]) and got_h[9] > 0    # > 65504 overflows to +inf
+    assert np.isinf(got_h[10]) and got_h[10] < 0
+
+    # Round-trip GRAYH -> GRAYS preserves NaN, +-inf, -0.0, and finite values.
+    rt_f = plane_array(core.zexpr.Expr([h_clip], ["x"], format=vs.GRAYS).get_frame(0), 0)[0]
+    assert np.isnan(rt_f[0])
+    assert np.isposinf(rt_f[1]) and np.isneginf(rt_f[2])
+    assert rt_f[3].view(np.uint32) == 0x80000000
+    assert rt_f[8] == np.float32(65504.0)
+
+    # 2. YUV420PH subsampled spatial access at odd chroma width (34 -> 17).
+    yph = make_clip(core, width=34, height=8, fmt=vs.YUV420PH, length=1, seed=610)
+    yph_f32 = core.zexpr.Expr([yph], ["x"], format=vs.YUV420PS)
+    assert_same_clip(
+        core.zexpr.Expr([yph], ["x[-1,0] x + x[1,0] + 3 /"]),
+        core.zexpr.Expr([yph_f32], ["x[-1,0] x + x[1,0] + 3 /"], format=vs.YUV420PH),
+    )
+
+    # 3. Cross-format u8 -> f16 (costly LUT & cheap SIMD) and u16 <-> f16.
+    c8 = make_clip(core, width=65, height=4, fmt=vs.GRAY8, length=1, seed=611)
+    f8 = core.std.Expr([c8], ["x"], format=vs.GRAYS)
+    for expr in ("x 255 /", "x 255 / 2.2 pow"):
+        assert_same_clip(
+            core.zexpr.Expr([c8], [expr], format=vs.GRAYH),
+            core.zexpr.Expr([f8], [expr], format=vs.GRAYH),
+        )
+    c16 = make_clip(core, width=65, height=4, fmt=vs.GRAY16, length=1, seed=612)
+    f16_from_16 = core.zexpr.Expr([c16], ["x 65535 /"], format=vs.GRAYH)
+    ref_from_16 = core.zexpr.Expr([core.std.Expr([c16], ["x"], format=vs.GRAYS)], ["x 65535 /"], format=vs.GRAYH)
+    assert_same_clip(f16_from_16, ref_from_16)
+    assert_same_clip(
+        core.zexpr.Expr([f16_from_16], ["x 65535 *"], format=vs.GRAY16),
+        core.zexpr.Expr([core.zexpr.Expr([f16_from_16], ["x"], format=vs.GRAYS)], ["x 65535 *"], format=vs.GRAY16),
+    )
+
+
+def test_u32_cross_format_conversions_and_props(core: vs.Core) -> None:
+    """u32 -> GRAY8/GRAY16/GRAYS/GRAYH conversions and u32 opt=1 with frame properties."""
+    base = core.std.BlankClip(width=33, height=3, format=vs.GRAY32, length=2)
+    vals = np.resize(np.array([0, 50, 255, 1000, 65535, 100000], dtype=np.uint32), (3, 33))
+
+    def fill(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
+        out = f.copy()
+        np.asarray(out[0])[:] = vals
+        out.props["Bias"] = 10.0 + n
+        return out
+
+    c32 = base.std.ModifyFrame(base, fill)
+    for dst_fmt, peak in ((vs.GRAY8, 255), (vs.GRAY16, 65535)):
+        got = plane_array(core.zexpr.Expr([c32], ["x x.Bias +"], format=dst_fmt).get_frame(1), 0)
+        exp = np.clip(np.rint(vals.astype(np.float32) + np.float32(11.0)), 0, peak).astype(got.dtype)
+        np.testing.assert_array_equal(got, exp)
+
+    got_h = plane_array(core.zexpr.Expr([c32], ["x 1000 /"], format=vs.GRAYH).get_frame(0), 0)
+    exp_h = (vals.astype(np.float32) / np.float32(1000.0)).astype(np.float16)
+    np.testing.assert_array_equal(got_h, exp_h)

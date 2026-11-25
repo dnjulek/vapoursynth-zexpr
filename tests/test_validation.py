@@ -209,7 +209,18 @@ assert np.all(np.asarray(f[2]) == 155)
 assert len(warnings) == 1, f"expected 1 mtWarning, got {{len(warnings)}}: {{warnings}}"
 assert "executable memory" in warnings[0].lower() or "scalar" in warnings[0].lower()
 
-# 3. Also verify ZEXPR_CPU_LEVEL=0 produces ZERO warnings
+# 3. Dynamic varformat Expr under PROT_EXEC denial also falls back cleanly with 1 warning and exact results
+warnings.clear()
+c16 = core.std.BlankClip(width=32, height=8, format=vs.YUV420P16, color=[1000, 2000, 3000], length=1)
+var_c = core.std.Splice([c, c16], mismatch=True)
+out_dyn = core.zexpr.Expr([var_c], ["x[-1,0] x + 2 /", "x 10 +", "x 5 -"])
+fd0 = out_dyn.get_frame(0)
+fd1 = out_dyn.get_frame(1)
+assert np.all(np.asarray(fd0[0]) == 100) and np.all(np.asarray(fd0[1]) == 138) and np.all(np.asarray(fd0[2]) == 155)
+assert np.all(np.asarray(fd1[0]) == 1000) and np.all(np.asarray(fd1[1]) == 2010) and np.all(np.asarray(fd1[2]) == 2995)
+assert len(warnings) == 1, f"expected 1 mtWarning for dynamic varformat, got {{len(warnings)}}: {{warnings}}"
+
+# 4. Also verify ZEXPR_CPU_LEVEL=0 produces ZERO warnings
 warnings.clear()
 os.environ["ZEXPR_CPU_LEVEL"] = "0"
 out2 = core.zexpr.Expr([c], ["x[-1,0] x + 2 /"])

@@ -664,3 +664,77 @@ def test_expr_phase_c_parallel_stress(core: vs.Core) -> None:
     for i, frame in enumerate(out.frames(backlog=16)):
         exp = expected[(i % 4, (i // 4) & 1)]
         assert np.array_equal(plane_array(frame, 0), exp), f"mismatch on parallel stress frame {i}"
+
+
+def test_expr_builtins_with_props_spatial_luts_and_extra_bitdepths(core: vs.Core) -> None:
+    """Built-ins combined with per-frame x.Prop, spatial/gather/wide-reach, extra bit depths, and dynamic 1D/2D LUTs."""
+    # 1. Phase B _Range switching on GRAY9/12/14 and YUV420P10 + combined per-frame `x.Offset`.
+    for fmt in (vs.GRAY9, vs.GRAY12, vs.GRAY14, vs.YUV420P10):
+        base = make_clip(core, width=32, height=8, fmt=fmt, length=3, seed=(int(fmt) & 0xFFFF) + 33)
+        offsets = (3.5, -7.25, 19.0)
+        ranges = (0, 1, 0)
+        src = _with_props(core, base, lambda n: {"_Range": ranges[n], "Offset": offsets[n]})
+        vf = base.format
+        out = core.zexpr.Expr([src], ["x x.Offset + plane_min - plane_max plane_min - / range_max *"])
+        for n in range(3):
+            is_full = bool(ranges[n])
+            lit_exprs = [
+                f"x {offsets[n]} + {jetpack_value('plane_min', vf, p, is_full)} - "
+                f"{jetpack_value('plane_max', vf, p, is_full)} {jetpack_value('plane_min', vf, p, is_full)} - / "
+                f"{jetpack_value('range_max', vf, p, is_full)} *"
+                for p in range(vf.num_planes)
+            ]
+            assert_same_clip(out[n : n + 1], core.zexpr.Expr([base[n : n + 1]], lit_exprs))
+
+    # 2. Combined built-ins + x.Prop + spatial/gather across Phase B (k=1) and Phase C (k=3 & varsize wide-reach + format=).
+    g8_base = make_clip(core, width=33, height=5, fmt=vs.GRAY8, length=2, seed=901)
+    g8_p = _with_props(core, g8_base, lambda n: {"_Range": n, "Shift": 5.0 if n == 0 else -4.0})
+    for boundary in (0, 1):
+        out_sp = core.zexpr.Expr([g8_p], ["x[-1,0] x.Shift + X 1 - Y x[] + 0.5 * plane_min max plane_max min"], boundary=boundary)
+        for n in range(2):
+            pmin = 0 if n == 1 else 16
+            pmax = 255 if n == 1 else 235
+            sh = 5.0 if n == 0 else -4.0
+            ref = core.zexpr.Expr([g8_base[n : n + 1]], [f"x[-1,0] {sh} + X 1 - Y x[] + 0.5 * {pmin} max {pmax} min"], boundary=boundary)
+            assert_same_clip(out_sp[n : n + 1], ref)
+
+    # varsize wide-reach (`x[-65,0]`) + `format=` override + built-ins + x.Prop.
+    vs_parts = [
+        _with_props(core, make_clip(core, width=w, height=4, fmt=vs.GRAY8, length=1, seed=910 + w), lambda _n, r=idx & 1, add=float(w): {"_Range": r, "Add": add})
+        for idx, w in enumerate((17, 65, 130))
+    ]
+    vs_clip = core.std.Splice(vs_parts, mismatch=True)
+    out_vs = core.zexpr.Expr([vs_clip], ["x[-65,0] x.Add + x:plane_max / dst:plane_max *"], format=vs.GRAY16)
+    assert out_vs.format.id == vs.GRAY16
+    for idx, (part, w) in enumerate(zip(vs_parts, (17, 65, 130))):
+        is_full = bool(idx & 1)
+        x_pmax = 255 if is_full else 235
+        d_pmax = 65535 if is_full else (235 << 8)
+        ref = core.zexpr.Expr([part], [f"x[-65,0] {float(w)} + {x_pmax} / {d_pmax} *"], format=vs.GRAY16).get_frame(0)
+        assert np.array_equal(plane_array(out_vs.get_frame(idx), 0), plane_array(ref, 0))
+
+    # 3. Dynamic varformat/varsize clips hitting 1D u16 LUT and 2D u8 LUT paths.
+    u16_parts = [
+        _with_props(core, make_clip(core, width=w, height=4, fmt=vs.GRAY16, length=1, seed=920 + w), lambda _n, r=idx & 1: {"_Range": r})
+        for idx, w in enumerate((17, 65))
+    ]
+    var_u16 = core.std.Splice(u16_parts, mismatch=True)
+    out_dyn_u16 = core.zexpr.Expr([var_u16], ["x plane_min - plane_max plane_min - / 2.2 pow range_max *"])
+    for idx, part in enumerate(u16_parts):
+        pmin = 0 if (idx & 1) else (16 << 8)
+        pmax = 65535 if (idx & 1) else (235 << 8)
+        ref = core.zexpr.Expr([part], [f"x {pmin} - {pmax} {pmin} - / 2.2 pow 65535 *"]).get_frame(0)
+        assert np.array_equal(plane_array(out_dyn_u16.get_frame(idx), 0), plane_array(ref, 0))
+
+    u8_a = [make_clip(core, width=w, height=4, fmt=vs.GRAY8, length=1, seed=930 + w) for w in (17, 65)]
+    u8_b = [make_clip(core, width=w, height=4, fmt=vs.GRAY8, length=1, seed=940 + w) for w in (17, 65)]
+    out_dyn_2d = core.zexpr.Expr(
+        [core.std.Splice(u8_a, mismatch=True), core.std.Splice(u8_b, mismatch=True)],
+        ["x range_max / 2.2 pow y range_max / 1.8 pow + 0.5 * dst:range_max *"],
+    )
+    for idx in range(2):
+        ref = core.zexpr.Expr(
+            [u8_a[idx], u8_b[idx]],
+            ["x 255 / 2.2 pow y 255 / 1.8 pow + 0.5 * 255 *"],
+        ).get_frame(0)
+        assert np.array_equal(plane_array(out_dyn_2d.get_frame(idx), 0), plane_array(ref, 0))

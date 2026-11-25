@@ -129,3 +129,26 @@ def test_abs_access_d7_y16_and_nonfinite_coords(core: vs.Core) -> None:
         u_arr = plane_array(u_src.get_frame(0), 0)
         got_u = plane_array(core.zexpr.Expr([u_src], ["width 1 - X - height 1 - Y - x[]:c"]).get_frame(0), 0)
         np.testing.assert_array_equal(got_u, u_arr[::-1, ::-1])
+
+
+@pytest.mark.parametrize("fmt", [vs.GRAY8, vs.GRAY10, vs.GRAY16, vs.GRAY32, vs.GRAYH, vs.GRAYS])
+@pytest.mark.parametrize("width", [1, 17, 65])
+def test_wide_2d_rotate_gathers_all_formats(core: vs.Core, fmt: vs.PresetVideoFormat, width: int) -> None:
+    """2D affine/rotate-style dynamic gathers across all sample formats and AVX-512/NEON interior+tail widths."""
+    height = 7
+    src = make_clip(core, width=width, height=height, fmt=fmt, length=1, seed=(int(fmt) & 0xFFFF) + width)
+    src_arr = plane_array(src.get_frame(0), 0)
+    # 2D non-separable coordinate transform exercising full 16-lane AVX-512 gathers (both vpgatherdd & reg gather).
+    expr = "X 0.8 * Y 0.6 * - 2 + Y 0.6 * X 0.2 * + x[]:c"
+    got = plane_array(core.zexpr.Expr([src], [expr]).get_frame(0), 0)
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    sx_f = xx * np.float32(0.8) - yy * np.float32(0.6) + np.float32(2.0)
+    sy_f = yy * np.float32(0.6) + xx * np.float32(0.2)
+    sx = np.clip(np.rint(sx_f).astype(np.int64), 0, width - 1)
+    sy = np.clip(np.rint(sy_f).astype(np.int64), 0, height - 1)
+    expected = src_arr[sy, sx]
+    if fmt == vs.GRAY32:
+        # opt=0 GRAY32 loads signed i32 -> f32 and clamps to [0, 2147483520].
+        expected = np.clip(np.rint(np.clip(expected.view(np.int32).astype(np.float32), 0.0, 2147483520.0)), 0, 2147483520).astype(np.uint32)
+    np.testing.assert_array_equal(got, expected)

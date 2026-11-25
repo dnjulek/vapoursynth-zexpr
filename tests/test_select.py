@@ -125,3 +125,49 @@ def test_select_validation_y17(core: vs.Core) -> None:
         core.zexpr.Select([c0], [c0], ["X"])
     with pytest.raises(vs.Error):
         core.zexpr.Select([c0], [c0], [""])
+
+
+def test_select_ptdata_fewer_exprs_many_clips_props_and_yuv_builtins(core: vs.Core) -> None:
+    """Select: ptData reads, fewer exprs repeating last, >26 clip_src, prop passthrough, YUV & multi-prop_src _Range."""
+    # 1. ptData (byte 1 -> clip 1, 0xC8 -> clamps to last clip, empty -> 0) + output prop passthrough from plane 0's clip.
+    c0 = _with_props(core, core.std.BlankClip(width=8, height=4, format=vs.YUV420P8, color=[10, 20, 30], length=3), lambda _n: {"Origin": 0})
+    c1 = _with_props(core, core.std.BlankClip(width=8, height=4, format=vs.YUV420P8, color=[110, 120, 130], length=3), lambda _n: {"Origin": 1})
+    c2 = _with_props(core, core.std.BlankClip(width=8, height=4, format=vs.YUV420P8, color=[210, 220, 230], length=3), lambda _n: {"Origin": 2})
+    pdata = _with_props(
+        core,
+        c0,
+        lambda n: {"Pick": [b"\x01", b"\xc8", b""][n]},
+    )
+    # 2 expressions on 3-plane YUV: plane 0 uses expr 0 (clip 1/2/0), planes 1 & 2 repeat expr 1 (clip 2).
+    sel = core.zexpr.Select([c0, c1, c2], [pdata], ["x.Pick", "2"])
+    for n, (exp_y, exp_origin) in enumerate(((110, 1), (210, 2), (10, 0))):
+        f = sel.get_frame(n)
+        assert np.all(plane_array(f, 0) == exp_y)
+        assert np.all(plane_array(f, 1) == 220)
+        assert np.all(plane_array(f, 2) == 230)
+        assert f.props["Origin"] == exp_origin
+
+    # 2. > 26 clips in clip_src (30 clips).
+    clips30 = [core.std.BlankClip(width=8, height=4, format=vs.GRAY8, color=[i * 8], length=2) for i in range(30)]
+    p30 = _with_props(core, clips30[0], lambda n: {"Idx": 29 if n == 1 else 0})
+    sel30 = core.zexpr.Select(clips30, [p30], ["x.Idx"])
+    assert int(plane_array(sel30.get_frame(0), 0)[0, 0]) == 0
+    assert int(plane_array(sel30.get_frame(1), 0)[0, 0]) == 29 * 8
+
+    # 3. YUV420P8 prop_src: plane_max is 235 (Y) vs 240 (U/V) under _Range=0, and 255 everywhere under _Range=1.
+    # Also test secondary prop_src[1] (`y:plane_max`) switching per frame.
+    p_yuv0 = _with_props(core, c0[:2], lambda n: {"_Range": n})
+    p_yuv1 = _with_props(core, c0[:2], lambda n: {"_Range": 1 - n})
+    sel_yuv = core.zexpr.Select([c0[:2], c1[:2]], [p_yuv0, p_yuv1], ["x:plane_max 240 >="])
+    f0 = sel_yuv.get_frame(0)  # _Range=0: Y=235 (clip 0), U=240 (clip 1), V=240 (clip 1)
+    f1 = sel_yuv.get_frame(1)  # _Range=1: Y/U/V=255 (all clip 1)
+    assert np.all(plane_array(f0, 0) == 10)
+    assert np.all(plane_array(f0, 1) == 120)
+    assert np.all(plane_array(f0, 2) == 130)
+    assert np.all(plane_array(f1, 0) == 110)
+    assert np.all(plane_array(f1, 1) == 120)
+    assert np.all(plane_array(f1, 2) == 130)
+
+    sel_y_src = core.zexpr.Select([c0[:2], c1[:2]], [p_yuv0, p_yuv1], ["y:plane_max 255 ="])
+    assert np.all(plane_array(sel_y_src.get_frame(0), 0) == 110)  # p_yuv1 frame 0 has _Range=1
+    assert np.all(plane_array(sel_y_src.get_frame(1), 0) == 10)   # p_yuv1 frame 1 has _Range=0

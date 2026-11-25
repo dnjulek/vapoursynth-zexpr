@@ -108,3 +108,62 @@ def test_prop_expr_validation_y17_and_y20_error_paths(core: vs.Core) -> None:
 
     with pytest.raises(vs.Error):
         core.zexpr.PropExpr([c], dict=boom)
+
+
+def test_prop_expr_missing_zero_ptdata_nonfinite_varres_and_dst_range(core: vs.Core) -> None:
+    """Missing/empty ptData default to 0, high/NUL ptData bytes, NaN/inf/large-float storage, varres dims, dst:plane_min/max."""
+    import math
+
+    base = core.std.BlankClip(width=16, height=8, format=vs.GRAY8, length=2)
+    src = _with_props(
+        core,
+        base,
+        lambda n: {
+            "HighByte": b"\xc8rest",
+            "NulByte": b"\x00\x05",
+            "Empty": b"",
+            "Arr": [7, 99],
+            "_Range": n,
+        },
+    )
+    out = core.zexpr.PropExpr(
+        [src],
+        Miss="x.DoesNotExist",
+        MissAdd="x.DoesNotExist 5 +",
+        High="x.HighByte",
+        Nul="x.NulByte",
+        Emp="x.Empty",
+        Arr0="x.Arr",
+        NanV="0 0 /",
+        PosInf="1 0 /",
+        NegInf="-1 0 /",
+        BigFlt="1e20",
+        MinI64="-9223372036854775808.0",
+        DstMin="dst:plane_min",
+        DstMax="dst:plane_max",
+    )
+    for n, (exp_min, exp_max) in enumerate(((16, 235), (0, 255))):
+        pr = out.get_frame(n).props
+        assert pr["Miss"] == 0 and isinstance(pr["Miss"], int)
+        assert pr["MissAdd"] == 5 and isinstance(pr["MissAdd"], int)
+        assert pr["High"] == 200 and isinstance(pr["High"], int)
+        assert pr["Nul"] == 0 and isinstance(pr["Nul"], int)
+        assert pr["Emp"] == 0 and isinstance(pr["Emp"], int)
+        assert pr["Arr0"] == 7 and isinstance(pr["Arr0"], int)
+        assert isinstance(pr["NanV"], float) and math.isnan(pr["NanV"])
+        assert isinstance(pr["PosInf"], float) and math.isinf(pr["PosInf"]) and pr["PosInf"] > 0
+        assert isinstance(pr["NegInf"], float) and math.isinf(pr["NegInf"]) and pr["NegInf"] < 0
+        assert isinstance(pr["BigFlt"], float) and pr["BigFlt"] > 1e19
+        assert isinstance(pr["MinI64"], int) and pr["MinI64"] == -(1 << 63)
+        assert pr["DstMin"] == exp_min
+        assert pr["DstMax"] == exp_max
+
+    # Variable-resolution + variable-format PropExpr exposes per-frame width/height and dst:plane_max.
+    c0 = _with_props(core, core.std.BlankClip(width=12, height=6, format=vs.GRAY8, length=1), lambda _n: {"_Range": 0})
+    c1 = _with_props(core, core.std.BlankClip(width=30, height=14, format=vs.GRAY16, length=1), lambda _n: {"_Range": 1})
+    var = core.std.Splice([c0, c1], mismatch=True)
+    out_var = core.zexpr.PropExpr([var], W="width", H="height", DMax="dst:plane_max")
+    p0 = out_var.get_frame(0).props
+    p1 = out_var.get_frame(1).props
+    assert (p0["W"], p0["H"], p0["DMax"]) == (12, 6, 235)
+    assert (p1["W"], p1["H"], p1["DMax"]) == (30, 14, 65535)

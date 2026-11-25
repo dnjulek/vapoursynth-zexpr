@@ -112,3 +112,124 @@ def test_multithreaded_concurrent_get_frame(core: vs.Core) -> None:
 
     for n in range(32):
         np.testing.assert_array_equal(parallel[n], serial[n])
+
+
+def test_props_simd_widths_all_formats_opt1_and_lut_guard(core: vs.Core) -> None:
+    """Props work across integer/float/YUV formats at SIMD interior+tail widths, opt=1, and never mis-cache as LUTs."""
+    deltas = (1.5, -3.25, 11.0)
+    gammas = (1.5, 2.2, 0.8)
+
+    def add_varying_props(clip: vs.VideoNode) -> vs.VideoNode:
+        def fn(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
+            out = f.copy()
+            out.props["Delta"] = deltas[n % len(deltas)]
+            out.props["Gamma"] = gammas[n % len(gammas)]
+            out.props["KeepMe"] = 777 + n
+            return out
+
+        return clip.std.ModifyFrame(clip, fn)
+
+    # 1. SIMD interior + tail widths across GRAY8/10/16/32/H and YUV420P8/16 (both opt=0 and opt=1).
+    cases = (
+        (vs.GRAY8, (1, 17, 33, 65)),
+        (vs.GRAY10, (17, 65)),
+        (vs.GRAY16, (1, 17, 33, 65)),
+        (vs.GRAY32, (17, 65)),
+        (vs.GRAYH, (17, 65)),
+        (vs.YUV420P8, (34, 66)),
+        (vs.YUV420P16, (34, 66)),
+    )
+    for fmt, widths in cases:
+        for w in widths:
+            base = make_clip(core, width=w, height=4, fmt=fmt, length=3, seed=(int(fmt) & 0xFFFF) + w)
+            src = add_varying_props(base)
+            for opt in (0, 1):
+                out = core.zexpr.Expr([src], ["x x.Delta +"], opt=opt)
+                for n in range(3):
+                    ref = core.zexpr.Expr([base[n : n + 1]], [f"x {deltas[n]} +"], opt=opt)
+                    assert_same_clip(out[n : n + 1], ref)
+                    # Expr must preserve src[0] frame properties.
+                    assert out.get_frame(n).props["KeepMe"] == 777 + n
+
+    # 2. Costly 1-clip gamma with per-frame `x.Gamma` must NOT be misclassified as a static 1D LUT!
+    for fmt, peak in ((vs.GRAY8, 255), (vs.GRAY16, 65535)):
+        base = make_clip(core, width=65, height=4, fmt=fmt, length=3, seed=500 + peak)
+        src = add_varying_props(base)
+        out = core.zexpr.Expr([src], [f"x {peak} / x.Gamma pow {peak} *"])
+        for n in range(3):
+            ref = core.zexpr.Expr([base[n : n + 1]], [f"x {peak} / {gammas[n]} pow {peak} *"])
+            assert_same_clip(out[n : n + 1], ref)
+
+
+def test_props_multiclip_scratch_overflow_and_edge_values(core: vs.Core) -> None:
+    """Multi-clip props (incl. short clip clamping), >64 props heap Scratch, array/NUL-data/nonfinite props."""
+    # 1. Multi-clip props (`x.P`, `y.P`, `src27.P`) with shorter `src27` clamping to its last frame.
+    clips = []
+    for i in range(28):
+        length = 2 if i == 27 else 4
+        base = core.std.BlankClip(width=17, height=2, format=vs.GRAYS, color=[float(i)], length=length)
+
+        def _mk(idx: int):
+            def _fn(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
+                out = f.copy()
+                out.props["P"] = idx * 10 + n
+                return out
+
+            return _fn
+
+        clips.append(base.std.ModifyFrame(base, _mk(i)))
+
+    out_mc = core.zexpr.Expr(clips, ["x.P y.P + src27.P +"])
+    for n in range(4):
+        expected = (0 * 10 + n) + (1 * 10 + n) + (27 * 10 + min(n, 1))
+        np.testing.assert_array_equal(plane_array(out_mc.get_frame(n), 0), np.full((2, 17), expected, dtype=np.float32))
+
+    # 2. > 64 distinct properties (70 props) exercising Scratch(f32, 64) heap fallback in readProps.
+    base70 = core.std.BlankClip(width=17, height=2, format=vs.GRAYS, length=2)
+
+    def add_70(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
+        out = f.copy()
+        for k in range(70):
+            out.props[f"P{k}"] = k + n
+        return out
+
+    c70 = base70.std.ModifyFrame(base70, add_70)
+    expr70 = "x.P0 " + " ".join(f"x.P{k} +" for k in range(1, 70))
+    out70 = core.zexpr.Expr([c70], [expr70])
+    for n in range(2):
+        expected = sum(k + n for k in range(70))
+        np.testing.assert_array_equal(plane_array(out70.get_frame(n), 0), np.full((2, 17), expected, dtype=np.float32))
+
+    # 3. Array prop (element 0), NUL-prefixed ptData (0.0, not NaN), non-finite float props -> D4 int clamp & D7 gather.
+    base_e = make_clip(core, width=17, height=3, fmt=vs.GRAY8, length=1, seed=88)
+
+    def add_edges(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
+        _ = n
+        out = f.copy()
+        out.props["ArrInt"] = [10, 20, 30]
+        out.props["ArrFlt"] = [2.5, 9.5]
+        out.props["NulData"] = b"\x00\x05"
+        out.props["NanP"] = float("nan")
+        out.props["PosInf"] = float("inf")
+        out.props["NegInf"] = float("-inf")
+        out.props["PassTag"] = 1234
+        return out
+
+    ce = base_e.std.ModifyFrame(base_e, add_edges)
+    out_arr = core.zexpr.Expr([ce], ["x.ArrInt x.ArrFlt + x.NulData +"], format=vs.GRAYS)
+    f_arr = out_arr.get_frame(0)
+    np.testing.assert_array_equal(plane_array(f_arr, 0), np.full((3, 17), 12.5, dtype=np.float32))
+    assert f_arr.props["PassTag"] == 1234
+
+    # D4: NaN/+inf props clamp to peak, -inf clamps to 0 on GRAY8 & GRAY16.
+    for fmt, peak in ((vs.GRAY8, 255), (vs.GRAY16, 65535)):
+        assert np.all(plane_array(core.zexpr.Expr([ce], ["x.NanP"], format=fmt).get_frame(0), 0) == peak)
+        assert np.all(plane_array(core.zexpr.Expr([ce], ["x.PosInf"], format=fmt).get_frame(0), 0) == peak)
+        assert np.all(plane_array(core.zexpr.Expr([ce], ["x.NegInf"], format=fmt).get_frame(0), 0) == 0)
+
+    # D7: non-finite prop coordinates in absolute gather `x[]` remain bounds-safe.
+    src_arr = plane_array(base_e.get_frame(0), 0)
+    got_nan_g = plane_array(core.zexpr.Expr([ce], ["x.NanP 0 x[]:c"]).get_frame(0), 0)
+    got_pinf_g = plane_array(core.zexpr.Expr([ce], ["x.PosInf 0 x[]:c"]).get_frame(0), 0)
+    assert np.all(got_nan_g == src_arr[0, 0])
+    assert np.all(got_pinf_g == src_arr[0, -1])
