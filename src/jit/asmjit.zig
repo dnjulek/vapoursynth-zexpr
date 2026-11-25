@@ -296,6 +296,10 @@ pub fn emitShutdownMarkerIfEnabled() void {
 pub const Builder = struct {
     raw: *c.zj_ctx,
     cpu: CpuInfo,
+    /// NEON: convert u8/u16 loads to f32 with the exact `zip` + 2^23 bias sequence instead of
+    /// `ucvtf` (V0-only, 2 uops on Neoverse). Set per kernel by codegen from
+    /// `CpuInfo.prefer_alt_widen_load`; it pins two more constants, so high-pressure bodies skip it.
+    uint_f32_bias_loads: bool = false,
 
     pub fn init(rt: *Runtime, cpu: CpuInfo, capture_disasm: bool) JitError!Builder {
         const c_cpu = cpu.toC();
@@ -396,6 +400,10 @@ pub const Builder = struct {
         c.zj_bind(self.raw, label.raw);
     }
 
+    pub fn alignCode(self: *Builder, alignment: u32) void {
+        c.zj_align_code(self.raw, alignment);
+    }
+
     pub fn constF32Splat(self: *Builder, val: f32) Reg {
         return .{ .raw = c.zj_const_f32_splat(self.raw, val) };
     }
@@ -468,6 +476,10 @@ pub const Builder = struct {
         c.zj_vec_op3(self.raw, @backingInt(op), dst.raw, a.raw, b.raw);
     }
 
+    pub fn vecOp3Mem(self: *Builder, op: VecOp3, dst: Reg, a: Reg, mem: Mem) void {
+        c.zj_vec_op3_mem(self.raw, @backingInt(op), dst.raw, a.raw, mem.raw);
+    }
+
     pub fn vecOp4(self: *Builder, op: VecOp4, dst: Reg, a: Reg, b: Reg, c_reg: Reg) void {
         c.zj_vec_op4(self.raw, @backingInt(op), dst.raw, a.raw, b.raw, c_reg.raw);
     }
@@ -514,6 +526,71 @@ pub const Builder = struct {
 
     pub fn vecLoadUVecx2(self: *Builder, dst0: Reg, dst1: Reg, mem: Mem) void {
         c.zj_vec_load_u_vecx2(self.raw, dst0.raw, dst1.raw, mem.raw);
+    }
+
+    pub fn vecLoadU8ToU32x2(self: *Builder, dst0: Reg, dst1: Reg, mem: Mem) void {
+        c.zj_vec_load_u8_to_u32x2(self.raw, dst0.raw, dst1.raw, mem.raw);
+    }
+
+    pub fn vecLoadU16ToU32x2(self: *Builder, dst0: Reg, dst1: Reg, mem: Mem) void {
+        c.zj_vec_load_u16_to_u32x2(self.raw, dst0.raw, dst1.raw, mem.raw);
+    }
+
+    /// Load `f32_lanes` u8 (`bytes_per_sample` 1) or u16 (2) pixels as exact `f32`.
+    pub fn vecLoadUintToF32(self: *Builder, dst: Reg, mem: Mem, bytes_per_sample: u32) void {
+        if (self.cpu.isa == .neon and self.uint_f32_bias_loads) {
+            c.zj_vec_load_uint_to_f32(self.raw, dst.raw, mem.raw, bytes_per_sample);
+            return;
+        }
+        self.vecLoad(if (bytes_per_sample == 1) .cvt_u8_to_u32 else .cvt_u16_to_u32, dst, mem);
+        self.vecOp2(.cvt_i32_to_f32, dst, dst);
+    }
+
+    /// Load `2 * f32_lanes` u8 (`bytes_per_sample` 1) or u16 (2) pixels as exact `f32`.
+    pub fn vecLoadUintToF32x2(self: *Builder, dst0: Reg, dst1: Reg, mem: Mem, bytes_per_sample: u32) void {
+        if (self.cpu.isa == .neon and self.uint_f32_bias_loads) {
+            c.zj_vec_load_uint_to_f32x2(self.raw, dst0.raw, dst1.raw, mem.raw, bytes_per_sample);
+            return;
+        }
+        if (bytes_per_sample == 1) self.vecLoadU8ToU32x2(dst0, dst1, mem) else self.vecLoadU16ToU32x2(dst0, dst1, mem);
+        self.vecOp2(.cvt_i32_to_f32, dst0, dst0);
+        self.vecOp2(.cvt_i32_to_f32, dst1, dst1);
+    }
+
+    pub fn vecLoadU8ToU16x2(self: *Builder, dst0: Reg, dst1: Reg, mem: Mem) void {
+        c.zj_vec_load_u8_to_u16x2(self.raw, dst0.raw, dst1.raw, mem.raw);
+    }
+
+    pub fn vecUaddlU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
+        c.zj_vec_uaddl_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+    }
+
+    pub fn vecUsublU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
+        c.zj_vec_usubl_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+    }
+
+    pub fn vecUaddwU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
+        c.zj_vec_uaddw_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
+    }
+
+    pub fn vecUsubwU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
+        c.zj_vec_usubw_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
+    }
+
+    pub fn vecUaddlU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
+        c.zj_vec_uaddl_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+    }
+
+    pub fn vecUsublU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
+        c.zj_vec_usubl_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+    }
+
+    pub fn vecUaddwU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
+        c.zj_vec_uaddw_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
+    }
+
+    pub fn vecUsubwU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
+        c.zj_vec_usubw_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
     }
 
     pub fn vecStoreUVecx2(self: *Builder, mem: Mem, src0: Reg, src1: Reg) void {
@@ -632,6 +709,14 @@ pub const Builder = struct {
         c.zj_vec_fnma_bc_f32(self.raw, dst.raw, a.raw, b_const, c_reg.raw);
     }
 
+    pub fn vecFmaMemF32(self: *Builder, dst: Reg, a: Reg, mem: Mem, c_reg: Reg) void {
+        c.zj_vec_fma_mem_f32(self.raw, dst.raw, a.raw, mem.raw, c_reg.raw);
+    }
+
+    pub fn vecFnmaMemF32(self: *Builder, dst: Reg, a: Reg, mem: Mem, c_reg: Reg) void {
+        c.zj_vec_fnma_mem_f32(self.raw, dst.raw, a.raw, mem.raw, c_reg.raw);
+    }
+
     pub fn vecPermuteF32(self: *Builder, dst: Reg, src: Reg, lane_indices: []const u32) void {
         c.zj_vec_permute_f32(self.raw, dst.raw, src.raw, lane_indices.ptr, @intCast(lane_indices.len));
     }
@@ -702,7 +787,7 @@ test "native C++ ABI layout matches translated zasmjit_c types" {
     {
         var n: usize = 0;
         const p = zj_probe_cpu_info_layout(&n);
-        try std.testing.expectEqual(12, n);
+        try std.testing.expectEqual(13, n);
         try std.testing.expectEqual(p[0], @sizeOf(c.zj_cpu_info_t));
         try std.testing.expectEqual(p[1], @alignOf(c.zj_cpu_info_t));
         try std.testing.expectEqual(p[2], @offsetOf(c.zj_cpu_info_t, "isa"));
@@ -715,6 +800,7 @@ test "native C++ ABI layout matches translated zasmjit_c types" {
         try std.testing.expectEqual(p[9], @offsetOf(c.zj_cpu_info_t, "has_avx2"));
         try std.testing.expectEqual(p[10], @offsetOf(c.zj_cpu_info_t, "has_avx512"));
         try std.testing.expectEqual(p[11], @offsetOf(c.zj_cpu_info_t, "prefer_hw_gather_f32"));
+        try std.testing.expectEqual(p[12], @offsetOf(c.zj_cpu_info_t, "prefer_alt_widen_load"));
     }
 
     // By-value struct round trips across the C++ <-> Zig boundary.

@@ -18,6 +18,7 @@
 #endif
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -47,6 +48,8 @@ struct ShimErrorHandler final : public aj::ErrorHandler {
                 std::strncpy(first_msg, msg, sizeof(first_msg) - 1u);
                 first_msg[sizeof(first_msg) - 1u] = '\0';
             }
+            // Opt-in diagnostics: AsmJit's message is otherwise only reported as CompileFailed.
+            if (std::getenv("ZEXPR_JIT_ERRORS") != nullptr) std::fprintf(stderr, "zexpr: AsmJit error %u: %s\n", unsigned(err), msg != nullptr ? msg : "(null)");
         }
     }
 };
@@ -129,6 +132,23 @@ static aj::CpuFeatures build_cpu_features(const zj_cpu_info_t& cpu) noexcept {
     return f;
 }
 
+static aj::CpuHints build_cpu_hints(const zj_cpu_info_t& cpu) noexcept {
+    aj::CpuHints h = aj::CpuInfo::host().hints();
+#if defined(ASMJIT_UJIT_X86)
+    if (cpu.isa < ZJ_ISA_V4) {
+        const uint32_t mask =
+            uint32_t(aj::CpuHints::kVecMaskedOps8) |
+            uint32_t(aj::CpuHints::kVecMaskedOps16) |
+            uint32_t(aj::CpuHints::kVecMaskedOps32) |
+            uint32_t(aj::CpuHints::kVecMaskedOps64);
+        h = static_cast<aj::CpuHints>(uint32_t(h) & ~mask);
+    }
+#else
+    (void)cpu;
+#endif
+    return h;
+}
+
 } // namespace
 
 struct zj_runtime {
@@ -153,7 +173,7 @@ struct zj_ctx {
         : rt(runtime),
           cpu(cpu_info),
           cc(&code),
-          uc(&cc, build_cpu_features(cpu_info), aj::CpuHints::kNone),
+          uc(&cc, build_cpu_features(cpu_info), build_cpu_hints(cpu_info)),
           capture_disasm(disasm) {
         const aj::CpuFeatures target_features = build_cpu_features(cpu_info);
         code.init(rt->rt.environment(), target_features);
@@ -344,7 +364,8 @@ void zj_cpu_detect(zj_cpu_info_t* out, int32_t max_isa_override) {
         return;
     }
 
-    const aj::CpuFeatures& f = aj::CpuInfo::host().features();
+    const aj::CpuInfo& host_cpu = aj::CpuInfo::host();
+    const aj::CpuFeatures& f = host_cpu.features();
 
 #if defined(ASMJIT_UJIT_X86)
     const bool has_v2 =
@@ -391,7 +412,13 @@ void zj_cpu_detect(zj_cpu_info_t* out, int32_t max_isa_override) {
         out->has_f16c = 1u;
         out->has_avx2 = 1u;
         out->has_avx512 = 1u;
-        out->prefer_hw_gather_f32 = 1u;
+        // Real-silicon AVX-512 f32 gather split (overrideable via ZEXPR_HW_GATHER=0|1):
+        // Intel (EMR/GNR) vpgatherdd zmm beats register gather by +63-65%, while AMD
+        // (Zen 4/5) microcoded vpgatherdd zmm is 26-29% slower than 16-lane register gather.
+        out->prefer_hw_gather_f32 = host_cpu.is_vendor("INTEL") ? 1u : 0u;
+        // Split widening loads (see zj_vec_load): Granite Rapids silicon +3.3% on 8/16-bit
+        // kernels, but Zen 4 (EPYC 9V74) -1% despite llvm-mca's -14%, so Intel only.
+        out->prefer_alt_widen_load = host_cpu.is_vendor("INTEL") ? 1u : 0u;
     } else if (target_isa == ZJ_ISA_V3) {
         out->vec_bytes = 32u;
         out->f32_lanes = 8u;
@@ -423,6 +450,10 @@ void zj_cpu_detect(zj_cpu_info_t* out, int32_t max_isa_override) {
     out->vec_bytes = 16u;
     out->f32_lanes = 4u;
     out->has_fma = 1u; // ARMv8.0 ASIMD has FMA (fmla/fmls) and fcvtl/fcvtn baseline
+    // Real silicon: the zip + 2^23 bias u8/u16 -> f32 load is +6% geomean (up to +36%) on
+    // Neoverse-N2, where 4S ucvtf is 2 uops on V0 only, but neutral on Apple M1, whose four FP
+    // pipes all run ucvtf (and gamma/var_sq p16 lost 8-12% there). AsmJit names Apple "APPLE".
+    out->prefer_alt_widen_load = host_cpu.is_vendor("APPLE") ? 0u : 1u;
 #endif
 }
 
@@ -571,6 +602,11 @@ void zj_bind(zj_ctx* ctx, zj_label_t label) {
     ctx->uc.bind(unpack_label(label));
 }
 
+void zj_align_code(zj_ctx* ctx, uint32_t alignment) {
+    if (!ctx_ok(ctx) || alignment <= 1u) return;
+    ctx->cc.align(aj::AlignMode::kCode, alignment);
+}
+
 zj_reg_t zj_vec_zero(zj_ctx* ctx) {
     if (!ctx_ok(ctx)) return zj_reg_t{0u, 0u};
     if (ctx->has_zero_vec) return ctx->zero_vec;
@@ -584,8 +620,81 @@ zj_reg_t zj_vec_zero(zj_ctx* ctx) {
     return ctx->zero_vec;
 }
 
+#if defined(ASMJIT_UJIT_X86)
+static zj_reg_t intern_broadcast32_const(zj_ctx* ctx, const void* val4, bool is_f32) noexcept {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, val4, 4u);
+    if (bits == 0u) return zj_vec_zero(ctx);
+
+    const uint32_t vb = ctx->cpu.vec_bytes;
+    const uint32_t lanes = ctx->cpu.f32_lanes;
+    uint8_t buf[64]{};
+    for (uint32_t i = 0; i < lanes; ++i) {
+        std::memcpy(buf + i * 4u, &bits, 4u);
+    }
+    for (const ConstEntry& e : ctx->const_cache) {
+        if (e.len == vb && std::memcmp(e.bytes, buf, vb) == 0) {
+            return zj_reg_t{e.reg_id, e.reg_sig};
+        }
+    }
+    ujit::Vec v = ctx->uc.new_vec();
+    ujit::Mem mem4 = ctx->cc.new_const(aj::ConstPoolScope::kLocal, &bits, 4u);
+    {
+        ujit::ScopedInjector inject(&ctx->cc, &ctx->uc._func_init_hook);
+        if (vb == 64u) {
+            if (is_f32) ctx->cc.vbroadcastss(v.zmm(), mem4);
+            else ctx->cc.vpbroadcastd(v.zmm(), mem4);
+        } else {
+            if (is_f32) ctx->cc.vbroadcastss(v.ymm(), mem4);
+            else ctx->cc.vpbroadcastd(v.ymm(), mem4);
+        }
+    }
+    ConstEntry entry{};
+    std::memcpy(entry.bytes, buf, vb);
+    entry.len = vb;
+    entry.reg_id = v.id();
+    entry.reg_sig = v.signature().bits();
+    ctx->const_cache.push_back(entry);
+    return pack_reg(v);
+}
+
+static void emit_x86_ternlog_blend(zj_ctx* ctx, ujit::Vec d, ujit::Vec f, ujit::Vec t, ujit::Vec m) noexcept {
+    // Bitwise lane blend `(m & t) | (~m & f)` in 1 EVEX vpternlogd (zero register copies when dst aliases m, f, or t).
+    if (d.id() == m.id()) {
+        ctx->cc.vpternlogd(d.zmm(), t.zmm(), f.zmm(), 0xCA);
+    } else if (d.id() == f.id()) {
+        ctx->cc.vpternlogd(d.zmm(), t.zmm(), m.zmm(), 0xD8);
+    } else if (d.id() == t.id()) {
+        ctx->cc.vpternlogd(d.zmm(), f.zmm(), m.zmm(), 0xE4);
+    } else {
+        ctx->cc.vmovdqa64(d.zmm(), m.zmm());
+        ctx->cc.vpternlogd(d.zmm(), t.zmm(), f.zmm(), 0xCA);
+    }
+}
+#endif
+
+#if defined(ASMJIT_UJIT_AARCH64)
+static void emit_a64_bsl_blend(zj_ctx* ctx, ujit::Vec d, ujit::Vec f, ujit::Vec t, ujit::Vec m) noexcept {
+    if (d.id() == m.id()) {
+        ctx->cc.bsl(d.b16(), t.b16(), f.b16());
+    } else if (d.id() == f.id()) {
+        ctx->cc.bit(d.b16(), t.b16(), m.b16());
+    } else if (d.id() == t.id()) {
+        ctx->cc.bif(d.b16(), f.b16(), m.b16());
+    } else {
+        ctx->cc.mov(d.b16(), m.b16());
+        ctx->cc.bsl(d.b16(), t.b16(), f.b16());
+    }
+}
+#endif
+
 zj_reg_t zj_const_f32_splat(zj_ctx* ctx, float val) {
     if (!ctx_ok(ctx)) return zj_reg_t{0u, 0u};
+#if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.vec_bytes >= 32u) {
+        return intern_broadcast32_const(ctx, &val, true);
+    }
+#endif
     uint8_t buf[64]{};
     const uint32_t lanes = ctx->cpu.f32_lanes;
     for (uint32_t i = 0; i < lanes; ++i) {
@@ -596,6 +705,11 @@ zj_reg_t zj_const_f32_splat(zj_ctx* ctx, float val) {
 
 zj_reg_t zj_const_i32_splat(zj_ctx* ctx, int32_t val) {
     if (!ctx_ok(ctx)) return zj_reg_t{0u, 0u};
+#if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.vec_bytes >= 32u) {
+        return intern_broadcast32_const(ctx, &val, false);
+    }
+#endif
     uint8_t buf[64]{};
     const uint32_t lanes = ctx->cpu.f32_lanes;
     for (uint32_t i = 0; i < lanes; ++i) {
@@ -888,6 +1002,61 @@ void zj_vec_op3(zj_ctx* ctx, zj_vec_op3_t op, zj_reg_t dst, zj_reg_t a, zj_reg_t
     ctx->uc.emit_3v(uop, unpack_vec(dst), unpack_vec(a), unpack_vec(b));
 }
 
+void zj_vec_op3_mem(zj_ctx* ctx, zj_vec_op3_t op, zj_reg_t dst, zj_reg_t a, zj_mem_t mem) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.vec_bytes == 32u || ctx->cpu.vec_bytes == 64u) {
+        ujit::Vec d = unpack_vec(dst);
+        ujit::Vec lhs = unpack_vec(a);
+        ujit::Mem m = legalise_mem(ctx, mem, ctx->cpu.vec_bytes);
+        if (ctx->cpu.vec_bytes == 32u) {
+            switch (op) {
+                case ZJ_V3_ADD_F32:  ctx->cc.vaddps(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_SUB_F32:  ctx->cc.vsubps(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_MUL_F32:  ctx->cc.vmulps(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_MIN_F32:  ctx->cc.vminps(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_MAX_F32:  ctx->cc.vmaxps(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_MIN_U8:   ctx->cc.vpminub(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_MAX_U8:   ctx->cc.vpmaxub(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_ADDS_U8:  ctx->cc.vpaddusb(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_SUBS_U8:  ctx->cc.vpsubusb(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_MIN_U16:  ctx->cc.vpminuw(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_MAX_U16:  ctx->cc.vpmaxuw(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_ADDS_U16: ctx->cc.vpaddusw(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_SUBS_U16: ctx->cc.vpsubusw(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_AND_U32:  ctx->cc.vpand(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_OR_U32:   ctx->cc.vpor(d.ymm(), lhs.ymm(), m); return;
+                case ZJ_V3_XOR_U32:  ctx->cc.vpxor(d.ymm(), lhs.ymm(), m); return;
+                default: break;
+            }
+        } else {
+            switch (op) {
+                case ZJ_V3_ADD_F32:  ctx->cc.vaddps(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_SUB_F32:  ctx->cc.vsubps(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_MUL_F32:  ctx->cc.vmulps(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_MIN_F32:  ctx->cc.vminps(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_MAX_F32:  ctx->cc.vmaxps(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_MIN_U8:   ctx->cc.vpminub(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_MAX_U8:   ctx->cc.vpmaxub(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_ADDS_U8:  ctx->cc.vpaddusb(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_SUBS_U8:  ctx->cc.vpsubusb(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_MIN_U16:  ctx->cc.vpminuw(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_MAX_U16:  ctx->cc.vpmaxuw(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_ADDS_U16: ctx->cc.vpaddusw(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_SUBS_U16: ctx->cc.vpsubusw(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_AND_U32:  ctx->cc.vpandd(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_OR_U32:   ctx->cc.vpord(d.zmm(), lhs.zmm(), m); return;
+                case ZJ_V3_XOR_U32:  ctx->cc.vpxord(d.zmm(), lhs.zmm(), m); return;
+                default: break;
+            }
+        }
+    }
+#endif
+    ujit::Vec tmp = ctx->uc.new_vec();
+    ctx->uc.v_loaduvec(tmp, legalise_mem(ctx, mem, ctx->cpu.vec_bytes));
+    zj_vec_op3(ctx, op, dst, a, pack_reg(tmp));
+}
+
 void zj_vec_op4(zj_ctx* ctx, zj_vec_op4_t op, zj_reg_t dst, zj_reg_t a, zj_reg_t b, zj_reg_t c) {
     if (!ctx_ok(ctx)) return;
     // On non-FMA x86 (SSE2/v2), UniCompiler lowers kNMAddF32 as `(-a)*b + c` via sse_fsign_flip,
@@ -899,6 +1068,17 @@ void zj_vec_op4(zj_ctx* ctx, zj_vec_op4_t op, zj_reg_t dst, zj_reg_t a, zj_reg_t
         ctx->uc.emit_3v(ujit::UniOpVVV::kSubF32, unpack_vec(dst), unpack_vec(c), tmp);
         return;
     }
+#if defined(ASMJIT_UJIT_X86)
+    if (op == ZJ_V4_BLENDV_U8 && ctx->cpu.vec_bytes == 64u) {
+        emit_x86_ternlog_blend(ctx, unpack_vec(dst), unpack_vec(a), unpack_vec(b), unpack_vec(c));
+        return;
+    }
+#elif defined(ASMJIT_UJIT_AARCH64)
+    if (op == ZJ_V4_BLENDV_U8) {
+        emit_a64_bsl_blend(ctx, unpack_vec(dst), unpack_vec(a), unpack_vec(b), unpack_vec(c));
+        return;
+    }
+#endif
     ujit::UniOpVVVV uop;
     switch (op) {
         case ZJ_V4_MADD_F32:  uop = ujit::UniOpVVVV::kMAddF32; break;
@@ -953,10 +1133,26 @@ void zj_vec_load(zj_ctx* ctx, zj_vec_load_t op, zj_reg_t dst, zj_mem_t mem) {
             ctx->uc.emit_vm(ujit::UniOpVM::kLoad128_U32, d, legalise_mem(ctx, mem, 16u), ujit::Alignment(16));
             return;
         case ZJ_VLOAD_CVT_U8_TO_U16:
+#if defined(ASMJIT_UJIT_X86)
+            if (ctx->cpu.vec_bytes == 64u && ctx->cpu.prefer_alt_widen_load != 0u) {
+                ctx->cc.vmovdqu32(d.ymm(), legalise_mem(ctx, mem, 32u));
+                ctx->cc.vpmovzxbw(d.zmm(), d.ymm());
+                return;
+            }
+#endif
             ctx->uc.emit_vm(ujit::UniOpVM::kLoadCvtN_U8ToU16, d, legalise_mem(ctx, mem, ctx->cpu.vec_bytes / 2u), ujit::Alignment(1));
             return;
         case ZJ_VLOAD_CVT_U8_TO_U32:
 #if defined(ASMJIT_UJIT_X86)
+            // AVX-512 split widening loads (prefer_alt_widen_load, Intel only): load into the low part
+            // of dst, then widen register to register. Granite Rapids silicon +3.3% on 8/16-bit kernels;
+            // on Zen 4 silicon it lost ~1% although llvm-mca models the memory form as 1.5 vs 1.0
+            // FP-pipe cycles there.
+            if (ctx->cpu.vec_bytes == 64u && ctx->cpu.prefer_alt_widen_load != 0u) {
+                ctx->cc.vmovdqu32(d.xmm(), legalise_mem(ctx, mem, 16u));
+                ctx->cc.vpmovzxbd(d.zmm(), d.xmm());
+                return;
+            }
             if (!ctx->cpu.has_sse4_1) {
                 // Work around upstream AsmJit 1.23.0 bug at uni_compiler_x86.cpp:5402
                 // where kLoadCvtN_U8ToU32 emits VEX `vmovd` on pre-SSE4.1 CPUs.
@@ -977,6 +1173,13 @@ void zj_vec_load(zj_ctx* ctx, zj_vec_load_t op, zj_reg_t dst, zj_mem_t mem) {
             ctx->uc.emit_vm(ujit::UniOpVM::kLoadCvtN_U8ToU32, d, legalise_mem(ctx, mem, ctx->cpu.vec_bytes / 4u), ujit::Alignment(1));
             return;
         case ZJ_VLOAD_CVT_U16_TO_U32:
+#if defined(ASMJIT_UJIT_X86)
+            if (ctx->cpu.vec_bytes == 64u && ctx->cpu.prefer_alt_widen_load != 0u) {
+                ctx->cc.vmovdqu32(d.ymm(), legalise_mem(ctx, mem, 32u));
+                ctx->cc.vpmovzxwd(d.zmm(), d.ymm());
+                return;
+            }
+#endif
             ctx->uc.emit_vm(ujit::UniOpVM::kLoadCvtN_U16ToU32, d, legalise_mem(ctx, mem, ctx->cpu.vec_bytes / 2u), ujit::Alignment(1));
             return;
         case ZJ_VLOAD_BROADCAST_U32:
@@ -1140,6 +1343,251 @@ void zj_vec_load_u_vecx2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem
     ctx->uc.v_loaduvec(unpack_vec(dst1), legalise_mem(ctx, m1, ctx->cpu.vec_bytes));
 }
 
+void zj_vec_load_u8_to_u32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ctx->cc.ldr(d0.d(), legalise_mem(ctx, mem, 8u));
+    ctx->cc.ushll(d0.h8(), d0.b8(), 0);
+    ctx->cc.ushll2(d1.s4(), d0.h8(), 0);
+    ctx->cc.ushll(d0.s4(), d0.h4(), 0);
+    return;
+#endif
+    zj_vec_load(ctx, ZJ_VLOAD_CVT_U8_TO_U32, dst0, mem);
+    zj_mem_t m1 = mem;
+    m1.disp += int32_t(ctx->cpu.f32_lanes);
+    zj_vec_load(ctx, ZJ_VLOAD_CVT_U8_TO_U32, dst1, m1);
+}
+
+void zj_vec_load_u16_to_u32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ctx->cc.ldr(d0.q(), legalise_mem(ctx, mem, 16u));
+    ctx->cc.ushll2(d1.s4(), d0.h8(), 0);
+    ctx->cc.ushll(d0.s4(), d0.h4(), 0);
+    return;
+#endif
+    zj_vec_load(ctx, ZJ_VLOAD_CVT_U16_TO_U32, dst0, mem);
+    zj_mem_t m1 = mem;
+    m1.disp += int32_t(ctx->cpu.f32_lanes * 2u);
+    zj_vec_load(ctx, ZJ_VLOAD_CVT_U16_TO_U32, dst1, m1);
+}
+
+void zj_vec_load_u8_to_u16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ctx->cc.ldr(d0.q(), legalise_mem(ctx, mem, 16u));
+    ctx->cc.ushll2(d1.h8(), d0.b16(), 0);
+    ctx->cc.ushll(d0.h8(), d0.b8(), 0);
+    return;
+#endif
+    zj_vec_load(ctx, ZJ_VLOAD_CVT_U8_TO_U16, dst0, mem);
+    zj_mem_t m1 = mem;
+    m1.disp += int32_t(ctx->cpu.vec_bytes / 2u);
+    zj_vec_load(ctx, ZJ_VLOAD_CVT_U8_TO_U16, dst1, m1);
+}
+
+#if defined(ASMJIT_UJIT_AARCH64)
+// Exact u8/u16 -> f32 without `ucvtf`: `zip` each u16 lane with a 0x4B00 high half, giving the
+// f32 bit pattern of 2^23 + u (exact for u < 2^23), then subtract 2^23 (exact; u = 0 gives +0.0
+// like `ucvtf`). Neoverse-N2 runs 4S `ucvtf` as 2 uops on V0 only and `ushll` on V1 only, while
+// `zip1`/`zip2`/`fsub` issue on both V pipes; Apple M1 executes the same op count.
+static ujit::Vec neon_f32_magic_hi(zj_ctx* ctx) noexcept {
+    uint8_t raw[16];
+    for (uint32_t i = 0; i < 16u; i += 2u) {
+        raw[i] = 0x00u;
+        raw[i + 1u] = 0x4Bu;
+    }
+    return unpack_vec(intern_const_vec(ctx, raw, 16u));
+}
+
+static ujit::Vec neon_f32_magic_bias(zj_ctx* ctx) noexcept {
+    return unpack_vec(zj_const_f32_splat(ctx, 8388608.0f));
+}
+#endif
+
+void zj_vec_load_uint_to_f32(zj_ctx* ctx, zj_reg_t dst, zj_mem_t mem, uint32_t bytes_per_sample) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    {
+        ujit::Vec d = unpack_vec(dst);
+        ujit::Vec hi = neon_f32_magic_hi(ctx);
+        if (bytes_per_sample == 1u) {
+            ctx->cc.ldr(d.s(), legalise_mem(ctx, mem, 4u));
+            ujit::Vec zero = unpack_vec(zj_vec_zero(ctx));
+            ctx->cc.zip1(d.b16(), d.b16(), zero.b16());
+        } else {
+            ctx->cc.ldr(d.d(), legalise_mem(ctx, mem, 8u));
+        }
+        ctx->cc.zip1(d.h8(), d.h8(), hi.h8());
+        ctx->cc.fsub(d.s4(), d.s4(), neon_f32_magic_bias(ctx).s4());
+        return;
+    }
+#endif
+    zj_vec_load(ctx, bytes_per_sample == 1u ? ZJ_VLOAD_CVT_U8_TO_U32 : ZJ_VLOAD_CVT_U16_TO_U32, dst, mem);
+    ctx->uc.emit_2v(ujit::UniOpVV::kCvtI32ToF32, unpack_vec(dst), unpack_vec(dst));
+}
+
+void zj_vec_load_uint_to_f32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem, uint32_t bytes_per_sample) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    {
+        ujit::Vec d0 = unpack_vec(dst0);
+        ujit::Vec d1 = unpack_vec(dst1);
+        ujit::Vec hi = neon_f32_magic_hi(ctx);
+        if (bytes_per_sample == 1u) {
+            ctx->cc.ldr(d0.d(), legalise_mem(ctx, mem, 8u));
+            ujit::Vec zero = unpack_vec(zj_vec_zero(ctx));
+            ctx->cc.zip1(d0.b16(), d0.b16(), zero.b16());
+        } else {
+            ctx->cc.ldr(d0.q(), legalise_mem(ctx, mem, 16u));
+        }
+        ctx->cc.zip2(d1.h8(), d0.h8(), hi.h8());
+        ctx->cc.zip1(d0.h8(), d0.h8(), hi.h8());
+        ujit::Vec bias = neon_f32_magic_bias(ctx);
+        ctx->cc.fsub(d0.s4(), d0.s4(), bias.s4());
+        ctx->cc.fsub(d1.s4(), d1.s4(), bias.s4());
+        return;
+    }
+#endif
+    if (bytes_per_sample == 1u) {
+        zj_vec_load_u8_to_u32x2(ctx, dst0, dst1, mem);
+    } else {
+        zj_vec_load_u16_to_u32x2(ctx, dst0, dst1, mem);
+    }
+    ctx->uc.emit_2v(ujit::UniOpVV::kCvtI32ToF32, unpack_vec(dst0), unpack_vec(dst0));
+    ctx->uc.emit_2v(ujit::UniOpVV::kCvtI32ToF32, unpack_vec(dst1), unpack_vec(dst1));
+}
+
+void zj_vec_uaddl_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u8, zj_reg_t src_b_u8) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a = unpack_vec(src_a_u8);
+    ujit::Vec b = unpack_vec(src_b_u8);
+    ctx->cc.uaddl(d0.h8(), a.b8(), b.b8());
+    ctx->cc.uaddl2(d1.h8(), a.b16(), b.b16());
+#else
+    (void)dst0; (void)dst1; (void)src_a_u8; (void)src_b_u8;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
+void zj_vec_usubl_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u8, zj_reg_t src_b_u8) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a = unpack_vec(src_a_u8);
+    ujit::Vec b = unpack_vec(src_b_u8);
+    ctx->cc.usubl(d0.h8(), a.b8(), b.b8());
+    ctx->cc.usubl2(d1.h8(), a.b16(), b.b16());
+#else
+    (void)dst0; (void)dst1; (void)src_a_u8; (void)src_b_u8;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
+void zj_vec_uaddw_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i16, zj_reg_t acc1_i16, zj_reg_t src_u8) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a0 = unpack_vec(acc0_i16);
+    ujit::Vec a1 = unpack_vec(acc1_i16);
+    ujit::Vec b = unpack_vec(src_u8);
+    ctx->cc.uaddw(d0.h8(), a0.h8(), b.b8());
+    ctx->cc.uaddw2(d1.h8(), a1.h8(), b.b16());
+#else
+    (void)dst0; (void)dst1; (void)acc0_i16; (void)acc1_i16; (void)src_u8;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
+void zj_vec_usubw_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i16, zj_reg_t acc1_i16, zj_reg_t src_u8) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a0 = unpack_vec(acc0_i16);
+    ujit::Vec a1 = unpack_vec(acc1_i16);
+    ujit::Vec b = unpack_vec(src_u8);
+    ctx->cc.usubw(d0.h8(), a0.h8(), b.b8());
+    ctx->cc.usubw2(d1.h8(), a1.h8(), b.b16());
+#else
+    (void)dst0; (void)dst1; (void)acc0_i16; (void)acc1_i16; (void)src_u8;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
+void zj_vec_uaddl_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u16, zj_reg_t src_b_u16) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a = unpack_vec(src_a_u16);
+    ujit::Vec b = unpack_vec(src_b_u16);
+    ctx->cc.uaddl(d0.s4(), a.h4(), b.h4());
+    ctx->cc.uaddl2(d1.s4(), a.h8(), b.h8());
+#else
+    (void)dst0; (void)dst1; (void)src_a_u16; (void)src_b_u16;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
+void zj_vec_usubl_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u16, zj_reg_t src_b_u16) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a = unpack_vec(src_a_u16);
+    ujit::Vec b = unpack_vec(src_b_u16);
+    ctx->cc.usubl(d0.s4(), a.h4(), b.h4());
+    ctx->cc.usubl2(d1.s4(), a.h8(), b.h8());
+#else
+    (void)dst0; (void)dst1; (void)src_a_u16; (void)src_b_u16;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
+void zj_vec_uaddw_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i32, zj_reg_t acc1_i32, zj_reg_t src_u16) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a0 = unpack_vec(acc0_i32);
+    ujit::Vec a1 = unpack_vec(acc1_i32);
+    ujit::Vec b = unpack_vec(src_u16);
+    ctx->cc.uaddw(d0.s4(), a0.s4(), b.h4());
+    ctx->cc.uaddw2(d1.s4(), a1.s4(), b.h8());
+#else
+    (void)dst0; (void)dst1; (void)acc0_i32; (void)acc1_i32; (void)src_u16;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
+void zj_vec_usubw_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i32, zj_reg_t acc1_i32, zj_reg_t src_u16) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_AARCH64)
+    ujit::Vec d0 = unpack_vec(dst0);
+    ujit::Vec d1 = unpack_vec(dst1);
+    ujit::Vec a0 = unpack_vec(acc0_i32);
+    ujit::Vec a1 = unpack_vec(acc1_i32);
+    ujit::Vec b = unpack_vec(src_u16);
+    ctx->cc.usubw(d0.s4(), a0.s4(), b.h4());
+    ctx->cc.usubw2(d1.s4(), a1.s4(), b.h8());
+#else
+    (void)dst0; (void)dst1; (void)acc0_i32; (void)acc1_i32; (void)src_u16;
+    set_shim_error(ctx, aj::Error::kFeatureNotEnabled, "NEON widening op on non-AArch64");
+#endif
+}
+
 void zj_vec_store_u_vecx2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0, zj_reg_t src1) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_AARCH64)
@@ -1154,6 +1602,28 @@ void zj_vec_store_u_vecx2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0, zj_reg_t src
     ctx->uc.v_storeuvec(legalise_mem(ctx, m1, ctx->cpu.vec_bytes), unpack_vec(src1));
 }
 
+#if defined(ASMJIT_UJIT_X86)
+static void emit_x86_zmm_pack_permq_store(zj_ctx* ctx, ujit::Mem m, ujit::Vec s0, ujit::Vec s1, bool i16_to_u8) noexcept {
+    // vpackuswb/vpackusdw pack each 128-bit lane as [s0_lane, s1_lane] -> qwords [s0_0, s1_0, s0_1, s1_1, ...].
+    // Permute qwords [0,2,4,6,1,3,5,7] and store 64B in one vmovdqu64 (3x faster than 2x vpmovus* [mem] on Zen 4/5).
+    static constexpr uint64_t kPermIdx[8] = { 0u, 2u, 4u, 6u, 1u, 3u, 5u, 7u };
+    // vpermt2q, not vpermq: AsmJit's operand info for vpermq merges its imm8 form (where operand 1
+    // is r/m), so when RA spilled the hoisted index under pressure it folded the stack slot into the
+    // register-only index slot (`vpermq zmm, [rsp+N], zmm` -> InvalidInstruction, e.g.
+    // `x exp 0.5 * x log 0.25 * +` to u16). vpermt2q has a single form, so RA reloads a spilled
+    // index instead. Indices < 8 select from the first table (t) only.
+    ujit::Vec idx = unpack_vec(intern_const_vec(ctx, reinterpret_cast<const uint8_t*>(kPermIdx), 64u));
+    ujit::Vec t = ctx->uc.new_vec();
+    if (i16_to_u8) {
+        ctx->cc.vpackuswb(t.zmm(), s0.zmm(), s1.zmm());
+    } else {
+        ctx->cc.vpackusdw(t.zmm(), s0.zmm(), s1.zmm());
+    }
+    ctx->cc.vpermt2q(t.zmm(), idx.zmm(), t.zmm());
+    ctx->cc.vmovdqu64(m, t.zmm());
+}
+#endif
+
 void zj_vec_store_u8_from_i32(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i32) {
     if (!ctx_ok(ctx)) return;
     ujit::Vec s = unpack_vec(src_i32);
@@ -1162,7 +1632,10 @@ void zj_vec_store_u8_from_i32(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i32) {
 #if defined(ASMJIT_UJIT_X86)
     if (ctx->cpu.vec_bytes == 64u) {
         // Caller clamped src_i32 to [0, peak] before converting to i32.
-        ctx->cc.vpmovusdb(m, s.zmm());
+        // Reg-dest vpmovusdb + EVEX vmovdqu32 avoids slow Zen 4/5 memory-dest narrowing store (-33% rtp).
+        ujit::Vec t = ctx->uc.new_vec();
+        ctx->cc.vpmovusdb(t.xmm(), s.zmm());
+        ctx->cc.vmovdqu32(m, t.xmm());
     } else if (ctx->cpu.vec_bytes == 32u) {
         ujit::Vec t = ctx->uc.new_vec();
         ctx->cc.vpackssdw(t.ymm(), s.ymm(), s.ymm());
@@ -1192,10 +1665,14 @@ void zj_vec_store_u8_from_i32x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0_i32, zj
     ujit::Mem m = legalise_mem(ctx, mem, store_bytes);
 #if defined(ASMJIT_UJIT_X86)
     if (ctx->cpu.vec_bytes == 64u) {
-        ctx->cc.vpmovusdb(m, s0.zmm());
+        ujit::Vec t0 = ctx->uc.new_vec();
+        ujit::Vec t1 = ctx->uc.new_vec();
+        ctx->cc.vpmovusdb(t0.xmm(), s0.zmm());
+        ctx->cc.vmovdqu32(legalise_mem(ctx, mem, 16u), t0.xmm());
         zj_mem_t m1 = mem;
         m1.disp += 16;
-        ctx->cc.vpmovusdb(legalise_mem(ctx, m1, 16u), s1.zmm());
+        ctx->cc.vpmovusdb(t1.xmm(), s1.zmm());
+        ctx->cc.vmovdqu32(legalise_mem(ctx, m1, 16u), t1.xmm());
     } else if (ctx->cpu.vec_bytes == 32u) {
         ujit::Vec t = ctx->uc.new_vec();
         ctx->cc.vpackssdw(t.ymm(), s0.ymm(), s1.ymm());
@@ -1228,7 +1705,8 @@ void zj_vec_store_u8_from_i16(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i16) {
     if (ctx->cpu.vec_bytes == 64u) {
         ujit::Vec t = ctx->uc.new_vec();
         ctx->uc.emit_3v(ujit::UniOpVVV::kMaxI16, t, s, unpack_vec(zj_vec_zero(ctx)));
-        ctx->cc.vpmovuswb(m, t.zmm());
+        ctx->cc.vpmovuswb(t.ymm(), t.zmm());
+        ctx->cc.vmovdqu32(m, t.ymm());
     } else if (ctx->cpu.vec_bytes == 32u) {
         ujit::Vec t = ctx->uc.new_vec();
         ctx->cc.vpackuswb(t.ymm(), s.ymm(), s.ymm());
@@ -1254,15 +1732,7 @@ void zj_vec_store_u8_from_i16x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0_i16, zj
     ujit::Mem m = legalise_mem(ctx, mem, store_bytes);
 #if defined(ASMJIT_UJIT_X86)
     if (ctx->cpu.vec_bytes == 64u) {
-        ujit::Vec zero = unpack_vec(zj_vec_zero(ctx));
-        ujit::Vec t0 = ctx->uc.new_vec();
-        ujit::Vec t1 = ctx->uc.new_vec();
-        ctx->uc.emit_3v(ujit::UniOpVVV::kMaxI16, t0, s0, zero);
-        ctx->uc.emit_3v(ujit::UniOpVVV::kMaxI16, t1, s1, zero);
-        ctx->cc.vpmovuswb(m, t0.zmm());
-        zj_mem_t m1 = mem;
-        m1.disp += 32;
-        ctx->cc.vpmovuswb(legalise_mem(ctx, m1, 32u), t1.zmm());
+        emit_x86_zmm_pack_permq_store(ctx, m, s0, s1, true);
     } else if (ctx->cpu.vec_bytes == 32u) {
         ujit::Vec t = ctx->uc.new_vec();
         ctx->cc.vpackuswb(t.ymm(), s0.ymm(), s1.ymm());
@@ -1288,7 +1758,9 @@ void zj_vec_store_u16_from_i32(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i32) {
 #if defined(ASMJIT_UJIT_X86)
     if (ctx->cpu.vec_bytes == 64u) {
         // Caller clamped src_i32 to [0, peak] before converting to i32.
-        ctx->cc.vpmovusdw(m, s.zmm());
+        ujit::Vec t = ctx->uc.new_vec();
+        ctx->cc.vpmovusdw(t.ymm(), s.zmm());
+        ctx->cc.vmovdqu32(m, t.ymm());
     } else if (ctx->cpu.vec_bytes == 32u) {
         ujit::Vec t = ctx->uc.new_vec();
         ctx->cc.vpackusdw(t.ymm(), s.ymm(), s.ymm());
@@ -1314,10 +1786,7 @@ void zj_vec_store_u16_from_i32x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0_i32, z
     ujit::Mem m = legalise_mem(ctx, mem, store_bytes);
 #if defined(ASMJIT_UJIT_X86)
     if (ctx->cpu.vec_bytes == 64u) {
-        ctx->cc.vpmovusdw(m, s0.zmm());
-        zj_mem_t m1 = mem;
-        m1.disp += 32;
-        ctx->cc.vpmovusdw(legalise_mem(ctx, m1, 32u), s1.zmm());
+        emit_x86_zmm_pack_permq_store(ctx, m, s0, s1, false);
     } else if (ctx->cpu.vec_bytes == 32u) {
         ujit::Vec t = ctx->uc.new_vec();
         ctx->cc.vpackusdw(t.ymm(), s0.ymm(), s1.ymm());
@@ -1355,33 +1824,25 @@ void zj_vec_lut_u8_256(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t idx_reg, const ui
     ujit::Vec idx = unpack_vec(idx_reg);
 #if defined(ASMJIT_UJIT_X86)
     if (ctx->cpu.vec_bytes == 64u && aj::CpuInfo::host().features().x86().has_avx512_vbmi()) {
-        // AVX-512 VBMI: 4 x vpermb (64 bytes/lookup) + 3 masked moves = 64 pixels per vector!
+        // AVX-512 VBMI: 2x vpermi2b (128 bytes/lookup each) + 1 masked move = 64 pixels per vector (2x faster than 4x vpermb).
         ujit::Vec t0 = unpack_vec(intern_const_vec(ctx, table_256 + 0, 64u));
         ujit::Vec t1 = unpack_vec(intern_const_vec(ctx, table_256 + 64, 64u));
         ujit::Vec t2 = unpack_vec(intern_const_vec(ctx, table_256 + 128, 64u));
         ujit::Vec t3 = unpack_vec(intern_const_vec(ctx, table_256 + 192, 64u));
-        uint8_t b64[64], b128[64];
-        std::memset(b64, 0x40, 64);
+        uint8_t b128[64];
         std::memset(b128, 0x80, 64);
-        ujit::Vec c64 = unpack_vec(intern_const_vec(ctx, b64, 64u));
         ujit::Vec c128 = unpack_vec(intern_const_vec(ctx, b128, 64u));
 
-        aj::x86::KReg k1 = ctx->cc.new_kq();
-        aj::x86::KReg k2 = ctx->cc.new_kq();
-        ctx->cc.vptestmb(k1, idx.zmm(), c64.zmm());
-        ctx->cc.vptestmb(k2, idx.zmm(), c128.zmm());
+        aj::x86::KReg k = ctx->cc.new_kq();
+        ctx->cc.vptestmb(k, idx.zmm(), c128.zmm());
 
         ujit::Vec r0 = ctx->uc.new_vec();
         ujit::Vec r1 = ctx->uc.new_vec();
-        ujit::Vec r2 = ctx->uc.new_vec();
-        ujit::Vec r3 = ctx->uc.new_vec();
-        ctx->cc.vpermb(r0.zmm(), idx.zmm(), t0.zmm());
-        ctx->cc.vpermb(r1.zmm(), idx.zmm(), t1.zmm());
-        ctx->cc.vpermb(r2.zmm(), idx.zmm(), t2.zmm());
-        ctx->cc.vpermb(r3.zmm(), idx.zmm(), t3.zmm());
-        ctx->cc.k(k1).vmovdqu8(r0.zmm(), r1.zmm());
-        ctx->cc.k(k1).vmovdqu8(r2.zmm(), r3.zmm());
-        ctx->cc.k(k2).vmovdqu8(r0.zmm(), r2.zmm());
+        ctx->cc.vmovdqa64(r0.zmm(), idx.zmm());
+        ctx->cc.vpermi2b(r0.zmm(), t0.zmm(), t1.zmm());
+        ctx->cc.vmovdqa64(r1.zmm(), idx.zmm());
+        ctx->cc.vpermi2b(r1.zmm(), t2.zmm(), t3.zmm());
+        ctx->cc.k(k).vmovdqu8(r0.zmm(), r1.zmm());
         ctx->uc.emit_2v(ujit::UniOpVV::kMov, dst, r0);
         return;
     }
@@ -1395,12 +1856,7 @@ void zj_vec_lut_u8_256(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t idx_reg, const ui
     }
     ujit::Mem chunk_mems[16];
     for (uint32_t c = 0; c < 16u; ++c) {
-        uint8_t chunk_buf[32]{};
-        std::memcpy(chunk_buf, table_256 + c * 16u, 16u);
-        if (vb == 32u) {
-            std::memcpy(chunk_buf + 16u, table_256 + c * 16u, 16u);
-        }
-        chunk_mems[c] = ctx->cc.new_const(aj::ConstPoolScope::kLocal, chunk_buf, vb);
+        chunk_mems[c] = ctx->cc.new_const(aj::ConstPoolScope::kLocal, table_256 + c * 16u, 16u);
     }
 
     uint8_t m0f_raw[32];
@@ -1418,7 +1874,11 @@ void zj_vec_lut_u8_256(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t idx_reg, const ui
 
     auto load_shuf = [&](uint32_t c) -> ujit::Vec {
         ujit::Vec v = ctx->uc.new_vec();
-        ctx->uc.v_loadavec(v, chunk_mems[c]);
+        if (vb == 32u) {
+            ctx->cc.vbroadcasti128(v.ymm(), chunk_mems[c]);
+        } else {
+            ctx->uc.v_loadavec(v, chunk_mems[c]);
+        }
         ctx->uc.emit_3v(ujit::UniOpVVV::kSwizzlev_U8, v, v, lo);
         return v;
     };
@@ -1478,6 +1938,12 @@ void zj_vec_lut_u8_256(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t idx_reg, const ui
 }
 
 static ujit::Mem make_f32_const_mem(zj_ctx* ctx, float val) noexcept {
+#if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.vec_bytes == 64u) {
+        return ctx->cc.new_const(aj::ConstPoolScope::kLocal, &val, 4u)
+            .clone_broadcasted(aj::x86::Mem::Broadcast::k1To16);
+    }
+#endif
     uint8_t raw[64]{};
     const uint32_t lanes = ctx->cpu.f32_lanes;
     for (uint32_t i = 0; i < lanes; ++i) {
@@ -1579,7 +2045,7 @@ void zj_vec_max_c_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, float b_con
 void zj_vec_cmp_c_f32(zj_ctx* ctx, zj_vec_op3_t cmp_op, zj_reg_t dst_reg, zj_reg_t a_reg, float b_const) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_X86)
-    if (ctx->cpu.vec_bytes == 32u) {
+    if (ctx->cpu.vec_bytes >= 32u) {
         uint8_t imm = 0u;
         bool valid = true;
         switch (cmp_op) {
@@ -1595,7 +2061,13 @@ void zj_vec_cmp_c_f32(zj_ctx* ctx, zj_vec_op3_t cmp_op, zj_reg_t dst_reg, zj_reg
             ujit::Vec d = unpack_vec(dst_reg);
             ujit::Vec a = unpack_vec(a_reg);
             ujit::Mem m = make_f32_const_mem(ctx, b_const);
-            ctx->cc.vcmpps(d.ymm(), a.ymm(), m, imm);
+            if (ctx->cpu.vec_bytes == 64u) {
+                aj::x86::KReg k = ctx->cc.new_kw();
+                ctx->cc.vcmpps(k, a.zmm(), m, imm);
+                ctx->cc.vpmovm2d(d.zmm(), k);
+            } else {
+                ctx->cc.vcmpps(d.ymm(), a.ymm(), m, imm);
+            }
             return;
         }
     }
@@ -1613,16 +2085,14 @@ void zj_vec_fma_ac_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, float b_co
         ujit::Mem mb = make_f32_const_mem(ctx, b_const);
         // dst = a * [mb] + c. Guard dst == a && dst != c before copying c into acc.
         ujit::Vec acc = (d.id() == a.id() && d.id() != c.id()) ? ctx->uc.new_vec() : d;
-        if (acc.id() != c.id()) {
-            ctx->uc.emit_2v(ujit::UniOpVV::kMov, acc, c);
-        }
         if (ctx->cpu.vec_bytes == 64u) {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.zmm(), c.zmm());
             ctx->cc.vfmadd231ps(acc.zmm(), a.zmm(), mb);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.zmm(), acc.zmm());
         } else {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.ymm(), c.ymm());
             ctx->cc.vfmadd231ps(acc.ymm(), a.ymm(), mb);
-        }
-        if (acc.id() != d.id()) {
-            ctx->uc.emit_2v(ujit::UniOpVV::kMov, d, acc);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.ymm(), acc.ymm());
         }
         return;
     }
@@ -1633,10 +2103,17 @@ void zj_vec_fma_ac_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, float b_co
 void zj_vec_blendv_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t false_val, zj_reg_t true_val, zj_reg_t mask_reg) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.vec_bytes == 64u) {
+        emit_x86_ternlog_blend(ctx, unpack_vec(dst_reg), unpack_vec(false_val), unpack_vec(true_val), unpack_vec(mask_reg));
+        return;
+    }
     if (ctx->cpu.vec_bytes == 32u) {
         ctx->cc.vblendvps(unpack_vec(dst_reg).ymm(), unpack_vec(false_val).ymm(), unpack_vec(true_val).ymm(), unpack_vec(mask_reg).ymm());
         return;
     }
+#elif defined(ASMJIT_UJIT_AARCH64)
+    emit_a64_bsl_blend(ctx, unpack_vec(dst_reg), unpack_vec(false_val), unpack_vec(true_val), unpack_vec(mask_reg));
+    return;
 #endif
     ctx->uc.emit_4v(ujit::UniOpVVVV::kBlendV_U8, unpack_vec(dst_reg), unpack_vec(false_val), unpack_vec(true_val), unpack_vec(mask_reg));
 }
@@ -1644,6 +2121,10 @@ void zj_vec_blendv_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t false_val, zj_reg
 void zj_vec_and_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, zj_reg_t b_reg) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.vec_bytes == 64u) {
+        ctx->cc.vandps(unpack_vec(dst_reg).zmm(), unpack_vec(a_reg).zmm(), unpack_vec(b_reg).zmm());
+        return;
+    }
     if (ctx->cpu.vec_bytes == 32u) {
         ctx->cc.vandps(unpack_vec(dst_reg).ymm(), unpack_vec(a_reg).ymm(), unpack_vec(b_reg).ymm());
         return;
@@ -1655,6 +2136,10 @@ void zj_vec_and_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, zj_reg_t b_re
 void zj_vec_andn_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t mask_not, zj_reg_t b_reg) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.vec_bytes == 64u) {
+        ctx->cc.vandnps(unpack_vec(dst_reg).zmm(), unpack_vec(mask_not).zmm(), unpack_vec(b_reg).zmm());
+        return;
+    }
     if (ctx->cpu.vec_bytes == 32u) {
         ctx->cc.vandnps(unpack_vec(dst_reg).ymm(), unpack_vec(mask_not).ymm(), unpack_vec(b_reg).ymm());
         return;
@@ -1678,7 +2163,11 @@ void zj_vec_fma_bc_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, zj_reg_t b
             // Commutative: a * b == b * a, so keep d (= b) as acc and use a as rhs!
             rhs = a;
         } else if (d.id() != a.id()) {
-            ctx->uc.emit_2v(ujit::UniOpVV::kMov, acc, a);
+            if (ctx->cpu.vec_bytes == 64u) {
+                ctx->cc.vmovaps(acc.zmm(), a.zmm());
+            } else {
+                ctx->cc.vmovaps(acc.ymm(), a.ymm());
+            }
         }
         if (ctx->cpu.vec_bytes == 64u) {
             ctx->cc.vfmadd213ps(acc.zmm(), rhs.zmm(), mc);
@@ -1697,18 +2186,20 @@ void zj_vec_fma_cc_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, float b_co
     if (ctx->cpu.has_fma && ctx->cpu.vec_bytes >= 32u) {
         ujit::Vec d = unpack_vec(dst_reg);
         ujit::Vec a = unpack_vec(a_reg);
-        ujit::Mem mb = make_f32_const_mem(ctx, b_const);
         ujit::Mem mc = make_f32_const_mem(ctx, c_const);
         // L1: guard dst == a before loading [mb] into acc.
         ujit::Vec acc = (d.id() == a.id()) ? ctx->uc.new_vec() : d;
-        ctx->uc.v_loadavec(acc, mb);
         if (ctx->cpu.vec_bytes == 64u) {
+            // Hoist b_const once in prologue (4B const pool, 0-cycle vmovaps rename, avoids in-loop Zn4FP1 vbroadcastss).
+            ujit::Vec bv = unpack_vec(zj_const_f32_splat(ctx, b_const));
+            ctx->cc.vmovaps(acc.zmm(), bv.zmm());
             ctx->cc.vfmadd213ps(acc.zmm(), a.zmm(), mc);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.zmm(), acc.zmm());
         } else {
+            ujit::Mem mb = make_f32_const_mem(ctx, b_const);
+            ctx->uc.v_loadavec(acc, mb);
             ctx->cc.vfmadd213ps(acc.ymm(), a.ymm(), mc);
-        }
-        if (acc.id() != d.id()) {
-            ctx->uc.emit_2v(ujit::UniOpVV::kMov, d, acc);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.ymm(), acc.ymm());
         }
         return;
     }
@@ -1732,16 +2223,14 @@ void zj_vec_fnma_bc_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, float b_c
         ujit::Mem mb = make_f32_const_mem(ctx, b_const);
         // L1: dst = c - a * [mb]. Guard dst == a && dst != c before copying c into acc.
         ujit::Vec acc = (d.id() == a.id() && d.id() != c.id()) ? ctx->uc.new_vec() : d;
-        if (acc.id() != c.id()) {
-            ctx->uc.emit_2v(ujit::UniOpVV::kMov, acc, c);
-        }
         if (ctx->cpu.vec_bytes == 64u) {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.zmm(), c.zmm());
             ctx->cc.vfnmadd231ps(acc.zmm(), a.zmm(), mb);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.zmm(), acc.zmm());
         } else {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.ymm(), c.ymm());
             ctx->cc.vfnmadd231ps(acc.ymm(), a.ymm(), mb);
-        }
-        if (acc.id() != d.id()) {
-            ctx->uc.emit_2v(ujit::UniOpVV::kMov, d, acc);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.ymm(), acc.ymm());
         }
         return;
     }
@@ -1753,6 +2242,59 @@ void zj_vec_fnma_bc_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, float b_c
         return;
     }
     ctx->uc.emit_4v(ujit::UniOpVVVV::kNMAddF32, unpack_vec(dst_reg), unpack_vec(a_reg), unpack_vec(zj_const_f32_splat(ctx, b_const)), unpack_vec(c_reg));
+}
+
+void zj_vec_fma_mem_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, zj_mem_t mem, zj_reg_t c_reg) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.has_fma && ctx->cpu.vec_bytes >= 32u) {
+        ujit::Vec d = unpack_vec(dst_reg);
+        ujit::Vec a = unpack_vec(a_reg);
+        ujit::Vec c = unpack_vec(c_reg);
+        ujit::Mem m = legalise_mem(ctx, mem, ctx->cpu.vec_bytes);
+        // dst = a * [m] + c. Guard dst == a && dst != c before copying c into acc.
+        ujit::Vec acc = (d.id() == a.id() && d.id() != c.id()) ? ctx->uc.new_vec() : d;
+        if (ctx->cpu.vec_bytes == 64u) {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.zmm(), c.zmm());
+            ctx->cc.vfmadd231ps(acc.zmm(), a.zmm(), m);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.zmm(), acc.zmm());
+        } else {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.ymm(), c.ymm());
+            ctx->cc.vfmadd231ps(acc.ymm(), a.ymm(), m);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.ymm(), acc.ymm());
+        }
+        return;
+    }
+#endif
+    ujit::Vec tmp = ctx->uc.new_vec();
+    ctx->uc.v_loaduvec(tmp, legalise_mem(ctx, mem, ctx->cpu.vec_bytes));
+    ctx->uc.emit_4v(ujit::UniOpVVVV::kMAddF32, unpack_vec(dst_reg), unpack_vec(a_reg), tmp, unpack_vec(c_reg));
+}
+
+void zj_vec_fnma_mem_f32(zj_ctx* ctx, zj_reg_t dst_reg, zj_reg_t a_reg, zj_mem_t mem, zj_reg_t c_reg) {
+    if (!ctx_ok(ctx)) return;
+#if defined(ASMJIT_UJIT_X86)
+    if (ctx->cpu.has_fma && ctx->cpu.vec_bytes >= 32u) {
+        ujit::Vec d = unpack_vec(dst_reg);
+        ujit::Vec a = unpack_vec(a_reg);
+        ujit::Vec c = unpack_vec(c_reg);
+        ujit::Mem m = legalise_mem(ctx, mem, ctx->cpu.vec_bytes);
+        ujit::Vec acc = (d.id() == a.id() && d.id() != c.id()) ? ctx->uc.new_vec() : d;
+        if (ctx->cpu.vec_bytes == 64u) {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.zmm(), c.zmm());
+            ctx->cc.vfnmadd231ps(acc.zmm(), a.zmm(), m);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.zmm(), acc.zmm());
+        } else {
+            if (acc.id() != c.id()) ctx->cc.vmovaps(acc.ymm(), c.ymm());
+            ctx->cc.vfnmadd231ps(acc.ymm(), a.ymm(), m);
+            if (acc.id() != d.id()) ctx->cc.vmovaps(d.ymm(), acc.ymm());
+        }
+        return;
+    }
+#endif
+    ujit::Vec tmp = ctx->uc.new_vec();
+    ctx->uc.v_loaduvec(tmp, legalise_mem(ctx, mem, ctx->cpu.vec_bytes));
+    zj_vec_op4(ctx, ZJ_V4_NMADD_F32, dst_reg, a_reg, pack_reg(tmp), c_reg);
 }
 
 void zj_vec_permute_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t src, const uint32_t* lane_indices, uint32_t lane_count) {
@@ -1779,7 +2321,12 @@ void zj_vec_permute_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t src, const uint32_t*
         const uint32_t v = lane_indices[i];
         std::memcpy(idx_bytes + i * 4u, &v, 4u);
     }
-    ujit::Vec idx = unpack_vec(intern_const_vec(ctx, idx_bytes, ctx->cpu.vec_bytes));
+    // Load shuffle indices locally instead of hoisting into _func_init_hook:
+    // permute is only used on cold left/right edge peels, so hoisting it would
+    // keep cold index vectors live across the hot interior loop and cause spills.
+    ujit::Mem idx_mem = ctx->cc.new_const(aj::ConstPoolScope::kLocal, idx_bytes, ctx->cpu.vec_bytes);
+    ujit::Vec idx = ctx->uc.new_vec();
+    ctx->uc.v_loadavec(idx, idx_mem);
     if (lane_count == 8u) {
         ctx->cc.vpermps(d.ymm(), idx.ymm(), s.ymm());
     } else if (lane_count == 16u) {
@@ -1825,14 +2372,12 @@ static void emit_scalar_gather_impl(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg
 }
 
 #if defined(ASMJIT_UJIT_X86)
-static void emit_avx2_reg_gather_impl(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg, zj_reg_t offsets_reg, uint32_t elem_bytes, bool is_f16) noexcept {
-    // Register-only 8-lane gather on AVX2: 4x 64-bit extracts (vmovq/vpextrq), 0 stack spills, 0 STL stalls.
+static void emit_x86_reg_gather_impl(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg, zj_reg_t offsets_reg, uint32_t elem_bytes, bool is_f16) noexcept {
+    // Register-only 8-lane (AVX2) / 16-lane (AVX-512) gather: 64-bit extracts (vmovq/vpextrq), 0 stack spills, 0 STL stalls.
+    const bool is_zmm = (ctx->cpu.vec_bytes == 64u);
     ujit::Gp base = unpack_gp(base_reg);
     ujit::Vec off = unpack_vec(offsets_reg);
     ujit::Vec d = unpack_vec(dst);
-
-    ujit::Vec hi_off = ctx->uc.new_vec();
-    ctx->cc.vextracti128(hi_off.xmm(), off.ymm(), 1);
 
     ujit::Gp p01 = ctx->uc.new_gp64();
     ujit::Gp p23 = ctx->uc.new_gp64();
@@ -1840,10 +2385,7 @@ static void emit_avx2_reg_gather_impl(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_r
     ujit::Gp i2 = ctx->uc.new_gp64();
     ujit::Gp tmp = ctx->uc.new_gp32();
 
-    ujit::Vec lo_v = ctx->uc.new_vec();
-    ujit::Vec hi_v = ctx->uc.new_vec();
-
-    auto emit_half = [&](const ujit::Vec& off_x, const ujit::Vec& out_x) {
+    auto emit_quarter = [&](const ujit::Vec& off_x, const ujit::Vec& out_x) {
         ctx->cc.vmovq(p01, off_x);
         ctx->cc.vpextrq(p23, off_x, 1);
         ctx->cc.mov(i0.r32(), p01.r32());
@@ -1871,21 +2413,114 @@ static void emit_avx2_reg_gather_impl(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_r
         }
     };
 
-    emit_half(off.xmm(), lo_v.xmm());
-    emit_half(hi_off.xmm(), hi_v.xmm());
+    if (!is_zmm) {
+        ujit::Vec hi_off = ctx->uc.new_vec();
+        ctx->cc.vextracti128(hi_off.xmm(), off.ymm(), 1);
+        ujit::Vec lo_v = ctx->uc.new_vec();
+        ujit::Vec hi_v = ctx->uc.new_vec();
+        emit_quarter(off.xmm(), lo_v.xmm());
+        emit_quarter(hi_off.xmm(), hi_v.xmm());
 
-    if (elem_bytes == 4u) {
-        ctx->cc.vinsertf128(d.ymm(), lo_v.ymm(), hi_v.xmm(), 1);
-    } else if (elem_bytes == 2u) {
-        ctx->cc.vpunpcklqdq(lo_v.xmm(), lo_v.xmm(), hi_v.xmm());
-        if (is_f16) {
-            ctx->cc.vcvtph2ps(d.ymm(), lo_v.xmm());
+        if (elem_bytes == 4u) {
+            ctx->cc.vinsertf128(d.ymm(), lo_v.ymm(), hi_v.xmm(), 1);
+        } else if (elem_bytes == 2u) {
+            ctx->cc.vpunpcklqdq(lo_v.xmm(), lo_v.xmm(), hi_v.xmm());
+            if (is_f16) ctx->cc.vcvtph2ps(d.ymm(), lo_v.xmm());
+            else ctx->cc.vpmovzxwd(d.ymm(), lo_v.xmm());
         } else {
-            ctx->cc.vpmovzxwd(d.ymm(), lo_v.xmm());
+            ctx->cc.vpunpckldq(lo_v.xmm(), lo_v.xmm(), hi_v.xmm());
+            ctx->cc.vpmovzxbd(d.ymm(), lo_v.xmm());
         }
+        return;
+    }
+
+    // AVX-512 16-lane register gather: 4 quarters via EVEX vextracti32x4.
+    // For u8/u16/f16, pack 4 lanes in GPRs before vmovd/vpinsrd or vmovq/vpinsrq
+    // (cuts Zn4FP45 GPR->FP transfers 4x: 2.2x faster on Zen 4/5 with 0 stack spills).
+    ujit::Vec cur_off = ctx->uc.new_vec();
+    if (elem_bytes == 4u) {
+        ujit::Vec q0 = ctx->uc.new_vec();
+        ujit::Vec q1 = ctx->uc.new_vec();
+        ujit::Vec q2 = ctx->uc.new_vec();
+        ujit::Vec q3 = ctx->uc.new_vec();
+        emit_quarter(off.xmm(), q0.xmm());
+        ctx->cc.vextracti32x4(cur_off.xmm(), off.zmm(), 1);
+        emit_quarter(cur_off.xmm(), q1.xmm());
+        ctx->cc.vextracti32x4(cur_off.xmm(), off.zmm(), 2);
+        emit_quarter(cur_off.xmm(), q2.xmm());
+        ctx->cc.vextracti32x4(cur_off.xmm(), off.zmm(), 3);
+        emit_quarter(cur_off.xmm(), q3.xmm());
+        ctx->cc.vinsertf32x4(q0.ymm(), q0.ymm(), q1.xmm(), 1);
+        ctx->cc.vinsertf32x4(q2.ymm(), q2.ymm(), q3.xmm(), 1);
+        ctx->cc.vinsertf64x4(d.zmm(), q0.zmm(), q2.ymm(), 1);
+        return;
+    }
+
+    ujit::Gp w0 = ctx->uc.new_gp64();
+    ujit::Gp w1 = ctx->uc.new_gp64();
+    if (elem_bytes == 1u) {
+        ujit::Vec packed = ctx->uc.new_vec();
+        for (uint32_t q = 0; q < 4u; ++q) {
+            ujit::Vec ox = off.xmm();
+            if (q > 0u) {
+                ctx->cc.vextracti32x4(cur_off.xmm(), off.zmm(), q);
+                ox = cur_off.xmm();
+            }
+            ctx->cc.vmovq(p01, ox);
+            ctx->cc.vpextrq(p23, ox, 1);
+            ctx->cc.mov(i0.r32(), p01.r32());
+            ctx->cc.shr(p01, 32);
+            ctx->cc.mov(i2.r32(), p23.r32());
+            ctx->cc.shr(p23, 32);
+
+            ctx->cc.movzx(w0.r32(), aj::x86::byte_ptr(base, i0));
+            ctx->cc.movzx(w1.r32(), aj::x86::byte_ptr(base, p01));
+            ctx->cc.shl(w1.r32(), 8);
+            ctx->cc.or_(w0.r32(), w1.r32());
+            ctx->cc.movzx(i0.r32(), aj::x86::byte_ptr(base, i2));
+            ctx->cc.movzx(p01.r32(), aj::x86::byte_ptr(base, p23));
+            ctx->cc.shl(p01.r32(), 8);
+            ctx->cc.or_(i0.r32(), p01.r32());
+            ctx->cc.shl(i0.r32(), 16);
+            ctx->cc.or_(w0.r32(), i0.r32());
+            if (q == 0u) ctx->cc.vmovd(packed.xmm(), w0.r32());
+            else ctx->cc.vpinsrd(packed.xmm(), packed.xmm(), w0.r32(), q);
+        }
+        ctx->cc.vpmovzxbd(d.zmm(), packed.xmm());
     } else {
-        ctx->cc.vpunpckldq(lo_v.xmm(), lo_v.xmm(), hi_v.xmm());
-        ctx->cc.vpmovzxbd(d.ymm(), lo_v.xmm());
+        ujit::Vec lo_x = ctx->uc.new_vec();
+        ujit::Vec hi_x = ctx->uc.new_vec();
+        for (uint32_t q = 0; q < 4u; ++q) {
+            ujit::Vec ox = off.xmm();
+            if (q > 0u) {
+                ctx->cc.vextracti32x4(cur_off.xmm(), off.zmm(), q);
+                ox = cur_off.xmm();
+            }
+            ctx->cc.vmovq(p01, ox);
+            ctx->cc.vpextrq(p23, ox, 1);
+            ctx->cc.mov(i0.r32(), p01.r32());
+            ctx->cc.shr(p01, 32);
+            ctx->cc.mov(i2.r32(), p23.r32());
+            ctx->cc.shr(p23, 32);
+
+            ctx->cc.movzx(w0.r32(), aj::x86::word_ptr(base, i0));
+            ctx->cc.movzx(w1.r32(), aj::x86::word_ptr(base, p01));
+            ctx->cc.shl(w1.r32(), 16);
+            ctx->cc.or_(w0.r32(), w1.r32());
+            ctx->cc.movzx(i0.r32(), aj::x86::word_ptr(base, i2));
+            ctx->cc.movzx(p01.r32(), aj::x86::word_ptr(base, p23));
+            ctx->cc.shl(p01.r32(), 16);
+            ctx->cc.or_(i0.r32(), p01.r32());
+            ctx->cc.shl(i0, 32);
+            ctx->cc.or_(w0, i0);
+            if (q == 0u) ctx->cc.vmovq(lo_x.xmm(), w0);
+            else if (q == 1u) ctx->cc.vpinsrq(lo_x.xmm(), lo_x.xmm(), w0, 1);
+            else if (q == 2u) ctx->cc.vmovq(hi_x.xmm(), w0);
+            else ctx->cc.vpinsrq(hi_x.xmm(), hi_x.xmm(), w0, 1);
+        }
+        ctx->cc.vinserti32x4(lo_x.ymm(), lo_x.ymm(), hi_x.xmm(), 1);
+        if (is_f16) ctx->cc.vcvtph2ps(d.zmm(), lo_x.ymm());
+        else ctx->cc.vpmovzxwd(d.zmm(), lo_x.ymm());
     }
 }
 #endif
@@ -1899,28 +2534,31 @@ static void emit_a64_reg_gather_ld1(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg
     ujit::Vec off = unpack_vec(offsets_reg);
     ujit::Vec d = unpack_vec(dst);
 
-    ujit::Gp a0 = ctx->uc.new_gp64();
+    // Move the 4 u32 offsets out as two 64-bit pairs (`fmov` + `umov .d[1]`) instead of four
+    // `umov .s[i]`: vector->GP transfers issue on the V pipes, which gather-heavy kernels saturate
+    // on Neoverse, while the extended/shifted `add`s run on integer pipes. Each offset is still
+    // zero-extended from 32 bits (`uxtw` / `lsr #32`), exactly like `umov w`.
+    ujit::Gp lo = ctx->uc.new_gp64();
+    ujit::Gp hi = ctx->uc.new_gp64();
     ujit::Gp a1 = ctx->uc.new_gp64();
     ujit::Gp a2 = ctx->uc.new_gp64();
     ujit::Gp a3 = ctx->uc.new_gp64();
-    ctx->cc.umov(a0.r32(), off.s(0));
-    ctx->cc.umov(a1.r32(), off.s(1));
-    ctx->cc.umov(a2.r32(), off.s(2));
-    ctx->cc.umov(a3.r32(), off.s(3));
-    ctx->cc.add(a0, base, a0);
-    ctx->cc.add(a1, base, a1);
-    ctx->cc.add(a2, base, a2);
-    ctx->cc.add(a3, base, a3);
+    ctx->cc.fmov(lo, off.d());
+    ctx->cc.umov(hi, off.d(1));
+    ctx->cc.add(a1, base, lo, aj::a64::lsr(32));
+    ctx->cc.add(a2, base, hi.r32(), aj::a64::uxtw(0));
+    ctx->cc.add(a3, base, hi, aj::a64::lsr(32));
+    const aj::a64::Mem m0 = aj::a64::ptr(base, lo.r32(), aj::a64::uxtw(0));
 
     if (elem_bytes == 4u) {
-        ctx->cc.ldr(d.s(), aj::a64::ptr(a0));
+        ctx->cc.ldr(d.s(), m0);
         ctx->cc.ld1(d.s(1), aj::a64::ptr(a1));
         ctx->cc.ld1(d.s(2), aj::a64::ptr(a2));
         ctx->cc.ld1(d.s(3), aj::a64::ptr(a3));
     } else if (elem_bytes == 2u) {
         if (is_f16) {
             ujit::Vec tmp = ctx->uc.new_vec128();
-            ctx->cc.ldr(tmp.h(), aj::a64::ptr(a0));
+            ctx->cc.ldr(tmp.h(), m0);
             ctx->cc.ld1(tmp.h(1), aj::a64::ptr(a1));
             ctx->cc.ld1(tmp.h(2), aj::a64::ptr(a2));
             ctx->cc.ld1(tmp.h(3), aj::a64::ptr(a3));
@@ -1928,7 +2566,7 @@ static void emit_a64_reg_gather_ld1(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg
         } else {
             // AArch64 `ldr h` zeroes bits [16..127] of `d`, so loading directly into `h(2/4/6)`
             // yields zero-extended i32 lanes with zero `movi` and zero `ushll`.
-            ctx->cc.ldr(d.h(), aj::a64::ptr(a0));
+            ctx->cc.ldr(d.h(), m0);
             ctx->cc.ld1(d.h(2), aj::a64::ptr(a1));
             ctx->cc.ld1(d.h(4), aj::a64::ptr(a2));
             ctx->cc.ld1(d.h(6), aj::a64::ptr(a3));
@@ -1936,7 +2574,7 @@ static void emit_a64_reg_gather_ld1(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg
     } else {
         // AArch64 `ldr b` zeroes bits [8..127] of `d`, so loading directly into `b(4/8/12)`
         // yields zero-extended i32 lanes with zero `movi` and zero `ushll`.
-        ctx->cc.ldr(d.b(), aj::a64::ptr(a0));
+        ctx->cc.ldr(d.b(), m0);
         ctx->cc.ld1(d.b(4), aj::a64::ptr(a1));
         ctx->cc.ld1(d.b(8), aj::a64::ptr(a2));
         ctx->cc.ld1(d.b(12), aj::a64::ptr(a3));
@@ -2123,8 +2761,8 @@ void zj_vec_gather_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base, zj_reg_t byte_o
         }
         return;
     }
-    if (ctx->cpu.vec_bytes == 32u) {
-        emit_avx2_reg_gather_impl(ctx, dst, base, byte_offsets_i32, 4u, false);
+    if (ctx->cpu.vec_bytes >= 32u) {
+        emit_x86_reg_gather_impl(ctx, dst, base, byte_offsets_i32, 4u, false);
         return;
     }
 #elif defined(ASMJIT_UJIT_AARCH64)
@@ -2140,8 +2778,8 @@ void zj_vec_gather_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base, zj_reg_t byte_o
 void zj_vec_gather_f16(zj_ctx* ctx, zj_reg_t dst_f32, zj_reg_t base_reg, zj_reg_t byte_offsets_i32) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_X86)
-    if (ctx->cpu.vec_bytes == 32u && ctx->cpu.has_f16c) {
-        emit_avx2_reg_gather_impl(ctx, dst_f32, base_reg, byte_offsets_i32, 2u, true);
+    if (ctx->cpu.vec_bytes >= 32u && ctx->cpu.has_f16c) {
+        emit_x86_reg_gather_impl(ctx, dst_f32, base_reg, byte_offsets_i32, 2u, true);
         return;
     }
 #elif defined(ASMJIT_UJIT_AARCH64)
@@ -2198,8 +2836,8 @@ void zj_vec_gather_f16(zj_ctx* ctx, zj_reg_t dst_f32, zj_reg_t base_reg, zj_reg_
 void zj_vec_gather_u16(zj_ctx* ctx, zj_reg_t dst_i32, zj_reg_t base, zj_reg_t byte_offsets_i32) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_X86)
-    if (ctx->cpu.vec_bytes == 32u) {
-        emit_avx2_reg_gather_impl(ctx, dst_i32, base, byte_offsets_i32, 2u, false);
+    if (ctx->cpu.vec_bytes >= 32u) {
+        emit_x86_reg_gather_impl(ctx, dst_i32, base, byte_offsets_i32, 2u, false);
         return;
     }
 #elif defined(ASMJIT_UJIT_AARCH64)
@@ -2212,8 +2850,8 @@ void zj_vec_gather_u16(zj_ctx* ctx, zj_reg_t dst_i32, zj_reg_t base, zj_reg_t by
 void zj_vec_gather_u8(zj_ctx* ctx, zj_reg_t dst_i32, zj_reg_t base, zj_reg_t byte_offsets_i32) {
     if (!ctx_ok(ctx)) return;
 #if defined(ASMJIT_UJIT_X86)
-    if (ctx->cpu.vec_bytes == 32u) {
-        emit_avx2_reg_gather_impl(ctx, dst_i32, base, byte_offsets_i32, 1u, false);
+    if (ctx->cpu.vec_bytes >= 32u) {
+        emit_x86_reg_gather_impl(ctx, dst_i32, base, byte_offsets_i32, 1u, false);
         return;
     }
 #elif defined(ASMJIT_UJIT_AARCH64)

@@ -220,3 +220,25 @@ def test_exp2_log2_rsqrt_and_hypot(core: vs.Core) -> None:
         core.zexpr.Expr([c16_a, c16_b], ["x y hypot"], opt=1),
         core.zexpr.Expr([c16_a, c16_b], ["x dup * y dup * + sqrt"]),
     )
+
+
+@pytest.mark.parametrize("fmt", (vs.GRAY16, vs.GRAY10))
+@pytest.mark.parametrize("expr", ("x exp 0.5 * x log 0.25 * +", "x exp x[0,1] log +", "x exp x[1,0] log +"))
+@pytest.mark.parametrize("width", (33, 64, 200))
+def test_u16_store_after_exp_and_log(core: vs.Core, fmt: vs.PresetVideoFormat, expr: str, width: int) -> None:
+    # AVX-512 regression: the paired zmm vpackusdw + vpermq u16 store failed to JIT-compile
+    # (AsmJit folded a spilled permute index into vpermq's register-only index operand).
+    clip = make_clip(core, width=width, height=4, fmt=fmt, length=1, seed=7)
+    got = plane_array(core.zexpr.Expr(clip, expr).get_frame(0), 0).astype(np.float64)
+    x = plane_array(clip.get_frame(0), 0).astype(np.float64)
+    below = np.vstack([x[1:], x[-1:]])
+    right = np.hstack([x[:, 1:], x[:, -1:]])
+    other = {"x exp 0.5 * x log 0.25 * +": x, "x exp x[0,1] log +": below, "x exp x[1,0] log +": right}[expr]
+    with np.errstate(divide="ignore", over="ignore"):
+        if expr.startswith("x exp 0.5"):
+            ref = np.exp(x) * 0.5 + np.log(other) * 0.25
+        else:
+            ref = np.exp(x) + np.log(other)
+    peak = (1 << clip.format.bits_per_sample) - 1
+    ref = np.clip(np.nan_to_num(ref, nan=peak, posinf=peak, neginf=0.0), 0, peak)
+    assert np.max(np.abs(got - np.round(ref))) <= 1.0

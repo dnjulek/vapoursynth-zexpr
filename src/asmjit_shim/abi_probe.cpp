@@ -61,6 +61,7 @@ const size_t* zj_probe_cpu_info_layout(size_t* count) {
         offsetof(zj_cpu_info_t, has_avx2),
         offsetof(zj_cpu_info_t, has_avx512),
         offsetof(zj_cpu_info_t, prefer_hw_gather_f32),
+        offsetof(zj_cpu_info_t, prefer_alt_widen_load),
     };
     *count = sizeof(layout) / sizeof(layout[0]);
     return layout;

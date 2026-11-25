@@ -380,6 +380,7 @@ fn compileU8LutPlane(
     const x_gp = b.newGp64();
     b.gpMovImm(x_gp, 0);
     const x_loop = b.newLabel();
+    b.alignCode(32);
     b.bind(x_loop);
 
     const idx_v = b.newVec();

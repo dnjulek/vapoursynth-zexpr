@@ -25,11 +25,35 @@ pub const U16Plan = struct {
     eligible: bool = false,
 };
 
+pub const FinalScaleOp = enum {
+    none,
+    mul,
+    div,
+};
+
 pub const Int16Plan = struct {
     eligible: bool = false,
     /// Optional final right shift `k` when the root is `expr / 2^k` (`0` = no shift).
     final_div_shift: u5 = 0,
-    /// Subtree root evaluated in `i16` before applying `final_div_shift` (equals `prog.root` when shift == 0).
+    /// Optional final float32 multiply/divide applied after widening the `i16` subtree result
+    /// to `f32` (used for spatial / multi-clip linear convolutions like `box3x3` `... 9 /`).
+    final_scale_op: FinalScaleOp = .none,
+    final_scale_c: f32 = 1.0,
+    /// Subtree root evaluated in `i16` before applying `final_div_shift` or `final_scale_op`
+    /// (equals `prog.root` when neither is set).
+    eval_root: ast.NodeIdx = ast.invalid_node,
+};
+
+pub const Int32Plan = struct {
+    eligible: bool = false,
+    /// Optional final right shift `k` when the root is `expr / 2^k` (`0` = no shift).
+    final_div_shift: u5 = 0,
+    /// Optional final float32 multiply/divide applied after converting the exact `i32` subtree
+    /// result to `f32` (used for `u9..u16` spatial / multi-clip linear convolutions like `box3x3`).
+    final_scale_op: FinalScaleOp = .none,
+    final_scale_c: f32 = 1.0,
+    /// Subtree root evaluated in exact `i32` (within `[-2^24, +2^24]`) before applying
+    /// `final_div_shift` or `final_scale_op`.
     eval_root: ast.NodeIdx = ast.invalid_node,
 };
 
@@ -61,6 +85,7 @@ pub const Analysis = struct {
     u8_plan: U8Plan = .{},
     u16_plan: U16Plan = .{},
     int16_plan: Int16Plan = .{},
+    int32_plan: Int32Plan = .{},
 
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
         self.used_clips.deinit(allocator);
@@ -295,6 +320,10 @@ pub fn analyze(
     // satisfies `fits_i16(hi + 2^(k-1))`.
     res.int16_plan = try analyzeInt16(allocator, prog, src_fmts, dst_fmt, &res);
 
+    // Exact i32 interior fast-path eligibility for u9..u16 clips: every intermediate fits in
+    // exact f32 integer range `[-2^24, +2^24]`, eliminating per-tap `vcvtdq2ps` and store `vcvtps2dq`.
+    res.int32_plan = try analyzeInt32(allocator, prog, src_fmts, dst_fmt, &res);
+
     // Cost-gated LUT eligibility (B4): pure point expression on 1 integer clip (u8 or u16) or 2 u8 clips.
     // Avoid sending trivial expressions to L2-hitting 64KB/128KB LUTs or scalar non-u8 LUTs when SIMD is faster.
     const is_pure_point = !res.uses_x and !res.uses_y and !res.uses_n and
@@ -414,35 +443,29 @@ fn analyzeU8(
         } else if (node == .binary) {
             const bin = node.binary;
             if (bin.op == .max) {
-                // `max(a - b, C)` with `C in [0, 255]` -> `max(subs_u8(a, b), C)` is exact.
+                // `max(a - b, other)` with exact `other >= 0` -> `max(subs_u8(a, b), other)` is exact.
+                // Mark at most one child per `max` so the other child is verified >= 0 in exact arithmetic.
                 for ([_][2]ast.NodeIdx{ .{ bin.a, bin.b }, .{ bin.b, bin.a } }) |pair| {
                     const sub_i = pair[0];
-                    const c_i = pair[1];
+                    const other_i = pair[1];
                     if (prog.nodes.items[sub_i] == .binary and prog.nodes.items[sub_i].binary.op == .sub and
-                        info.use_counts.items[sub_i] == 1)
+                        info.use_counts.items[sub_i] == 1 and !sat_ok[other_i])
                     {
-                        const cv = switch (prog.nodes.items[c_i]) {
-                            .const_f32 => |v| if (std.math.isFinite(v) and @trunc(v) == v and v >= 0.0 and v <= 255.0) v else null,
-                            .const_i32 => |v| if (v >= 0 and v <= 255) @as(f32, @floatFromInt(v)) else null,
-                            else => null,
-                        };
-                        if (cv != null) sat_ok[sub_i] = true;
+                        sat_ok[sub_i] = true;
+                        break;
                     }
                 }
             } else if (bin.op == .min) {
-                // `min(a + b, C)` with `C in [0, 255]` -> `min(adds_u8(a, b), C)` is exact.
+                // `min(a + b, other)` with exact `other <= 255` -> `min(adds_u8(a, b), other)` is exact.
+                // Mark at most one child per `min` so the other child is verified <= 255 in exact arithmetic.
                 for ([_][2]ast.NodeIdx{ .{ bin.a, bin.b }, .{ bin.b, bin.a } }) |pair| {
                     const add_i = pair[0];
-                    const c_i = pair[1];
+                    const other_i = pair[1];
                     if (prog.nodes.items[add_i] == .binary and prog.nodes.items[add_i].binary.op == .add and
-                        info.use_counts.items[add_i] == 1)
+                        info.use_counts.items[add_i] == 1 and !sat_ok[other_i])
                     {
-                        const cv = switch (prog.nodes.items[c_i]) {
-                            .const_f32 => |v| if (std.math.isFinite(v) and @trunc(v) == v and v >= 0.0 and v <= 255.0) v else null,
-                            .const_i32 => |v| if (v >= 0 and v <= 255) @as(f32, @floatFromInt(v)) else null,
-                            else => null,
-                        };
-                        if (cv != null) sat_ok[add_i] = true;
+                        sat_ok[add_i] = true;
+                        break;
                     }
                 }
             }
@@ -555,33 +578,27 @@ fn analyzeU16(
         } else if (node == .binary) {
             const bin = node.binary;
             if (bin.op == .max) {
+                // `max(a - b, other)` with exact `other >= 0` -> `max(subs_u16(a, b), other)` is exact.
                 for ([_][2]ast.NodeIdx{ .{ bin.a, bin.b }, .{ bin.b, bin.a } }) |pair| {
                     const sub_i = pair[0];
-                    const c_i = pair[1];
+                    const other_i = pair[1];
                     if (prog.nodes.items[sub_i] == .binary and prog.nodes.items[sub_i].binary.op == .sub and
-                        info.use_counts.items[sub_i] == 1)
+                        info.use_counts.items[sub_i] == 1 and !sat_ok[other_i])
                     {
-                        const cv = switch (prog.nodes.items[c_i]) {
-                            .const_f32 => |v| if (std.math.isFinite(v) and @trunc(v) == v and v >= 0.0 and v <= 65535.0) v else null,
-                            .const_i32 => |v| if (v >= 0 and v <= 65535) @as(f32, @floatFromInt(v)) else null,
-                            else => null,
-                        };
-                        if (cv != null) sat_ok[sub_i] = true;
+                        sat_ok[sub_i] = true;
+                        break;
                     }
                 }
             } else if (bin.op == .min) {
+                // `min(a + b, other)` with exact `other <= 65535` -> `min(adds_u16(a, b), other)` is exact.
                 for ([_][2]ast.NodeIdx{ .{ bin.a, bin.b }, .{ bin.b, bin.a } }) |pair| {
                     const add_i = pair[0];
-                    const c_i = pair[1];
+                    const other_i = pair[1];
                     if (prog.nodes.items[add_i] == .binary and prog.nodes.items[add_i].binary.op == .add and
-                        info.use_counts.items[add_i] == 1)
+                        info.use_counts.items[add_i] == 1 and !sat_ok[other_i])
                     {
-                        const cv = switch (prog.nodes.items[c_i]) {
-                            .const_f32 => |v| if (std.math.isFinite(v) and @trunc(v) == v and v >= 0.0 and v <= 65535.0) v else null,
-                            .const_i32 => |v| if (v >= 0 and v <= 65535) @as(f32, @floatFromInt(v)) else null,
-                            else => null,
-                        };
-                        if (cv != null) sat_ok[add_i] = true;
+                        sat_ok[add_i] = true;
+                        break;
                     }
                 }
             }
@@ -655,8 +672,8 @@ const Interval = struct {
     lo: i64,
     hi: i64,
 
-    fn fitsI16(self: Interval) bool {
-        return self.lo >= std.math.minInt(i16) and self.hi <= std.math.maxInt(i16);
+    fn fitsRange(self: Interval, min_bound: i64, max_bound: i64) bool {
+        return self.lo >= min_bound and self.hi <= max_bound;
     }
 };
 
@@ -668,52 +685,18 @@ fn powerOfTwoShift(f: f32) ?u5 {
     return @intCast(@ctz(u));
 }
 
-fn analyzeInt16(
+fn checkIntRangeSubtree(
     allocator: std.mem.Allocator,
     prog: *const ast.Program,
-    src_fmts: []const ast.SampleFormat,
-    dst_fmt: ast.SampleFormat,
-    info: *const Analysis,
-) std.mem.Allocator.Error!Int16Plan {
-    if (prog.opt_int) return .{};
-    if (dst_fmt.is_float or dst_fmt.bits_per_sample != 8) return .{};
-    if (info.uses_x or info.uses_y or info.uses_n or info.uses_width or info.uses_height or info.uses_props or info.uses_abs_access) {
-        return .{};
-    }
-    for (info.used_clips.items) |clip| {
-        const fmt = src_fmts[clip];
-        if (fmt.is_float or fmt.bits_per_sample != 8) return .{};
-    }
-    if (prog.root >= prog.nodes.items.len) return .{};
-
-    // Detect optional final `/ 2^k`, `expr * 2^-k`, or `2^-k * expr` at root.
-    var check_root = prog.root;
-    var final_shift: u5 = 0;
-    const root_node = prog.nodes.items[prog.root];
-    if (root_node == .binary) {
-        const b = root_node.binary;
-        if (b.op == .div and prog.nodes.items[b.b] == .const_f32) {
-            if (powerOfTwoShift(prog.nodes.items[b.b].const_f32)) |k| {
-                check_root = b.a;
-                final_shift = k;
-            }
-        } else if (b.op == .mul and prog.nodes.items[b.b] == .const_f32) {
-            const inv = 1.0 / prog.nodes.items[b.b].const_f32;
-            if (powerOfTwoShift(inv)) |k| {
-                check_root = b.a;
-                final_shift = k;
-            }
-        } else if (b.op == .mul and prog.nodes.items[b.a] == .const_f32) {
-            const inv = 1.0 / prog.nodes.items[b.a].const_f32;
-            if (powerOfTwoShift(inv)) |k| {
-                check_root = b.b;
-                final_shift = k;
-            }
-        }
-    }
-
+    check_root: ast.NodeIdx,
+    final_shift: u5,
+    sample_max: i64,
+    min_bound: i64,
+    max_bound: i64,
+    bias_max: i64,
+) std.mem.Allocator.Error!bool {
     // Compute liveness anchored at `check_root` so a fractional reciprocal constant
-    // (e.g. `0.25` from `/ 4 -> * 0.25`) used only by `prog.root` is not checked as i16.
+    // (e.g. `0.25` from `/ 4 -> * 0.25`) used only by `prog.root` is not checked as integer.
     const sub_live = try allocator.alloc(bool, prog.nodes.items.len);
     defer allocator.free(sub_live);
     @memset(sub_live, false);
@@ -744,24 +727,26 @@ fn analyzeInt16(
     const intervals = try allocator.alloc(Interval, prog.nodes.items.len);
     defer allocator.free(intervals);
 
+    const min_f: f32 = @floatFromInt(min_bound);
+    const max_f: f32 = @floatFromInt(max_bound);
+
     for (prog.nodes.items[0 .. check_root + 1], 0..) |node, idx| {
         if (!sub_live[idx]) continue;
 
         const iv: Interval = switch (node) {
             .const_f32 => |v| blk: {
-                if (!std.math.isFinite(v) or @trunc(v) != v) return .{};
-                if (v < @as(f32, std.math.minInt(i16)) or v > @as(f32, std.math.maxInt(i16))) return .{};
+                if (!std.math.isFinite(v) or @trunc(v) != v) return false;
+                if (v < min_f or v > max_f) return false;
                 const iv_i64: i64 = @intFromFloat(v);
                 break :blk .{ .lo = iv_i64, .hi = iv_i64 };
             },
             .const_i32 => |v| .{ .lo = v, .hi = v },
-            .load_clip, .load_rel => .{ .lo = 0, .hi = 255 },
+            .load_clip, .load_rel => .{ .lo = 0, .hi = sample_max },
             .unary => |u| blk: {
                 const a = intervals[u.a];
                 break :blk switch (u.op) {
                     .neg => .{ .lo = -a.hi, .hi = -a.lo },
                     .abs => blk2: {
-                        // a.lo and a.hi are already verified within i16 bounds, so -v fits in i64.
                         const abs_lo: i64 = if (a.lo < 0) -a.lo else a.lo;
                         const abs_hi: i64 = if (a.hi < 0) -a.hi else a.hi;
                         break :blk2 .{
@@ -770,7 +755,7 @@ fn analyzeInt16(
                         };
                     },
                     .not => .{ .lo = 0, .hi = 1 },
-                    else => return .{},
+                    else => return false,
                 };
             },
             .binary => |b| blk: {
@@ -792,7 +777,7 @@ fn analyzeInt16(
                     .min => .{ .lo = @min(a.lo, rhs.lo), .hi = @min(a.hi, rhs.hi) },
                     .max => .{ .lo = @max(a.lo, rhs.lo), .hi = @max(a.hi, rhs.hi) },
                     .lt, .le, .gt, .ge, .eq, .and_op, .or_op, .xor_op => .{ .lo = 0, .hi = 1 },
-                    else => return .{},
+                    else => return false,
                 };
             },
             .ternary => |t| blk: {
@@ -810,7 +795,7 @@ fn analyzeInt16(
                     .lo = @min(@min(p0, p1), @min(p2, p3)),
                     .hi = @max(@max(p0, p1), @max(p2, p3)),
                 };
-                if (!prod.fitsI16()) return .{};
+                if (!prod.fitsRange(min_bound, max_bound)) return false;
                 break :blk switch (t.op) {
                     .fmadd => .{ .lo = prod.lo + c_iv.lo, .hi = prod.hi + c_iv.hi },
                     .fmsub => .{ .lo = prod.lo - c_iv.hi, .hi = prod.hi - c_iv.lo },
@@ -819,26 +804,165 @@ fn analyzeInt16(
                     .select, .linstep => unreachable,
                 };
             },
-            else => return .{},
+            else => return false,
         };
 
-        if (!iv.fitsI16()) return .{};
+        if (!iv.fitsRange(min_bound, max_bound)) return false;
         intervals[idx] = iv;
     }
 
     // Y1 guard: rounding bias added before `>> k` is in `[2^(k-1)-1, 2^(k-1)] >= 0`,
-    // so only `hi + 2^(k-1)` can overflow i16!
+    // so only `hi + 2^(k-1)` can overflow the integer lane width.
     if (final_shift != 0) {
         const root_iv = intervals[check_root];
         const half: i64 = @as(i64, 1) << (final_shift - 1);
-        if (root_iv.hi + half > std.math.maxInt(i16)) return .{};
+        if (root_iv.hi + half > bias_max) return false;
     }
 
-    return .{
-        .eligible = true,
-        .final_div_shift = final_shift,
-        .eval_root = check_root,
-    };
+    return true;
+}
+
+const RootScaleCandidate = struct {
+    eval_root: ast.NodeIdx,
+    op: FinalScaleOp,
+    c: f32,
+};
+
+fn detectPurePow2Root(prog: *const ast.Program) struct { eval_root: ast.NodeIdx, shift: u5 } {
+    const root_node = prog.nodes.items[prog.root];
+    if (root_node == .binary) {
+        const b = root_node.binary;
+        if (b.op == .div and prog.nodes.items[b.b] == .const_f32) {
+            if (powerOfTwoShift(prog.nodes.items[b.b].const_f32)) |k| {
+                return .{ .eval_root = b.a, .shift = k };
+            }
+        } else if (b.op == .mul and prog.nodes.items[b.b] == .const_f32) {
+            if (powerOfTwoShift(1.0 / prog.nodes.items[b.b].const_f32)) |k| {
+                return .{ .eval_root = b.a, .shift = k };
+            }
+        } else if (b.op == .mul and prog.nodes.items[b.a] == .const_f32) {
+            if (powerOfTwoShift(1.0 / prog.nodes.items[b.a].const_f32)) |k| {
+                return .{ .eval_root = b.b, .shift = k };
+            }
+        }
+    }
+    return .{ .eval_root = prog.root, .shift = 0 };
+}
+
+fn detectFinalScaleRoot(prog: *const ast.Program) ?RootScaleCandidate {
+    const root_node = prog.nodes.items[prog.root];
+    if (root_node != .binary) return null;
+    const b = root_node.binary;
+    if (b.op == .div and prog.nodes.items[b.b] == .const_f32) {
+        const c = prog.nodes.items[b.b].const_f32;
+        if (std.math.isFinite(c) and c != 0.0) return .{ .eval_root = b.a, .op = .div, .c = c };
+    } else if (b.op == .mul and prog.nodes.items[b.b] == .const_f32) {
+        const c = prog.nodes.items[b.b].const_f32;
+        if (std.math.isFinite(c)) return .{ .eval_root = b.a, .op = .mul, .c = c };
+    } else if (b.op == .mul and prog.nodes.items[b.a] == .const_f32) {
+        const c = prog.nodes.items[b.a].const_f32;
+        if (std.math.isFinite(c)) return .{ .eval_root = b.b, .op = .mul, .c = c };
+    }
+    return null;
+}
+
+fn analyzeInt16(
+    allocator: std.mem.Allocator,
+    prog: *const ast.Program,
+    src_fmts: []const ast.SampleFormat,
+    dst_fmt: ast.SampleFormat,
+    info: *const Analysis,
+) std.mem.Allocator.Error!Int16Plan {
+    if (prog.opt_int) return .{};
+    if (dst_fmt.is_float or dst_fmt.bits_per_sample != 8) return .{};
+    if (info.uses_x or info.uses_y or info.uses_n or info.uses_width or info.uses_height or info.uses_props or info.uses_abs_access) {
+        return .{};
+    }
+    for (info.used_clips.items) |clip| {
+        const fmt = src_fmts[clip];
+        if (fmt.is_float or fmt.bits_per_sample != 8) return .{};
+    }
+    if (prog.root >= prog.nodes.items.len) return .{};
+
+    const min_i16: i64 = std.math.minInt(i16);
+    const max_i16: i64 = std.math.maxInt(i16);
+
+    // Try pure `i16` (including exact `/ 2^k` / `* 2^-k`) first so integer multiplications like
+    // `... 255 *` stay on pure 2x-unrolled `i16` instead of widening to `f32`.
+    const pure = detectPurePow2Root(prog);
+    if (try checkIntRangeSubtree(allocator, prog, pure.eval_root, pure.shift, 255, min_i16, max_i16, max_i16)) {
+        return .{
+            .eligible = true,
+            .final_div_shift = pure.shift,
+            .eval_root = pure.eval_root,
+        };
+    }
+
+    // Fallback for spatial / multi-clip linear convolutions with arbitrary float final scale (e.g. `box3x3` `... 9 /`).
+    if (info.uses_rel_access or info.used_clips.items.len >= 2) {
+        if (detectFinalScaleRoot(prog)) |cand| {
+            if (try checkIntRangeSubtree(allocator, prog, cand.eval_root, 0, 255, min_i16, max_i16, max_i16)) {
+                return .{
+                    .eligible = true,
+                    .final_scale_op = cand.op,
+                    .final_scale_c = cand.c,
+                    .eval_root = cand.eval_root,
+                };
+            }
+        }
+    }
+
+    return .{};
+}
+
+fn analyzeInt32(
+    allocator: std.mem.Allocator,
+    prog: *const ast.Program,
+    src_fmts: []const ast.SampleFormat,
+    dst_fmt: ast.SampleFormat,
+    info: *const Analysis,
+) std.mem.Allocator.Error!Int32Plan {
+    if (prog.opt_int) return .{};
+    if (dst_fmt.is_float or dst_fmt.bits_per_sample < 9 or dst_fmt.bits_per_sample > 16) return .{};
+    if (info.uses_x or info.uses_y or info.uses_n or info.uses_width or info.uses_height or info.uses_props or info.uses_abs_access) {
+        return .{};
+    }
+    for (info.used_clips.items) |clip| {
+        const fmt = src_fmts[clip];
+        if (fmt.is_float or fmt.bits_per_sample < 9 or fmt.bits_per_sample > 16) return .{};
+    }
+    if (prog.root >= prog.nodes.items.len) return .{};
+
+    // Every integer in `[-2^24, +2^24]` is exactly representable in IEEE-754 `f32`,
+    // making exact `i32` evaluation bit-identical to `f32` while skipping `vcvtdq2ps` / `vcvtps2dq`.
+    const max_exact_f32: i64 = 1 << 24;
+    const min_exact_f32: i64 = -max_exact_f32;
+    const max_i32: i64 = std.math.maxInt(i32);
+
+    // Always use full raw u16 container domain [0, 65535] so unvalidated u10/u12 samples never overflow.
+    const pure = detectPurePow2Root(prog);
+    if (try checkIntRangeSubtree(allocator, prog, pure.eval_root, pure.shift, 65535, min_exact_f32, max_exact_f32, max_i32)) {
+        return .{
+            .eligible = true,
+            .final_div_shift = pure.shift,
+            .eval_root = pure.eval_root,
+        };
+    }
+
+    if (info.uses_rel_access or info.used_clips.items.len >= 2) {
+        if (detectFinalScaleRoot(prog)) |cand| {
+            if (try checkIntRangeSubtree(allocator, prog, cand.eval_root, 0, 65535, min_exact_f32, max_exact_f32, max_i32)) {
+                return .{
+                    .eligible = true,
+                    .final_scale_op = cand.op,
+                    .final_scale_c = cand.c,
+                    .eval_root = cand.eval_root,
+                };
+            }
+        }
+    }
+
+    return .{};
 }
 
 test "analysis detects LUT, spatial reach, opt=1 types, and Y1 i16 rounding-bias overflow guard" {

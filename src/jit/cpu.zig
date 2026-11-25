@@ -37,6 +37,12 @@ pub const CpuInfo = struct {
     has_avx2: bool,
     has_avx512: bool,
     prefer_hw_gather_f32: bool,
+    /// Use the ISA's alternative u8/u16 widening-load sequence (set per vendor by `zj_cpu_detect`):
+    /// NEON: exact `zip` + 2^23 bias u8/u16 -> f32 instead of `ucvtf` (Neoverse-N2 silicon +6%
+    /// geomean on the affected kernels; neutral on Apple M1, so off there).
+    /// AVX-512: `vmovdqu` + register `vpmovzx` instead of the memory form (Intel Granite Rapids
+    /// +3.3% on 8/16-bit kernels; AMD Zen 4 -1%, so off there).
+    prefer_alt_widen_load: bool = false,
 
     pub fn toC(self: CpuInfo) c.zj_cpu_info_t {
         return .{
@@ -50,7 +56,7 @@ pub const CpuInfo = struct {
             .has_avx2 = @intFromBool(self.has_avx2),
             .has_avx512 = @intFromBool(self.has_avx512),
             .prefer_hw_gather_f32 = @intFromBool(self.prefer_hw_gather_f32),
-            ._pad = .{0},
+            .prefer_alt_widen_load = @intFromBool(self.prefer_alt_widen_load),
         };
     }
 
@@ -66,6 +72,7 @@ pub const CpuInfo = struct {
             .has_avx2 = raw.has_avx2 != 0,
             .has_avx512 = raw.has_avx512 != 0,
             .prefer_hw_gather_f32 = raw.prefer_hw_gather_f32 != 0,
+            .prefer_alt_widen_load = raw.prefer_alt_widen_load != 0,
         };
     }
 
@@ -78,6 +85,17 @@ pub const CpuInfo = struct {
             .v4 => "x86-64-v4",
             .neon => "neon",
         };
+    }
+
+    /// True on ISAs with 32 architectural SIMD vector registers (AArch64 NEON and x86-64 AVX-512).
+    pub fn has32VecRegs(self: CpuInfo) bool {
+        return self.isa == .neon or self.has_avx512;
+    }
+
+    /// True when reusing `mask` as the blend destination eliminates a register copy
+    /// (`bsl(mask, true, false)` on NEON, `vpternlogd(mask, true, false, 0xCA)` on AVX-512).
+    pub fn prefersMaskDstReuse(self: CpuInfo) bool {
+        return self.isa == .neon or self.has_avx512;
     }
 };
 

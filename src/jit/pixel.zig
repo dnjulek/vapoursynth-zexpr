@@ -37,30 +37,14 @@ pub fn emitRoundF32(b: *aj.Builder, dst: aj.Reg, src: aj.Reg, mode: RoundMode) v
     }
 }
 
-/// Emit `dst = (mask != 0) ? true_val : false_val` in FP domain (`vblendvps` on AVX2).
+/// Emit `dst = (mask != 0) ? true_val : false_val` in FP domain (`vblendvps` on AVX2, `vpternlogd` on AVX-512, `bsl/bit/bif` on NEON).
 pub fn emitSelectF32ByMask(b: *aj.Builder, dst: aj.Reg, false_val: aj.Reg, true_val: aj.Reg, mask: aj.Reg) void {
-    if (!b.cpu.has_avx512) {
-        b.vecBlendVF32(dst, false_val, true_val, mask);
-    } else {
-        const t_part = b.newVec();
-        const f_part = b.newVec();
-        b.vecOp3(.and_u32, t_part, true_val, mask);
-        b.vecOp3(.andn_u32, f_part, mask, false_val);
-        b.vecOp3(.or_u32, dst, t_part, f_part);
-    }
+    b.vecBlendVF32(dst, false_val, true_val, mask);
 }
 
 /// Emit `dst = (mask != 0) ? true_val : false_val` where `mask` is all-1s / all-0s per lane.
 pub fn emitSelectByMask(b: *aj.Builder, dst: aj.Reg, false_val: aj.Reg, true_val: aj.Reg, mask: aj.Reg) void {
-    if (!b.cpu.has_avx512) {
-        b.vecOp4(.blendv_u8, dst, false_val, true_val, mask);
-    } else {
-        const t_part = b.newVec();
-        const f_part = b.newVec();
-        b.vecOp3(.and_u32, t_part, true_val, mask);
-        b.vecOp3(.andn_u32, f_part, mask, false_val);
-        b.vecOp3(.or_u32, dst, t_part, f_part);
-    }
+    b.vecOp4(.blendv_u8, dst, false_val, true_val, mask);
 }
 
 /// Load `f32_lanes` pixels from `mem` and convert to `f32`.
@@ -74,13 +58,11 @@ pub fn emitLoadF32(b: *aj.Builder, dst: aj.Reg, mem: aj.Mem, fmt: ast.SampleForm
         return;
     }
 
-    if (fmt.bits_per_sample <= 8) {
-        b.vecLoad(.cvt_u8_to_u32, dst, mem);
-    } else if (fmt.bits_per_sample <= 16) {
-        b.vecLoad(.cvt_u16_to_u32, dst, mem);
-    } else {
-        b.vecLoad(.u_vec, dst, mem);
+    if (fmt.bits_per_sample <= 16) {
+        b.vecLoadUintToF32(dst, mem, fmt.bytesPerSample());
+        return;
     }
+    b.vecLoad(.u_vec, dst, mem);
     b.vecOp2(.cvt_i32_to_f32, dst, dst);
 }
 
@@ -143,6 +125,12 @@ pub fn emitStoreI32(b: *aj.Builder, mem: aj.Mem, src: aj.Reg, fmt: ast.SampleFor
         return;
     }
 
+    if (!b.cpu.has_avx512 and fmt.bits_per_sample == 16) {
+        // SSE/AVX2 `vpackusdw` and NEON `sqxtun` saturate signed i32 directly to [0, 65535].
+        b.vecStoreU16FromI32(mem, src);
+        return;
+    }
+
     const peak_i = b.constI32Splat(@intCast(fmt.peakInt()));
     const tmp = b.newVec();
     b.vecOp3(.min_i32, tmp, src, peak_i);
@@ -175,13 +163,18 @@ pub fn emitStoreI32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, 
         }
         return;
     }
+    if (fmt.bits_per_sample == 16) {
+        // SSE/AVX2/AVX-512 `vpackusdw` and NEON `kPacksI32_U16` saturate signed i32 directly to [0, 65535].
+        b.vecStoreU16FromI32x2(mem0, src0, src1);
+        return;
+    }
 
     const peak_i = b.constI32Splat(@intCast(fmt.peakInt()));
     const t0 = b.newVec();
     const t1 = b.newVec();
     b.vecOp3(.min_i32, t0, src0, peak_i);
     b.vecOp3(.min_i32, t1, src1, peak_i);
-    if (b.cpu.has_avx512) {
+    if (b.cpu.has_avx512 and fmt.bits_per_sample <= 8) {
         const z = b.vecZero();
         b.vecOp3(.max_i32, t0, t0, z);
         b.vecOp3(.max_i32, t1, t1, z);
@@ -219,7 +212,7 @@ pub fn emitStoreF32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, 
     const t1 = b.newVec();
     b.vecOp3(.min_f32, t0, src0, peak);
     b.vecOp3(.min_f32, t1, src1, peak);
-    if (b.cpu.has_avx512 or fmt.bits_per_sample == 32) {
+    if ((b.cpu.has_avx512 and fmt.bits_per_sample <= 8) or fmt.bits_per_sample == 32) {
         const z = b.vecZero();
         b.vecOp3(.max_f32, t0, t0, z);
         b.vecOp3(.max_f32, t1, t1, z);

@@ -120,7 +120,7 @@ pub fn optimize(
 
     // Pass 2: FMA fusion when target has FMA and `use_count(mul) == 1` (never touches `Op.mod`, R3).
     if (opts.enable_value_changing and opts.enable_fma and profile.use_fma and !prog.opt_int) {
-        try fuseFmaPass(allocator, prog);
+        try fuseFmaPass(allocator, prog, profile);
     }
 
     // Pass 3: Dead code elimination (compact to live nodes in topological order).
@@ -531,38 +531,46 @@ fn computeUseCounts(allocator: std.mem.Allocator, prog: *const ast.Program) std.
 }
 
 /// FMA fusion pass (B5, R3): fuses `add`/`sub` with single-use `mul` into `fmadd`/`fmsub`/`fnmadd`/`fnmsub`.
-/// `Op.mod` is atomic and is never touched.
-fn fuseFmaPass(allocator: std.mem.Allocator, prog: *ast.Program) std.mem.Allocator.Error!void {
+/// On AArch64 NEON, `fnmadd` (`fmls`) and `fmadd` (`fmla`) are 1 instruction while `fmsub` requires
+/// `fneg` + `fmla`, so prefer `fnmadd` when RHS is a single-use `mul` and fold `fmsub(a, b, const)`
+/// into exact `fmadd(a, b, -const)`. `Op.mod` is atomic and is never touched.
+fn fuseFmaPass(allocator: std.mem.Allocator, prog: *ast.Program, profile: interp.TargetProfile) std.mem.Allocator.Error!void {
     const uses = try computeUseCounts(allocator, prog);
     defer allocator.free(uses);
 
-    const nodes = prog.nodes.items;
-    for (nodes, 0..) |*node, idx| {
+    const n_orig = prog.nodes.items.len;
+    const prefer_fnmadd = profile.isa_family == .aarch64;
+    for (0..n_orig) |idx| {
         if (uses[idx] == 0) continue;
-        if (node.* != .binary) continue;
-        const bin = node.binary;
+        if (prog.nodes.items[idx] != .binary) continue;
+        const bin = prog.nodes.items[idx].binary;
         switch (bin.op) {
             .add => {
-                if (uses[bin.a] == 1 and nodes[bin.a] == .binary and nodes[bin.a].binary.op == .mul) {
-                    const m = nodes[bin.a].binary;
-                    node.* = .{ .ternary = .{ .op = .fmadd, .a = m.a, .b = m.b, .c = bin.b } };
-                } else if (uses[bin.b] == 1 and nodes[bin.b] == .binary and nodes[bin.b].binary.op == .mul) {
-                    const m = nodes[bin.b].binary;
-                    node.* = .{ .ternary = .{ .op = .fmadd, .a = m.a, .b = m.b, .c = bin.a } };
+                if (uses[bin.a] == 1 and prog.nodes.items[bin.a] == .binary and prog.nodes.items[bin.a].binary.op == .mul) {
+                    const m = prog.nodes.items[bin.a].binary;
+                    prog.nodes.items[idx] = .{ .ternary = .{ .op = .fmadd, .a = m.a, .b = m.b, .c = bin.b } };
+                } else if (uses[bin.b] == 1 and prog.nodes.items[bin.b] == .binary and prog.nodes.items[bin.b].binary.op == .mul) {
+                    const m = prog.nodes.items[bin.b].binary;
+                    prog.nodes.items[idx] = .{ .ternary = .{ .op = .fmadd, .a = m.a, .b = m.b, .c = bin.a } };
                 }
             },
             .sub => {
-                if (uses[bin.a] == 1 and nodes[bin.a] == .binary and nodes[bin.a].binary.op == .mul) {
-                    const m = nodes[bin.a].binary;
-                    node.* = .{ .ternary = .{ .op = .fmsub, .a = m.a, .b = m.b, .c = bin.b } };
-                } else if (uses[bin.b] == 1 and nodes[bin.b] == .binary and nodes[bin.b].binary.op == .mul) {
-                    const m = nodes[bin.b].binary;
-                    node.* = .{ .ternary = .{ .op = .fnmadd, .a = m.a, .b = m.b, .c = bin.a } };
-                } else if (uses[bin.a] == 1 and nodes[bin.a] == .unary and nodes[bin.a].unary.op == .neg) {
-                    const inner = nodes[bin.a].unary.a;
-                    if (uses[inner] == 1 and nodes[inner] == .binary and nodes[inner].binary.op == .mul) {
-                        const m = nodes[inner].binary;
-                        node.* = .{ .ternary = .{ .op = .fnmsub, .a = m.a, .b = m.b, .c = bin.b } };
+                const lhs_mul = uses[bin.a] == 1 and prog.nodes.items[bin.a] == .binary and prog.nodes.items[bin.a].binary.op == .mul;
+                const rhs_mul = uses[bin.b] == 1 and prog.nodes.items[bin.b] == .binary and prog.nodes.items[bin.b].binary.op == .mul;
+                if (prefer_fnmadd and rhs_mul) {
+                    const m = prog.nodes.items[bin.b].binary;
+                    prog.nodes.items[idx] = .{ .ternary = .{ .op = .fnmadd, .a = m.a, .b = m.b, .c = bin.a } };
+                } else if (lhs_mul) {
+                    const m = prog.nodes.items[bin.a].binary;
+                    prog.nodes.items[idx] = .{ .ternary = .{ .op = .fmsub, .a = m.a, .b = m.b, .c = bin.b } };
+                } else if (rhs_mul) {
+                    const m = prog.nodes.items[bin.b].binary;
+                    prog.nodes.items[idx] = .{ .ternary = .{ .op = .fnmadd, .a = m.a, .b = m.b, .c = bin.a } };
+                } else if (uses[bin.a] == 1 and prog.nodes.items[bin.a] == .unary and prog.nodes.items[bin.a].unary.op == .neg) {
+                    const inner = prog.nodes.items[bin.a].unary.a;
+                    if (uses[inner] == 1 and prog.nodes.items[inner] == .binary and prog.nodes.items[inner].binary.op == .mul) {
+                        const m = prog.nodes.items[inner].binary;
+                        prog.nodes.items[idx] = .{ .ternary = .{ .op = .fnmsub, .a = m.a, .b = m.b, .c = bin.b } };
                     }
                 }
             },

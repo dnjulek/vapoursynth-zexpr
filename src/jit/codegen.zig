@@ -108,7 +108,8 @@ fn computeInvariance(
         inv[idx] = switch (node) {
             .const_f32, .const_i32, .frame_n, .load_prop, .plane_width, .plane_height => .frame,
             .coord_y => .row,
-            .coord_x, .load_clip, .load_rel, .load_abs, .arg_extrema, .arg_sort_elem => .pixel,
+            .coord_x, .load_clip, .load_rel, .arg_extrema, .arg_sort_elem => .pixel,
+            .load_abs => |la| @fromBackingInt(@max(@backingInt(inv[la.x]), @backingInt(inv[la.y]))),
             .unary => |u| inv[u.a],
             .binary => |b| if (periodicCoordXMod(prog, const_f32_vals, node, width, lanes) != null)
                 .frame
@@ -165,6 +166,120 @@ fn computeCompileTimeF32Consts(
         };
     }
     return vals;
+}
+
+const RpnStats = struct {
+    peak_live: u32 = 0,
+    has_transcendental: bool = false,
+};
+
+/// Estimate peak simultaneous live `.pixel` values in RPN order (excluding hoisted/const nodes)
+/// to decide whether a long DAG should use Sethi-Ullman reordering (`peak_live > 10`) or
+/// lockstep 2x-interleaved evaluation (`peak_live <= 6` on 16-reg AVX2, `<= 8` on 32-reg ISAs).
+fn estimateRpnStats(
+    allocator: std.mem.Allocator,
+    prog: *const ast.Program,
+    info: *const analysis_mod.Analysis,
+    node_inv: []const Invariance,
+    const_f32_vals: []const ?f32,
+) std.mem.Allocator.Error!RpnStats {
+    const n_nodes = prog.nodes.items.len;
+    if (prog.root >= n_nodes) return .{};
+
+    const rem = try allocator.alloc(u32, n_nodes);
+    defer allocator.free(rem);
+    @memset(rem, 0);
+    rem[prog.root] = 1;
+
+    var ri: usize = prog.root + 1;
+    while (ri > 0) {
+        ri -= 1;
+        if (rem[ri] == 0) continue;
+        if (node_inv[ri] != .pixel or const_f32_vals[ri] != null) continue;
+        switch (prog.nodes.items[ri]) {
+            .load_abs => |la| {
+                rem[la.x] += 1;
+                rem[la.y] += 1;
+            },
+            .unary => |u| rem[u.a] += 1,
+            .binary => |bin| {
+                rem[bin.a] += 1;
+                rem[bin.b] += 1;
+            },
+            .ternary => |t| {
+                rem[t.a] += 1;
+                rem[t.b] += 1;
+                rem[t.c] += 1;
+            },
+            else => {},
+        }
+    }
+
+    var live_now: u32 = 0;
+    var peak: u32 = 0;
+    var has_trans = false;
+    const isTracked = struct {
+        fn run(p: *const ast.Program, inv: []const Invariance, cf: []const ?f32, i: ast.NodeIdx) bool {
+            if (inv[i] != .pixel or cf[i] != null) return false;
+            return switch (p.nodes.items[i]) {
+                .const_f32, .const_i32, .coord_x, .coord_y, .frame_n, .load_prop, .plane_width, .plane_height => false,
+                else => true,
+            };
+        }
+    }.run;
+
+    for (prog.nodes.items[0 .. prog.root + 1], 0..) |node, i| {
+        const idx: ast.NodeIdx = @intCast(i);
+        if (rem[idx] == 0 or !isTracked(prog, node_inv, const_f32_vals, idx)) continue;
+        switch (node) {
+            .unary => |u| switch (u.op) {
+                .exp, .exp2, .log, .log2, .sin, .cos, .tan, .atan, .asin, .acos => has_trans = true,
+                else => {},
+            },
+            .binary => |bin| switch (bin.op) {
+                .pow, .atan2 => has_trans = true,
+                else => {},
+            },
+            else => {},
+        }
+        live_now += 1;
+        if (live_now > peak) peak = live_now;
+        switch (node) {
+            .load_abs => |la| {
+                for ([_]ast.NodeIdx{ la.x, la.y }) |c| {
+                    if (isTracked(prog, node_inv, const_f32_vals, c) and rem[c] > 0) {
+                        rem[c] -= 1;
+                        if (rem[c] == 0 and live_now > 0) live_now -= 1;
+                    }
+                }
+            },
+            .unary => |u| {
+                if (isTracked(prog, node_inv, const_f32_vals, u.a) and rem[u.a] > 0) {
+                    rem[u.a] -= 1;
+                    if (rem[u.a] == 0 and live_now > 0) live_now -= 1;
+                }
+            },
+            .binary => |bin| {
+                for ([_]ast.NodeIdx{ bin.a, bin.b }) |c| {
+                    if (isTracked(prog, node_inv, const_f32_vals, c) and rem[c] > 0) {
+                        rem[c] -= 1;
+                        if (rem[c] == 0 and live_now > 0) live_now -= 1;
+                    }
+                }
+            },
+            .ternary => |t| {
+                for ([_]ast.NodeIdx{ t.a, t.b, t.c }) |c| {
+                    if (isTracked(prog, node_inv, const_f32_vals, c) and rem[c] > 0) {
+                        rem[c] -= 1;
+                        if (rem[c] == 0 and live_now > 0) live_now -= 1;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    _ = info;
+    return .{ .peak_live = peak, .has_transcendental = has_trans };
 }
 
 /// Compile a lowered/optimized plane expression into a native SIMD kernel.
@@ -300,11 +415,13 @@ pub fn compilePlane(
     // and hoist .frame/.row nodes.
     const lanes: usize = cpu.f32_lanes;
     const has_horiz_rel = info.max_left > 0 or info.max_right > 0;
+    b.uint_f32_bias_loads = cpu.prefer_alt_widen_load and info.live_node_count <= neon_bias_load_max_nodes;
     const use_u8_interior = info.u8_plan.eligible and !info.uses_abs_access;
     const use_u16_interior = !use_u8_interior and info.u16_plan.eligible and !info.uses_abs_access;
     const use_int16_interior = !use_u8_interior and !use_u16_interior and info.int16_plan.eligible and !info.uses_abs_access;
-    const can_unroll_x2 = !use_u8_interior and !use_u16_interior and !use_int16_interior and !info.uses_abs_access and info.live_node_count <= 40 and info.expr_cost <= 64;
-    const enable_licm = !info.u8_plan.eligible and !info.u16_plan.eligible and !info.int16_plan.eligible;
+    const use_int32_interior = !use_u8_interior and !use_u16_interior and !use_int16_interior and info.int32_plan.eligible and !info.uses_abs_access;
+    const base_unroll_x2 = !use_u8_interior and !use_u16_interior and !use_int16_interior and !use_int32_interior and !info.uses_abs_access and info.live_node_count <= 40 and info.expr_cost <= 64;
+    const enable_licm = !info.u8_plan.eligible and !info.u16_plan.eligible and !info.int16_plan.eligible and !info.int32_plan.eligible;
 
     const profile = interp.TargetProfile.fromCpu(cpu);
     const const_f32_vals = try computeCompileTimeF32Consts(allocator, prog, info, spec, profile);
@@ -325,6 +442,17 @@ pub fn compilePlane(
 
     var node_inv = try computeInvariance(allocator, prog, info, const_f32_vals, spec.width, if (has_2x_periodic) lanes * 2 else lanes);
     defer allocator.free(node_inv);
+
+    const rpn_stats = try estimateRpnStats(allocator, prog, info, node_inv, const_f32_vals);
+    const max_interleave_live: u32 = if (cpu.has_avx512 or cpu.isa == .neon) 8 else 6;
+    const can_interleave_x2 = !use_u8_interior and !use_u16_interior and !use_int16_interior and !use_int32_interior and
+        !info.uses_abs_access and !has_horiz_rel and !prog.opt_int and !rpn_stats.has_transcendental and
+        info.live_node_count > 40 and rpn_stats.peak_live <= max_interleave_live;
+    // On 32-register ISAs (AArch64 NEON and AVX-512), narrow serial chains (e.g. Mandelbrot,
+    // peak_live <= 5) can interleave 4 independent vectors with zero spills.
+    const can_interleave_x4 = cpu.has32VecRegs() and can_interleave_x2 and rpn_stats.peak_live <= 5 and !has_2x_periodic;
+    const can_unroll_x2 = base_unroll_x2 or can_interleave_x2;
+
     if (has_2x_periodic and node_inv[prog.root] == .pixel and !can_unroll_x2) {
         has_2x_periodic = false;
         allocator.free(node_inv);
@@ -340,6 +468,74 @@ pub fn compilePlane(
     const hoisted_slots_hi = try allocator.alloc(?RegSlot, if (has_2x_periodic) n_nodes else 0);
     defer allocator.free(hoisted_slots_hi);
     if (has_2x_periodic) @memset(hoisted_slots_hi, null);
+
+    // Precompute frame-invariant row pointers for contiguous `X const_y x[]` absolute loads.
+    const abs_row_ptrs = try allocator.alloc(?aj.Reg, if (info.uses_abs_access and spec.width <= (1 << 24)) n_nodes else 0);
+    defer allocator.free(abs_row_ptrs);
+    if (abs_row_ptrs.len == n_nodes) {
+        @memset(abs_row_ptrs, null);
+        for (prog.nodes.items, 0..) |node, idx| {
+            if (idx != prog.root and info.use_counts.items[idx] == 0) continue;
+            if (node != .load_abs) continue;
+            const la = node.load_abs;
+            if (prog.nodes.items[la.x] != .coord_x) continue;
+            if (const_f32_vals[la.y]) |cy| {
+                const sy = interp.absCoordToIndex(profile, cy, @intCast(spec.height), la.mode);
+                const rptr = b.newGp64();
+                if (sy == 0) {
+                    b.gpMov(rptr, base_src_ptrs[la.clip].?);
+                } else {
+                    b.gpMovImm(rptr, @intCast(sy));
+                    b.gpOp3(.mul, rptr, rptr, src_stride_regs[la.clip].?);
+                    b.gpOp3(.add, rptr, rptr, base_src_ptrs[la.clip].?);
+                }
+                abs_row_ptrs[idx] = rptr;
+            }
+        }
+    }
+
+    // Track `.frame`/`.row` nodes consumed as boolean conditions by `.pixel` select/logic trees
+    // so we hoist their `val > 0` mask once per frame/row instead of re-emitting `vcmpps` per pixel.
+    const need_hoisted_mask = try allocator.alloc(bool, n_nodes);
+    defer allocator.free(need_hoisted_mask);
+    @memset(need_hoisted_mask, false);
+    if (enable_licm and !prog.opt_int) {
+        var mask_work: std.ArrayList(ast.NodeIdx) = .empty;
+        defer mask_work.deinit(allocator);
+        for (prog.nodes.items, 0..) |node, idx| {
+            if (idx != prog.root and info.use_counts.items[idx] == 0) continue;
+            if (node_inv[idx] != .pixel) continue;
+            if (node == .ternary and node.ternary.op == .select and info.value_types.items[idx] == .f32) {
+                try mask_work.append(allocator, node.ternary.a);
+                while (mask_work.items.len > 0) {
+                    const ci = mask_work.pop().?;
+                    if (node_inv[ci] != .pixel) {
+                        if (const_f32_vals[ci] == null) need_hoisted_mask[ci] = true;
+                        continue;
+                    }
+                    if (info.use_counts.items[ci] != 1) continue;
+                    switch (prog.nodes.items[ci]) {
+                        .binary => |bin| switch (bin.op) {
+                            .and_op, .or_op, .xor_op => {
+                                try mask_work.append(allocator, bin.a);
+                                try mask_work.append(allocator, bin.b);
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+
+    const hoisted_masks = try allocator.alloc(?aj.Reg, n_nodes);
+    defer allocator.free(hoisted_masks);
+    @memset(hoisted_masks, null);
+
+    const hoisted_masks_hi = try allocator.alloc(?aj.Reg, if (has_2x_periodic) n_nodes else 0);
+    defer allocator.free(hoisted_masks_hi);
+    if (has_2x_periodic) @memset(hoisted_masks_hi, null);
 
     if (enable_licm) {
         const frame_env = BodyEnv{
@@ -358,13 +554,16 @@ pub fn compilePlane(
             .v_frame_n_i32 = v_frame_n_i32,
             .node_inv = node_inv,
             .hoisted_slots = hoisted_slots,
+            .hoisted_masks = hoisted_masks,
             .const_f32_vals = const_f32_vals,
+            .abs_row_ptrs = abs_row_ptrs,
         };
-        try evalHoistedStage(allocator, &b, prog, info, spec, frame_env, node_inv, hoisted_slots, .frame, periodic_lanes, 0);
+        try evalHoistedStage(allocator, &b, prog, info, spec, frame_env, node_inv, hoisted_slots, hoisted_masks, need_hoisted_mask, .frame, periodic_lanes, 0);
         if (has_2x_periodic) {
             var frame_env_hi = frame_env;
             frame_env_hi.hoisted_slots = hoisted_slots_hi;
-            try evalHoistedStage(allocator, &b, prog, info, spec, frame_env_hi, node_inv, hoisted_slots_hi, .frame, periodic_lanes, lanes);
+            frame_env_hi.hoisted_masks = hoisted_masks_hi;
+            try evalHoistedStage(allocator, &b, prog, info, spec, frame_env_hi, node_inv, hoisted_slots_hi, hoisted_masks_hi, need_hoisted_mask, .frame, periodic_lanes, lanes);
         }
     }
 
@@ -405,7 +604,15 @@ pub fn compilePlane(
     // the interior `[left_end, right_start)` ALWAYS keeps the branchless u8 / i16x2 / f32x2 fast path!
     const left_use_dynamic = has_horiz_rel and left_vecs > 8;
     const right_use_dynamic = has_horiz_rel and right_vecs > 8;
-    const can_unroll_i16_x2 = use_int16_interior and info.live_node_count <= 32;
+    const can_unroll_u8_x2 = use_u8_interior and info.live_node_count <= 40;
+    const can_unroll_u16_x2 = use_u16_interior and info.live_node_count <= 40;
+    const can_unroll_i16_x2 = use_int16_interior and (info.int16_plan.final_scale_op == .none or cpu.isa == .neon) and info.live_node_count <= 48;
+    const can_unroll_i32_x2 = use_int32_interior and info.live_node_count <= 48;
+    // Short transcendental chains (exp/log/pow polynomials) are latency-bound: interleave the two
+    // unrolled vectors on AVX2 too, up to peak_live 8 even on 16 YMM registers (Zen 3 silicon:
+    // guided_a +10%, adg_mask +10..18%, exp p16 +11%, fine_sharp p16 +10% despite 4 -> 19 spills),
+    // and on NEON (Neoverse-N2 silicon: adg_mask +9..11%, sigmoid_inv +7%; Apple M1 within noise).
+    const interleave_x2 = can_interleave_x2 or ((cpu.vec_bytes >= 32 or cpu.isa == .neon) and base_unroll_x2 and rpn_stats.has_transcendental and rpn_stats.peak_live <= 8 and !has_horiz_rel and !prog.opt_int);
     const want_running_ptrs = (cpu.isa == .neon) and (info.used_clips.items.len + rel_row_keys.items.len <= 8);
     const want_pair_mem = want_running_ptrs;
 
@@ -543,17 +750,24 @@ pub fn compilePlane(
         .node_inv = node_inv,
         .hoisted_slots = hoisted_slots,
         .hoisted_slots_hi = hoisted_slots_hi,
+        .hoisted_masks = hoisted_masks,
+        .hoisted_masks_hi = hoisted_masks_hi,
         .const_f32_vals = const_f32_vals,
+        .abs_row_ptrs = abs_row_ptrs,
+        .rpn_peak_live = rpn_stats.peak_live,
     };
 
     if (enable_licm) {
-        try evalHoistedStage(allocator, &b, prog, info, spec, common_env, node_inv, hoisted_slots, .row, periodic_lanes, 0);
+        try evalHoistedStage(allocator, &b, prog, info, spec, common_env, node_inv, hoisted_slots, hoisted_masks, need_hoisted_mask, .row, periodic_lanes, 0);
         common_env.hoisted_slots = hoisted_slots;
+        common_env.hoisted_masks = hoisted_masks;
         if (has_2x_periodic) {
             var row_env_hi = common_env;
             row_env_hi.hoisted_slots = hoisted_slots_hi;
-            try evalHoistedStage(allocator, &b, prog, info, spec, row_env_hi, node_inv, hoisted_slots_hi, .row, periodic_lanes, lanes);
+            row_env_hi.hoisted_masks = hoisted_masks_hi;
+            try evalHoistedStage(allocator, &b, prog, info, spec, row_env_hi, node_inv, hoisted_slots_hi, hoisted_masks_hi, need_hoisted_mask, .row, periodic_lanes, lanes);
             common_env.hoisted_slots_hi = hoisted_slots_hi;
+            common_env.hoisted_masks_hi = hoisted_masks_hi;
         }
     }
 
@@ -783,23 +997,51 @@ pub fn compilePlane(
                 makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
             else
                 env;
-            const x_loop = b.newLabel();
-            b.bind(x_loop);
-            try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-            stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-            b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-            b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            const step2 = interior_step * 2;
+            const unroll_end = if (can_unroll_u8_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
+            if (unroll_end > 0) {
+                const x_loop2 = b.newLabel();
+                b.alignCode(32);
+                b.bind(x_loop2);
+                try int_path.emitU8InteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
+            }
+            if (unroll_end < spec.width) {
+                const x_loop = b.newLabel();
+                b.alignCode(32);
+                b.bind(x_loop);
+                try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
+                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            }
         } else if (use_u16_interior) {
             const renv = if (want_running_ptrs)
                 makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
             else
                 env;
-            const x_loop = b.newLabel();
-            b.bind(x_loop);
-            try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-            stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-            b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-            b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            const step2 = interior_step * 2;
+            const unroll_end = if (can_unroll_u16_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
+            if (unroll_end > 0) {
+                const x_loop2 = b.newLabel();
+                b.alignCode(32);
+                b.bind(x_loop2);
+                try int_path.emitU16InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
+            }
+            if (unroll_end < spec.width) {
+                const x_loop = b.newLabel();
+                b.alignCode(32);
+                b.bind(x_loop);
+                try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
+                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            }
         } else if (use_int16_interior) {
             const renv = if (want_running_ptrs)
                 makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
@@ -809,6 +1051,7 @@ pub fn compilePlane(
             const unroll_end = if (can_unroll_i16_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
             if (unroll_end > 0) {
                 const x_loop2 = b.newLabel();
+                b.alignCode(32);
                 b.bind(x_loop2);
                 try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
                 stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
@@ -817,11 +1060,76 @@ pub fn compilePlane(
             }
             if (unroll_end < spec.width) {
                 const x_loop = b.newLabel();
+                b.alignCode(32);
                 b.bind(x_loop);
                 try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
                 stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
                 b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
                 b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            }
+        } else if (use_int32_interior) {
+            const renv = if (want_running_ptrs)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
+            else
+                env;
+            const step2 = lanes * 2;
+            const unroll_end = if (can_unroll_i32_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
+            if (unroll_end > 0) {
+                const x_loop2 = b.newLabel();
+                b.alignCode(32);
+                b.bind(x_loop2);
+                try int_path.emitI32InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
+            }
+            if (unroll_end < spec.width) {
+                const x_loop = b.newLabel();
+                b.alignCode(32);
+                b.bind(x_loop);
+                try int_path.emitI32InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
+                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
+            }
+        } else if (can_interleave_x4 and spec.width >= lanes * 4) {
+            const renv = if (want_running_ptrs)
+                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
+            else
+                env;
+            const step4 = lanes * 4;
+            const unroll_end = (spec.width / step4) * step4;
+            if (unroll_end > 0) {
+                const x_loop4 = b.newLabel();
+                b.alignCode(32);
+                b.bind(x_loop4);
+                try emitDagBodyX4(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
+                if (renv.v_x) |vx| {
+                    b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step4)));
+                }
+                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step4);
+                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step4));
+                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop4);
+            }
+            if (unroll_end < spec.width) {
+                const rem = spec.width - unroll_end;
+                if (rem > lanes * 2) {
+                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, true);
+                    if (renv.v_x) |vx| {
+                        b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(lanes * 2)));
+                    }
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes * 2);
+                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes * 2));
+                    if (rem - lanes * 2 > lanes) {
+                        try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, true);
+                    } else {
+                        try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
+                    }
+                } else if (rem > lanes) {
+                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, true);
+                } else {
+                    try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
+                }
             }
         } else if ((can_unroll_x2 and spec.width >= lanes * 2) or has_2x_periodic) {
             const renv = if (want_running_ptrs)
@@ -832,8 +1140,9 @@ pub fn compilePlane(
             const unroll_end = (spec.width / step2) * step2;
             if (unroll_end > 0) {
                 const x_loop2 = b.newLabel();
+                b.alignCode(32);
                 b.bind(x_loop2);
-                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
+                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, interleave_x2);
                 if (renv.v_x) |vx| {
                     if (prog.opt_int) {
                         b.vecOp3(.add_i32, vx, vx, b.constI32Splat(@intCast(step2)));
@@ -850,7 +1159,7 @@ pub fn compilePlane(
                 if (spec.width - unroll_end > lanes) {
                     // Remainder spans both phase 0 and phase 1; `width > unroll_end + lanes` guarantees
                     // the 32B/64B-aligned stride accommodates all `2 * lanes` pixels of every src/dst format.
-                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
+                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, interleave_x2);
                 } else {
                     try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
                 }
@@ -862,6 +1171,7 @@ pub fn compilePlane(
             else
                 env;
             const x_loop = b.newLabel();
+            b.alignCode(32);
             b.bind(x_loop);
 
             try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
@@ -940,24 +1250,65 @@ pub fn compilePlane(
 
             const span = right_start - left_end;
             if (use_u8_interior) {
-                const x_loop = b.newLabel();
-                b.bind(x_loop);
-                try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
+                const step2 = interior_step * 2;
+                const unroll_end = if (can_unroll_u8_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
+                if (unroll_end > left_end) {
+                    const x_loop2 = b.newLabel();
+                    b.alignCode(32);
+                    b.bind(x_loop2);
+                    try int_path.emitU8InteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
+                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                    b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
+                }
+                if (unroll_end < right_start) {
+                    if (unroll_end == left_end) {
+                        const x_loop = b.newLabel();
+                        b.alignCode(32);
+                        b.bind(x_loop);
+                        try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
+                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
+                        b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
+                    } else {
+                        try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
+                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
+                    }
+                }
             } else if (use_u16_interior) {
-                const x_loop = b.newLabel();
-                b.bind(x_loop);
-                try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
+                const step2 = interior_step * 2;
+                const unroll_end = if (can_unroll_u16_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
+                if (unroll_end > left_end) {
+                    const x_loop2 = b.newLabel();
+                    b.alignCode(32);
+                    b.bind(x_loop2);
+                    try int_path.emitU16InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
+                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                    b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
+                }
+                if (unroll_end < right_start) {
+                    if (unroll_end == left_end) {
+                        const x_loop = b.newLabel();
+                        b.alignCode(32);
+                        b.bind(x_loop);
+                        try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
+                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
+                        b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
+                    } else {
+                        try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
+                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
+                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
+                    }
+                }
             } else if (use_int16_interior) {
                 const step2 = lanes * 4;
                 const unroll_end = if (can_unroll_i16_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
                 if (unroll_end > left_end) {
                     const x_loop2 = b.newLabel();
+                    b.alignCode(32);
                     b.bind(x_loop2);
                     try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
                     stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
@@ -966,18 +1317,41 @@ pub fn compilePlane(
                 }
                 if (unroll_end < right_start) {
                     const x_loop = b.newLabel();
+                    b.alignCode(32);
                     b.bind(x_loop);
                     try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
                     stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
                     b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
                     b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
                 }
+            } else if (use_int32_interior) {
+                const step2 = lanes * 2;
+                const unroll_end = if (can_unroll_i32_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
+                if (unroll_end > left_end) {
+                    const x_loop2 = b.newLabel();
+                    b.alignCode(32);
+                    b.bind(x_loop2);
+                    try int_path.emitI32InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
+                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                    b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
+                }
+                if (unroll_end < right_start) {
+                    const x_loop = b.newLabel();
+                    b.alignCode(32);
+                    b.bind(x_loop);
+                    try int_path.emitI32InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
+                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
+                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
+                    b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
+                }
             } else if (can_unroll_x2 and span >= lanes * 2) {
                 const step2 = lanes * 2;
                 const unroll_end = left_end + (span / step2) * step2;
                 const x_loop2 = b.newLabel();
+                b.alignCode(32);
                 b.bind(x_loop2);
-                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
+                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, interleave_x2);
                 if (renv.v_x) |vx| {
                     if (prog.opt_int) {
                         b.vecOp3(.add_i32, vx, vx, b.constI32Splat(@intCast(step2)));
@@ -991,6 +1365,7 @@ pub fn compilePlane(
 
                 if (unroll_end < right_start) {
                     const x_loop = b.newLabel();
+                    b.alignCode(32);
                     b.bind(x_loop);
                     try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
                     if (renv.v_x) |vx| {
@@ -1006,6 +1381,7 @@ pub fn compilePlane(
                 }
             } else {
                 const x_loop = b.newLabel();
+                b.alignCode(32);
                 b.bind(x_loop);
                 try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
                 if (renv.v_x) |vx| {
@@ -1116,7 +1492,11 @@ const BodyEnv = struct {
     node_inv: []const Invariance = &.{},
     hoisted_slots: []const ?RegSlot = &.{},
     hoisted_slots_hi: []const ?RegSlot = &.{},
+    hoisted_masks: []const ?aj.Reg = &.{},
+    hoisted_masks_hi: []const ?aj.Reg = &.{},
     const_f32_vals: []const ?f32 = &.{},
+    abs_row_ptrs: []const ?aj.Reg = &.{},
+    rpn_peak_live: u32 = 0,
     use_running_ptrs: bool = false,
     use_pair_mem: bool = false,
 
@@ -1417,8 +1797,14 @@ fn emitBoolMaskF32(
     use_const_mem: bool,
     idx: ast.NodeIdx,
 ) aj.Reg {
-    const mask = b.newVec();
     if (!fused_cmp[idx]) {
+        if (env.hoisted_masks.len == prog.nodes.items.len) {
+            if (env.hoisted_masks[idx]) |hm| {
+                if (rem_uses[idx] > 0) rem_uses[idx] -= 1;
+                return hm;
+            }
+        }
+        const mask = b.newVec();
         const reg = resolveSlotReg(b, prog, info, env, slots, idx);
         b.vecOp3(.cmp_gt_f32, mask, reg, b.vecZero());
         if (rem_uses[idx] > 0) {
@@ -1431,6 +1817,7 @@ fn emitBoolMaskF32(
         }
         return mask;
     }
+    const mask = b.newVec();
     switch (prog.nodes.items[idx]) {
         .unary => |u| {
             // `.not`: `a <= 0.0` (matches `emitUnaryF32(.not)` bit-for-bit incl. NaN).
@@ -1526,6 +1913,8 @@ fn evalHoistedStage(
     env: BodyEnv,
     node_inv: []const Invariance,
     hoisted_slots: []?RegSlot,
+    hoisted_masks: []?aj.Reg,
+    need_hoisted_mask: []const bool,
     target_inv: Invariance,
     periodic_lanes: usize,
     phase_offset: usize,
@@ -1535,6 +1924,9 @@ fn evalHoistedStage(
     const trig_cache = try allocator.alloc(?math_jit.TrigState, n_nodes);
     defer allocator.free(trig_cache);
     @memset(trig_cache, null);
+
+    const max_plane_bytes_f32: u64 = @as(u64, spec.height) * std.mem.alignForward(u64, @as(u64, spec.width) * 4 + 64, 64);
+    const can_hw_gather_f32 = max_plane_bytes_f32 <= 0x7FFF_0000;
 
     const ensureF32 = struct {
         fn run(builder: *aj.Builder, reg: aj.Reg, ty: analysis_mod.ValueType) aj.Reg {
@@ -1558,6 +1950,31 @@ fn evalHoistedStage(
                 if (out_ty == .i32) {
                     hoisted_slots[idx] = .{ .reg = b.constI32Splat(v), .owned = false };
                 }
+            },
+            .load_abs => |la| {
+                const fmt = spec.src_fmts[la.clip];
+                const shift: u8 = switch (fmt.bytesPerSample()) {
+                    1 => 0,
+                    2 => 1,
+                    else => 2,
+                };
+                const vx_raw = resolveSlotReg(b, prog, info, env, hoisted_slots, la.x);
+                const fx = ensureF32(b, vx_raw, info.value_types.items[la.x]);
+                const ix = b.newVec();
+                emitAbsCoordToI32(b, ix, fx, @intCast(spec.width), la.mode);
+                if (shift != 0) b.vecOp2i(.sll_u32, ix, ix, shift);
+
+                const vy_raw = resolveSlotReg(b, prog, info, env, hoisted_slots, la.y);
+                const fy = ensureF32(b, vy_raw, info.value_types.items[la.y]);
+                const iy = b.newVec();
+                emitAbsCoordToI32(b, iy, fy, @intCast(spec.height), la.mode);
+                b.vecOp3(.mul_i32, iy, iy, env.src_stride_vecs[la.clip].?);
+
+                const byte_off = b.newVec();
+                b.vecOp3(.add_i32, byte_off, iy, ix);
+                const dst = b.newVec();
+                emitGatherFromBase(b, dst, out_ty, env.base_src_ptrs[la.clip].?, byte_off, fmt, can_hw_gather_f32);
+                hoisted_slots[idx] = .{ .reg = dst, .owned = false };
             },
             .load_prop => |pid| {
                 hoisted_slots[idx] = .{ .reg = env.prop_regs[pid], .owned = false };
@@ -1622,23 +2039,23 @@ fn evalHoistedStage(
                         .reg = b.constBytes(std.mem.sliceAsBytes(lane_f[0..b.cpu.f32_lanes])),
                         .owned = false,
                     };
-                    continue;
-                }
-                const dst = b.newVec();
-                if (out_ty == .i32 and ta == .i32 and tb == .i32) {
-                    emitBinaryI32(b, bin.op, dst, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b));
-                } else if (out_ty == .i32) {
-                    emitBinaryF32ToI32(b, bin.op, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b), tb));
-                } else if (bin.op == .mod and nodeConstF32(prog, env, bin.b) != null and isExactPow2Divisor(nodeConstF32(prog, env, bin.b).?)) {
-                    emitModPow2F32(b, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), nodeConstF32(prog, env, bin.b).?);
-                } else if (bin.op == .mul and nodeConstF32(prog, env, bin.b) != null) {
-                    b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), nodeConstF32(prog, env, bin.b).?);
-                } else if (bin.op == .mul and nodeConstF32(prog, env, bin.a) != null) {
-                    b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b), tb), nodeConstF32(prog, env, bin.a).?);
                 } else {
-                    emitBinaryF32(b, bin.op, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b), tb));
+                    const dst = b.newVec();
+                    if (out_ty == .i32 and ta == .i32 and tb == .i32) {
+                        emitBinaryI32(b, bin.op, dst, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b));
+                    } else if (out_ty == .i32) {
+                        emitBinaryF32ToI32(b, bin.op, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b), tb));
+                    } else if (bin.op == .mod and nodeConstF32(prog, env, bin.b) != null and isExactPow2Divisor(nodeConstF32(prog, env, bin.b).?)) {
+                        emitModPow2F32(b, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), nodeConstF32(prog, env, bin.b).?);
+                    } else if (bin.op == .mul and nodeConstF32(prog, env, bin.b) != null) {
+                        b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), nodeConstF32(prog, env, bin.b).?);
+                    } else if (bin.op == .mul and nodeConstF32(prog, env, bin.a) != null) {
+                        b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b), tb), nodeConstF32(prog, env, bin.a).?);
+                    } else {
+                        emitBinaryF32(b, bin.op, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.a), ta), ensureF32(b, resolveSlotReg(b, prog, info, env, hoisted_slots, bin.b), tb));
+                    }
+                    hoisted_slots[idx] = .{ .reg = dst, .owned = false };
                 }
-                hoisted_slots[idx] = .{ .reg = dst, .owned = false };
             },
             .ternary => |t| {
                 const a_reg = resolveSlotReg(b, prog, info, env, hoisted_slots, t.a);
@@ -1659,6 +2076,14 @@ fn evalHoistedStage(
             },
             else => unreachable,
         }
+
+        if (need_hoisted_mask[idx] and out_ty == .f32) {
+            if (hoisted_slots[idx]) |hs| {
+                const m = b.newVec();
+                b.vecOp3(.cmp_gt_f32, m, hs.reg, b.vecZero());
+                hoisted_masks[idx] = m;
+            }
+        }
     }
 }
 
@@ -1674,65 +2099,117 @@ fn evalDagVector(
     use_const_mem: bool,
     preloaded: ?[]const ?aj.Reg,
 ) std.mem.Allocator.Error!aj.Reg {
+    const res = try evalDagVectors(1, allocator, b, prog, info, spec, .{env}, x_mode, .{col_disp}, use_const_mem, .{preloaded});
+    return res[0];
+}
+
+fn evalDagVectors(
+    comptime count: usize,
+    allocator: std.mem.Allocator,
+    b: *aj.Builder,
+    prog: *const ast.Program,
+    info: *const analysis_mod.Analysis,
+    spec: CompileSpec,
+    envs: [count]BodyEnv,
+    x_mode: XMode,
+    col_disps: [count]usize,
+    use_const_mem: bool,
+    preloaded_arr: [count]?[]const ?aj.Reg,
+) std.mem.Allocator.Error![count]aj.Reg {
     const n_nodes = prog.nodes.items.len;
-    const slots = try allocator.alloc(?RegSlot, n_nodes);
-    defer allocator.free(slots);
-    if (env.hoisted_slots.len == n_nodes) {
-        if (env.hoisted_slots[prog.root]) |rs| return rs.reg;
-        @memcpy(slots, env.hoisted_slots);
-    } else {
-        @memset(slots, null);
-    }
-    if (preloaded) |pre| {
-        for (pre, 0..) |maybe_r, i| {
-            if (maybe_r) |r| {
-                slots[i] = .{ .reg = r, .owned = true };
+    const env0 = envs[0];
+
+    var slots_arr: [count][]?RegSlot = undefined;
+    var slots_init: usize = 0;
+    defer for (0..slots_init) |s| allocator.free(slots_arr[s]);
+
+    inline for (0..count) |s| {
+        const sl = try allocator.alloc(?RegSlot, n_nodes);
+        slots_arr[s] = sl;
+        slots_init = s + 1;
+        if (envs[s].hoisted_slots.len == n_nodes) {
+            @memcpy(sl, envs[s].hoisted_slots);
+        } else {
+            @memset(sl, null);
+        }
+        if (preloaded_arr[s]) |pre| {
+            for (pre, 0..) |maybe_r, i| {
+                if (maybe_r) |r| {
+                    sl[i] = .{ .reg = r, .owned = true };
+                }
             }
         }
     }
 
+    if (slots_arr[0][prog.root] != null) {
+        var fast_out: [count]aj.Reg = undefined;
+        inline for (0..count) |s| {
+            fast_out[s] = slots_arr[s][prog.root].?.reg;
+        }
+        return fast_out;
+    }
+
     // Cache shared Cody-Waite trig range reduction per operand node (speeds up `x sin x cos +`).
-    const trig_cache = try allocator.alloc(?math_jit.TrigState, n_nodes);
-    defer allocator.free(trig_cache);
-    @memset(trig_cache, null);
+    var trig_arr: [count][]?math_jit.TrigState = undefined;
+    var trig_init: usize = 0;
+    defer for (0..trig_init) |s| allocator.free(trig_arr[s]);
+    inline for (0..count) |s| {
+        const tc = try allocator.alloc(?math_jit.TrigState, n_nodes);
+        @memset(tc, null);
+        trig_arr[s] = tc;
+        trig_init = s + 1;
+    }
 
     // Cache deduplicated load_abs X byte offsets (`clamp(x) << shift`) and Y row offsets (`clamp(y) * stride`).
     const AbsXEntry = struct { node: ast.NodeIdx, mode: ast.BoundaryMode, shift: u8, reg: aj.Reg };
     const AbsYEntry = struct { node: ast.NodeIdx, mode: ast.BoundaryMode, clip: ast.ClipId, reg: aj.Reg };
-    var abs_x_cache: std.ArrayList(AbsXEntry) = .empty;
-    defer abs_x_cache.deinit(allocator);
-    var abs_y_cache: std.ArrayList(AbsYEntry) = .empty;
-    defer abs_y_cache.deinit(allocator);
+    var abs_x_arr: [count]std.ArrayList(AbsXEntry) = @splat(.empty);
+    defer inline for (0..count) |s| abs_x_arr[s].deinit(allocator);
+    var abs_y_arr: [count]std.ArrayList(AbsYEntry) = @splat(.empty);
+    defer inline for (0..count) |s| abs_y_arr[s].deinit(allocator);
 
     // Compute per-body remaining uses stopping at already-hoisted slots and compile-time constants
     // so children of hoisted nodes (e.g. `coord_x` under periodic `X % C`) are never emitted in the x loop.
-    const rem_uses = try allocator.alloc(u32, n_nodes);
-    defer allocator.free(rem_uses);
-    @memset(rem_uses, 0);
-    rem_uses[prog.root] = 1;
+    var rem_arr: [count][]u32 = undefined;
+    var rem_init: usize = 0;
+    defer for (0..rem_init) |s| allocator.free(rem_arr[s]);
+
+    const rem_uses0 = try allocator.alloc(u32, n_nodes);
+    rem_arr[0] = rem_uses0;
+    rem_init = 1;
+    @memset(rem_uses0, 0);
+    rem_uses0[prog.root] = 1;
     var ri: usize = prog.root + 1;
     while (ri > 0) {
         ri -= 1;
-        if (rem_uses[ri] == 0) continue;
-        if (slots[ri] != null or nodeConstF32(prog, env, @intCast(ri)) != null) continue;
+        if (rem_uses0[ri] == 0) continue;
+        if (slots_arr[0][ri] != null or nodeConstF32(prog, env0, @intCast(ri)) != null) continue;
         switch (prog.nodes.items[ri]) {
             .load_abs => |la| {
-                rem_uses[la.x] += 1;
-                rem_uses[la.y] += 1;
+                rem_uses0[la.x] += 1;
+                rem_uses0[la.y] += 1;
             },
-            .unary => |u| rem_uses[u.a] += 1,
+            .unary => |u| rem_uses0[u.a] += 1,
             .binary => |bin| {
-                rem_uses[bin.a] += 1;
-                rem_uses[bin.b] += 1;
+                rem_uses0[bin.a] += 1;
+                rem_uses0[bin.b] += 1;
             },
             .ternary => |t| {
-                rem_uses[t.a] += 1;
-                rem_uses[t.b] += 1;
-                rem_uses[t.c] += 1;
+                rem_uses0[t.a] += 1;
+                rem_uses0[t.b] += 1;
+                rem_uses0[t.c] += 1;
             },
             else => {},
         }
     }
+    inline for (1..count) |s| {
+        const r = try allocator.alloc(u32, n_nodes);
+        @memcpy(r, rem_uses0);
+        rem_arr[s] = r;
+        rem_init = s + 1;
+    }
+
+    const slots0 = slots_arr[0];
 
     // Identify single-use comparison / boolean logic trees directly feeding a `.select` so we fuse
     // `vcmpps/vpand/vpor/vpxor + vblendvps/vandps/vandnps` (f32) or `vpcmpgtd/vpcmpeqd + vpblendvb/vpand` (opt=1 i32).
@@ -1740,14 +2217,14 @@ fn evalDagVector(
     defer allocator.free(fused_cmp);
     @memset(fused_cmp, false);
     for (prog.nodes.items, 0..) |node, idx| {
-        if (rem_uses[idx] == 0 or slots[idx] != null or nodeConstF32(prog, env, @intCast(idx)) != null) continue;
+        if (rem_uses0[idx] == 0 or slots0[idx] != null or nodeConstF32(prog, env0, @intCast(idx)) != null) continue;
         if (node == .ternary and node.ternary.op == .select) {
             const cond_idx = node.ternary.a;
             const out_t = info.value_types.items[idx];
             if (!prog.opt_int and out_t == .f32) {
-                markFusableBoolTreeF32(prog, info, env, slots, fused_cmp, cond_idx);
+                markFusableBoolTreeF32(prog, info, env0, slots0, fused_cmp, cond_idx);
             } else if (prog.opt_int and out_t == .i32 and
-                slots[cond_idx] == null and nodeConstF32(prog, env, cond_idx) == null and
+                slots0[cond_idx] == null and nodeConstF32(prog, env0, cond_idx) == null and
                 info.use_counts.items[cond_idx] == 1 and prog.nodes.items[cond_idx] == .binary)
             {
                 const cb = prog.nodes.items[cond_idx].binary;
@@ -1759,6 +2236,279 @@ fn evalDagVector(
                 {
                     fused_cmp[cond_idx] = true;
                 }
+            }
+        }
+    }
+
+    // On AVX2/AVX-512 interior loops, fold single-use native f32 `.load_clip`/`.load_rel`
+    // directly into VEX/EVEX reg-reg-mem instructions (`vaddps`/`vsubps`/`vmulps`/`vminps`/`vmaxps`).
+    // For non-commutative / NaN-order-sensitive ops (`sub`, `min`, `max`), only fold RHS (`bin.b`).
+    const folded_load = try allocator.alloc(bool, n_nodes);
+    defer allocator.free(folded_load);
+    @memset(folded_load, false);
+    const isNativeF32Load = struct {
+        fn run(nodes: []const ast.Node, fmts: []const ast.SampleFormat, types: []const analysis_mod.ValueType, slot_arr: []const ?RegSlot, rem: []const u32, fused: []const bool, idx: ast.NodeIdx) bool {
+            if (rem[idx] != 1 or slot_arr[idx] != null or fused[idx] or types[idx] != .f32) return false;
+            return switch (nodes[idx]) {
+                .load_clip => |clip| fmts[clip].is_float and fmts[clip].bits_per_sample == 32,
+                .load_rel => |rel| fmts[rel.clip].is_float and fmts[rel.clip].bits_per_sample == 32,
+                else => false,
+            };
+        }
+    }.run;
+
+    // Pin high-frequency constants (`use_counts >= 6`, e.g. `2.0` in Mandelbrot or `5.0`/`-3.0` in
+    // Kirsch) in a vector register on non-gather loops instead of reloading `[rip+off]` repeatedly.
+    const pin_hot_const = !info.uses_abs_access;
+
+    if (b.cpu.vec_bytes >= 32 and x_mode == .interior) {
+        // 1. Single-use native f32 loads folded into binary ops (e.g. box3x3, wide-reach).
+        for (prog.nodes.items[0 .. prog.root + 1], 0..) |node, idx| {
+            if (rem_uses0[idx] == 0 or slots0[idx] != null or fused_cmp[idx]) continue;
+            if (nodeConstF32(prog, env0, @intCast(idx)) != null) continue;
+            if (node != .binary or info.value_types.items[idx] != .f32) continue;
+            const bin = node.binary;
+            if (bin.a == bin.b) continue;
+            const ca = if (use_const_mem and (!pin_hot_const or info.use_counts.items[bin.a] < 6)) nodeConstF32(prog, env0, bin.a) else null;
+            const cb = if (use_const_mem and (!pin_hot_const or info.use_counts.items[bin.b] < 6)) nodeConstF32(prog, env0, bin.b) else null;
+            if (ca != null or cb != null) continue;
+            const is_comm = switch (bin.op) {
+                .add, .mul => true,
+                .sub, .min, .max => false,
+                else => continue,
+            };
+            if (!folded_load[bin.b] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, bin.b)) {
+                folded_load[bin.b] = true;
+            } else if (is_comm and !folded_load[bin.a] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, bin.a)) {
+                folded_load[bin.a] = true;
+            }
+        }
+    }
+
+    // 2. High-register-pressure multi-use native f32 loads (e.g. 5x5 Kirsch with 24 shared pixels):
+    //    on AVX2/AVX-512 folds each L1D load into VEX/EVEX mem-operand ALU; on AArch64 NEON
+    //    rematerializes fresh `ldr q` from L1D at each use instead of spilling 24 loads to `[sp]`.
+    if ((b.cpu.vec_bytes >= 32 or b.cpu.isa == .neon) and x_mode == .interior and b.cpu.has_fma and info.live_node_count > 48) {
+        const isAnyNativeF32Load = struct {
+            fn run(nodes: []const ast.Node, fmts: []const ast.SampleFormat, types: []const analysis_mod.ValueType, slot_arr: []const ?RegSlot, rem: []const u32, fused: []const bool, idx: ast.NodeIdx) bool {
+                if (rem[idx] == 0 or slot_arr[idx] != null or fused[idx] or types[idx] != .f32) return false;
+                return switch (nodes[idx]) {
+                    .load_clip => |clip| fmts[clip].is_float and fmts[clip].bits_per_sample == 32,
+                    .load_rel => |rel| fmts[rel.clip].is_float and fmts[rel.clip].bits_per_sample == 32,
+                    else => false,
+                };
+            }
+        }.run;
+
+        var live_f32_loads: usize = 0;
+        for (0..prog.root + 1) |idx| {
+            if (!folded_load[idx] and isAnyNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, @intCast(idx))) {
+                live_f32_loads += 1;
+            }
+        }
+        if (live_f32_loads > 12) {
+            const can_remat = try allocator.alloc(bool, n_nodes);
+            defer allocator.free(can_remat);
+            @memset(can_remat, false);
+            for (0..prog.root + 1) |idx| {
+                if (!folded_load[idx] and isAnyNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, @intCast(idx))) {
+                    can_remat[idx] = true;
+                }
+            }
+            can_remat[prog.root] = false;
+
+            for (prog.nodes.items[0 .. prog.root + 1], 0..) |node, idx| {
+                if (rem_uses0[idx] == 0 or slots0[idx] != null or folded_load[idx]) continue;
+                if (nodeConstF32(prog, env0, @intCast(idx)) != null) continue;
+                switch (node) {
+                    .load_abs => |la| {
+                        can_remat[la.x] = false;
+                        can_remat[la.y] = false;
+                    },
+                    .unary => |u| {
+                        can_remat[u.a] = false;
+                    },
+                    .binary => |bin| {
+                        const ok_op = info.value_types.items[idx] == .f32 and !fused_cmp[idx] and
+                            (bin.op == .add or bin.op == .mul or bin.op == .sub or bin.op == .min or bin.op == .max);
+                        if (!ok_op or bin.a == bin.b) {
+                            can_remat[bin.a] = false;
+                            can_remat[bin.b] = false;
+                        } else {
+                            if (bin.op == .sub or bin.op == .min or bin.op == .max) {
+                                can_remat[bin.a] = false;
+                            }
+                            // Never fold both operands of a single binary op simultaneously.
+                            if (can_remat[bin.a] and can_remat[bin.b]) {
+                                can_remat[bin.a] = false;
+                            }
+                        }
+                    },
+                    .ternary => |t| {
+                        can_remat[t.c] = false;
+                        const ok_fma = info.value_types.items[idx] == .f32 and (t.op == .fmadd or t.op == .fnmadd);
+                        if (!ok_fma or t.a == t.b or t.a == t.c or t.b == t.c) {
+                            can_remat[t.a] = false;
+                            can_remat[t.b] = false;
+                        } else if (can_remat[t.a] and can_remat[t.b]) {
+                            can_remat[t.a] = false;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            for (0..prog.root + 1) |idx| {
+                if (can_remat[idx]) folded_load[idx] = true;
+            }
+        }
+    }
+
+    // Iterative Sethi-Ullman / minimum-register-pressure topological schedule for high-pressure
+    // non-gather interior stencils (e.g. 5x5 Kirsch where RPN peak live > 10). Narrow serial chains
+    // (like Mandelbrot, peak_live <= 6) and gather-heavy loops keep RPN order.
+    var schedule: std.ArrayList(ast.NodeIdx) = .empty;
+    defer schedule.deinit(allocator);
+    try schedule.ensureTotalCapacity(allocator, info.live_node_count + 1);
+
+    const use_su_schedule = count == 1 and x_mode == .interior and !info.uses_abs_access and
+        info.live_node_count > 40 and env0.rpn_peak_live > 10;
+    if (!use_su_schedule) {
+        for (0..prog.root + 1) |i| {
+            const idx: ast.NodeIdx = @intCast(i);
+            if (rem_uses0[idx] == 0 or slots0[idx] != null or fused_cmp[idx] or folded_load[idx]) continue;
+            if (nodeConstF32(prog, env0, idx) != null) continue;
+            try schedule.append(allocator, idx);
+        }
+    } else {
+        const su = try allocator.alloc(u32, n_nodes);
+        defer allocator.free(su);
+        @memset(su, 0);
+        for (prog.nodes.items[0 .. prog.root + 1], 0..) |node, idx| {
+            if (rem_uses0[idx] == 0) continue;
+            if (slots0[idx] != null or folded_load[idx] or nodeConstF32(prog, env0, @intCast(idx)) != null) {
+                su[idx] = 0;
+                continue;
+            }
+            su[idx] = switch (node) {
+                .load_abs => |la| blk: {
+                    const s0 = su[la.x];
+                    const s1 = su[la.y];
+                    break :blk @max(@as(u32, 2), if (s0 == s1) s0 + 1 else @max(s0, s1));
+                },
+                .unary => |u| @max(@as(u32, 1), su[u.a]),
+                .binary => |bin| blk: {
+                    const s0 = su[bin.a];
+                    const s1 = su[bin.b];
+                    break :blk @max(@as(u32, 1), if (s0 == s1) s0 + 1 else @max(s0, s1));
+                },
+                .ternary => |t| blk: {
+                    var arr = [3]u32{ su[t.a], su[t.b], su[t.c] };
+                    if (arr[0] < arr[1]) std.mem.swap(u32, &arr[0], &arr[1]);
+                    if (arr[1] < arr[2]) std.mem.swap(u32, &arr[1], &arr[2]);
+                    if (arr[0] < arr[1]) std.mem.swap(u32, &arr[0], &arr[1]);
+                    break :blk @max(@as(u32, 1), @max(arr[0], @max(arr[1] + 1, arr[2] + 2)));
+                },
+                else => 1,
+            };
+        }
+
+        const VisState = enum(u8) { unvisited, expanded, emitted };
+        const vis = try allocator.alloc(VisState, n_nodes);
+        defer allocator.free(vis);
+        @memset(vis, .unvisited);
+
+        const Frame = struct { idx: ast.NodeIdx, post: bool };
+        var dfs_stack: std.ArrayList(Frame) = .empty;
+        defer dfs_stack.deinit(allocator);
+        var dep_buf: std.ArrayList(ast.NodeIdx) = .empty;
+        defer dep_buf.deinit(allocator);
+        var fused_walk: std.ArrayList(ast.NodeIdx) = .empty;
+        defer fused_walk.deinit(allocator);
+
+        const needsEmit = struct {
+            fn run(p: *const ast.Program, e: BodyEnv, rem: []const u32, sl: []const ?RegSlot, fc: []const bool, fl: []const bool, idx: ast.NodeIdx) bool {
+                if (rem[idx] == 0 or sl[idx] != null or fc[idx] or fl[idx]) return false;
+                return nodeConstF32(p, e, idx) == null;
+            }
+        }.run;
+
+        if (needsEmit(prog, env0, rem_uses0, slots0, fused_cmp, folded_load, prog.root)) {
+            try dfs_stack.append(allocator, .{ .idx = prog.root, .post = false });
+        }
+        while (dfs_stack.items.len > 0) {
+            const top = dfs_stack.pop().?;
+            const idx = top.idx;
+            if (top.post) {
+                if (vis[idx] != .emitted) {
+                    vis[idx] = .emitted;
+                    try schedule.append(allocator, idx);
+                }
+                continue;
+            }
+            if (vis[idx] != .unvisited) continue;
+            vis[idx] = .expanded;
+            try dfs_stack.append(allocator, .{ .idx = idx, .post = true });
+
+            dep_buf.clearRetainingCapacity();
+            const node = prog.nodes.items[idx];
+            switch (node) {
+                .load_abs => |la| {
+                    try dep_buf.append(allocator, la.x);
+                    try dep_buf.append(allocator, la.y);
+                },
+                .unary => |u| try dep_buf.append(allocator, u.a),
+                .binary => |bin| {
+                    if (!folded_load[bin.a]) try dep_buf.append(allocator, bin.a);
+                    if (!folded_load[bin.b]) try dep_buf.append(allocator, bin.b);
+                },
+                .ternary => |t| {
+                    if (t.op == .select and fused_cmp[t.a]) {
+                        fused_walk.clearRetainingCapacity();
+                        try fused_walk.append(allocator, t.a);
+                        while (fused_walk.items.len > 0) {
+                            const fidx = fused_walk.pop().?;
+                            if (!fused_cmp[fidx]) {
+                                try dep_buf.append(allocator, fidx);
+                                continue;
+                            }
+                            switch (prog.nodes.items[fidx]) {
+                                .unary => |fu| try fused_walk.append(allocator, fu.a),
+                                .binary => |fbin| {
+                                    try fused_walk.append(allocator, fbin.a);
+                                    try fused_walk.append(allocator, fbin.b);
+                                },
+                                else => {},
+                            }
+                        }
+                    } else {
+                        if (!folded_load[t.a]) try dep_buf.append(allocator, t.a);
+                    }
+                    if (!folded_load[t.b]) try dep_buf.append(allocator, t.b);
+                    if (!folded_load[t.c]) try dep_buf.append(allocator, t.c);
+                },
+                else => {},
+            }
+
+            var write_i: usize = 0;
+            for (dep_buf.items) |d| {
+                if (vis[d] == .unvisited and needsEmit(prog, env0, rem_uses0, slots0, fused_cmp, folded_load, d)) {
+                    dep_buf.items[write_i] = d;
+                    write_i += 1;
+                }
+            }
+            const deps_slice = dep_buf.items[0..write_i];
+            var si: usize = 1;
+            while (si < deps_slice.len) : (si += 1) {
+                const key = deps_slice[si];
+                const key_su = su[key];
+                var sj: usize = si;
+                while (sj > 0 and su[deps_slice[sj - 1]] > key_su) : (sj -= 1) {
+                    deps_slice[sj] = deps_slice[sj - 1];
+                }
+                deps_slice[sj] = key;
+            }
+            for (deps_slice) |d| {
+                try dfs_stack.append(allocator, .{ .idx = d, .post = false });
             }
         }
     }
@@ -1786,378 +2536,628 @@ fn evalDagVector(
         }
     }.run;
 
+    const loadMemF32Interior = struct {
+        fn run(node: ast.Node, w: i32, disp_px: usize, e: BodyEnv) aj.Mem {
+            return switch (node) {
+                .load_clip => |clip| e.rowMem(e.src_row_ptrs[clip].?, 2, @intCast(disp_px * 4)),
+                .load_rel => |rel| blk: {
+                    const row_ptr = e.rowPtrFor(rel.clip, rel.dy, rel.mode);
+                    const eff_dx: i32 = interp.clampRelOffset(rel.dx, w);
+                    const disp: i32 = (eff_dx + @as(i32, @intCast(disp_px))) * 4;
+                    break :blk e.rowMem(row_ptr, 2, disp);
+                },
+                else => unreachable,
+            };
+        }
+    }.run;
+
     const max_plane_bytes_f32: u64 = @as(u64, spec.height) * std.mem.alignForward(u64, @as(u64, spec.width) * 4 + 64, 64);
     const can_hw_gather_f32 = max_plane_bytes_f32 <= 0x7FFF_0000;
+    const w_i32_spec: i32 = @intCast(spec.width);
 
-    for (prog.nodes.items, 0..) |node, idx| {
-        if (rem_uses[idx] == 0) continue;
-        if (slots[idx] != null) continue;
-        if (fused_cmp[idx]) continue;
-        if (nodeConstF32(prog, env, @intCast(idx)) != null) continue;
-
+    for (schedule.items) |idx| {
+        const node = prog.nodes.items[idx];
         const out_ty = info.value_types.items[idx];
-        switch (node) {
-            .const_f32 => {},
-            .const_i32 => |v| {
-                if (out_ty == .i32) {
-                    slots[idx] = .{ .reg = b.constI32Splat(v), .owned = false };
-                }
-            },
-            .load_clip => |clip| {
-                const dst = b.newVec();
-                const fmt = spec.src_fmts[clip];
-                const bps: usize = fmt.bytesPerSample();
-                const shift: u8 = switch (bps) {
-                    1 => 0,
-                    2 => 1,
-                    else => 2,
-                };
-                const mem = switch (x_mode) {
-                    .const_col => |col| aj.Mem.ptr(env.src_row_ptrs[clip].?, @intCast((col + col_disp) * bps)),
-                    .interior => env.rowMem(env.src_row_ptrs[clip].?, shift, @intCast(col_disp * bps)),
-                    .dynamic_left, .dynamic_right => aj.Mem.indexed(env.src_row_ptrs[clip].?, env.x_gp, shift, @intCast(col_disp * bps)),
-                };
-                if (out_ty == .i32) {
-                    pixel.emitLoadI32(b, dst, mem, fmt);
+
+        // On AArch64 NEON 2x-interleaved interior loops, pair contiguous `.load_clip`/`.load_rel`
+        // loads into a single 8B/16B/32B transfer (`ldr d/q + ushll/ushll2`, `fcvtl/fcvtl2`, or `ldp`).
+        if (count == 2 and b.cpu.isa == .neon and x_mode == .interior and
+            col_disps[1] == col_disps[0] + b.cpu.f32_lanes and
+            rem_arr[0][idx] > 0 and slots_arr[0][idx] == null and slots_arr[1][idx] == null and
+            !fused_cmp[idx] and !folded_load[idx] and
+            (node == .load_clip or node == .load_rel))
+        {
+            const clip: ast.ClipId = if (node == .load_clip) node.load_clip else node.load_rel.clip;
+            const fmt = spec.src_fmts[clip];
+            const bps: usize = fmt.bytesPerSample();
+            const shift: u8 = switch (bps) {
+                1 => 0,
+                2 => 1,
+                else => 2,
+            };
+            const mem0 = switch (node) {
+                .load_clip => envs[0].rowMem(envs[0].src_row_ptrs[clip].?, shift, @intCast(col_disps[0] * bps)),
+                .load_rel => |rel| blk: {
+                    const row_ptr = envs[0].rowPtrFor(rel.clip, rel.dy, rel.mode);
+                    const eff_dx: i32 = interp.clampRelOffset(rel.dx, w_i32_spec);
+                    break :blk envs[0].rowMem(row_ptr, shift, (eff_dx + @as(i32, @intCast(col_disps[0]))) * @as(i32, @intCast(bps)));
+                },
+                else => unreachable,
+            };
+            const r0 = b.newVec();
+            const r1 = b.newVec();
+            if (fmt.is_float) {
+                if (fmt.bits_per_sample == 16) {
+                    b.vecCvtF16ToF32x2(r0, r1, mem0);
                 } else {
-                    pixel.emitLoadF32(b, dst, mem, fmt);
+                    b.vecLoadUVecx2(r0, r1, mem0);
                 }
-                slots[idx] = .{ .reg = dst, .owned = true };
-            },
-            .load_rel => |rel| {
-                const dst = b.newVec();
-                emitRelLoad(b, dst, out_ty, spec, env, x_mode, col_disp, rel.clip, rel.dx, rel.dy, rel.mode);
-                slots[idx] = .{ .reg = dst, .owned = true };
-            },
-            .load_abs => |la| {
-                const fmt = spec.src_fmts[la.clip];
-                const shift: u8 = switch (fmt.bytesPerSample()) {
-                    1 => 0,
-                    2 => 1,
-                    else => 2,
-                };
+            } else if (fmt.bits_per_sample <= 16 and out_ty == .f32) {
+                b.vecLoadUintToF32x2(r0, r1, mem0, fmt.bytesPerSample());
+            } else {
+                if (fmt.bits_per_sample <= 8) {
+                    b.vecLoadU8ToU32x2(r0, r1, mem0);
+                } else if (fmt.bits_per_sample <= 16) {
+                    b.vecLoadU16ToU32x2(r0, r1, mem0);
+                } else {
+                    b.vecLoadUVecx2(r0, r1, mem0);
+                }
+                if (out_ty == .f32) {
+                    b.vecOp2(.cvt_i32_to_f32, r0, r0);
+                    b.vecOp2(.cvt_i32_to_f32, r1, r1);
+                }
+            }
+            slots_arr[0][idx] = .{ .reg = r0, .owned = true };
+            slots_arr[1][idx] = .{ .reg = r1, .owned = true };
+            continue;
+        }
 
-                var ix_reg: ?aj.Reg = null;
-                for (abs_x_cache.items) |e| {
-                    if (e.node == la.x and e.mode == la.mode and e.shift == shift) {
-                        ix_reg = e.reg;
-                        break;
+        for (0..count) |s| {
+            const env = envs[s];
+            const slots = slots_arr[s];
+            const rem_uses = rem_arr[s];
+            const col_disp = col_disps[s];
+            const trig_cache = trig_arr[s];
+            const abs_x_cache = &abs_x_arr[s];
+            const abs_y_cache = &abs_y_arr[s];
+            if (rem_uses[idx] == 0) continue;
+            if (slots[idx] != null) continue;
+            if (fused_cmp[idx] or folded_load[idx]) continue;
+            if (nodeConstF32(prog, env, idx) != null) continue;
+
+            switch (node) {
+                .const_f32 => {},
+                .const_i32 => |v| {
+                    if (out_ty == .i32) {
+                        slots[idx] = .{ .reg = b.constI32Splat(v), .owned = false };
                     }
-                }
-                if (ix_reg == null) {
-                    const vx_raw = resolveSlotReg(b, prog, info, env, slots, la.x);
-                    const tx = info.value_types.items[la.x];
-                    const fx = ensureF32(b, vx_raw, tx);
-                    const ix = b.newVec();
-                    emitAbsCoordToI32(b, ix, fx, @intCast(spec.width), la.mode);
-                    if (shift != 0) b.vecOp2i(.sll_u32, ix, ix, shift);
-                    try abs_x_cache.append(allocator, .{ .node = la.x, .mode = la.mode, .shift = shift, .reg = ix });
-                    ix_reg = ix;
-                }
-
-                var iy_reg: ?aj.Reg = null;
-                for (abs_y_cache.items) |e| {
-                    if (e.node == la.y and e.mode == la.mode and e.clip == la.clip) {
-                        iy_reg = e.reg;
-                        break;
-                    }
-                }
-                if (iy_reg == null) {
-                    const vy_raw = resolveSlotReg(b, prog, info, env, slots, la.y);
-                    const ty = info.value_types.items[la.y];
-                    const fy = ensureF32(b, vy_raw, ty);
-                    const iy = b.newVec();
-                    emitAbsCoordToI32(b, iy, fy, @intCast(spec.height), la.mode);
-                    b.vecOp3(.mul_i32, iy, iy, env.src_stride_vecs[la.clip].?);
-                    try abs_y_cache.append(allocator, .{ .node = la.y, .mode = la.mode, .clip = la.clip, .reg = iy });
-                    iy_reg = iy;
-                }
-
-                releaseUse(rem_uses, slots, la.x);
-                releaseUse(rem_uses, slots, la.y);
-
-                const byte_off = b.newVec();
-                b.vecOp3(.add_i32, byte_off, iy_reg.?, ix_reg.?);
-
-                const dst = b.newVec();
-                emitGatherFromBase(b, dst, out_ty, env.base_src_ptrs[la.clip].?, byte_off, fmt, can_hw_gather_f32);
-                slots[idx] = .{ .reg = dst, .owned = true };
-            },
-            .load_prop => |pid| {
-                slots[idx] = .{ .reg = env.prop_regs[pid], .owned = false };
-            },
-            .coord_x => {
-                slots[idx] = .{ .reg = env.v_x.?, .owned = false };
-            },
-            .coord_y => {
-                slots[idx] = .{ .reg = env.v_y.?, .owned = false };
-            },
-            .frame_n => {
-                slots[idx] = .{ .reg = if (out_ty == .i32) env.v_frame_n_i32.? else env.v_frame_n_f32.?, .owned = false };
-            },
-            .plane_width => {
-                slots[idx] = .{
-                    .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.width)) else b.constF32Splat(@floatFromInt(spec.width)),
-                    .owned = false,
-                };
-            },
-            .plane_height => {
-                slots[idx] = .{
-                    .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.height)) else b.constF32Splat(@floatFromInt(spec.height)),
-                    .owned = false,
-                };
-            },
-            .unary => |u| {
-                const src_reg = resolveSlotReg(b, prog, info, env, slots, u.a);
-                const src_ty = info.value_types.items[u.a];
-                const dst = b.newVec();
-
-                if (u.op == .to_f32) {
-                    if (src_ty == .i32) {
-                        b.vecOp2(.cvt_i32_to_f32, dst, src_reg);
+                },
+                .load_clip => |clip| {
+                    const dst = b.newVec();
+                    const fmt = spec.src_fmts[clip];
+                    const bps: usize = fmt.bytesPerSample();
+                    const shift: u8 = switch (bps) {
+                        1 => 0,
+                        2 => 1,
+                        else => 2,
+                    };
+                    const mem = switch (x_mode) {
+                        .const_col => |col| aj.Mem.ptr(env.src_row_ptrs[clip].?, @intCast((col + col_disp) * bps)),
+                        .interior => env.rowMem(env.src_row_ptrs[clip].?, shift, @intCast(col_disp * bps)),
+                        .dynamic_left, .dynamic_right => aj.Mem.indexed(env.src_row_ptrs[clip].?, env.x_gp, shift, @intCast(col_disp * bps)),
+                    };
+                    if (out_ty == .i32) {
+                        pixel.emitLoadI32(b, dst, mem, fmt);
                     } else {
-                        b.vecOp2(.mov, dst, src_reg);
+                        pixel.emitLoadF32(b, dst, mem, fmt);
                     }
-                } else if (out_ty == .i32 and src_ty == .i32) {
-                    emitUnaryI32(b, u.op, dst, src_reg);
-                } else if (out_ty == .i32) {
-                    // V7: `not` / `bitnot` on `.f32` operand producing `.i32` under `opt=1`.
-                    emitUnaryF32ToI32(b, u.op, dst, src_reg);
-                } else {
-                    const a_f = ensureF32(b, src_reg, src_ty);
-                    switch (u.op) {
-                        .sin, .cos => {
-                            const st = trig_cache[u.a] orelse blk: {
-                                const prepared = math_jit.emitTrigPrepare(b, a_f);
-                                trig_cache[u.a] = prepared;
-                                break :blk prepared;
-                            };
-                            switch (u.op) {
-                                .sin => math_jit.emitSinFromState(b, dst, st),
-                                .cos => math_jit.emitCosFromState(b, dst, st),
-                                else => unreachable,
-                            }
-                        },
-                        else => emitUnaryF32(b, u.op, dst, a_f, use_const_mem),
-                    }
-                }
-                releaseUse(rem_uses, slots, u.a);
-                slots[idx] = .{ .reg = dst, .owned = true };
-            },
-            .binary => |bin| {
-                const ta = info.value_types.items[bin.a];
-                const tb = info.value_types.items[bin.b];
-                const dst = b.newVec();
+                    slots[idx] = .{ .reg = dst, .owned = true };
+                },
+                .load_rel => |rel| {
+                    const dst = b.newVec();
+                    emitRelLoad(b, dst, out_ty, spec, env, x_mode, col_disp, rel.clip, rel.dx, rel.dy, rel.mode);
+                    slots[idx] = .{ .reg = dst, .owned = true };
+                },
+                .load_abs => |la| {
+                    const fmt = spec.src_fmts[la.clip];
+                    const bps: usize = fmt.bytesPerSample();
+                    const shift: u8 = switch (bps) {
+                        1 => 0,
+                        2 => 1,
+                        else => 2,
+                    };
 
-                if (out_ty == .i32 and ta == .i32 and tb == .i32) {
-                    emitBinaryI32(b, bin.op, dst, resolveSlotReg(b, prog, info, env, slots, bin.a), resolveSlotReg(b, prog, info, env, slots, bin.b));
-                } else if (out_ty == .i32) {
-                    // V7: comparisons, logic, and bitwise ops on float/mixed operands producing `.i32` under `opt=1`.
-                    const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta);
-                    const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb);
-                    emitBinaryF32ToI32(b, bin.op, dst, af, bf);
-                } else {
-                    const ca = if (use_const_mem) nodeConstF32(prog, env, bin.a) else null;
-                    const cb = if (use_const_mem) nodeConstF32(prog, env, bin.b) else null;
-                    var handled = false;
-                    if (cb) |cv| {
-                        switch (bin.op) {
-                            .add => {
-                                b.vecAddCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                handled = true;
-                            },
-                            .sub => {
-                                b.vecSubCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                handled = true;
-                            },
-                            .mul => {
-                                b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                handled = true;
-                            },
-                            .min => {
-                                b.vecMinCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                handled = true;
-                            },
-                            .max => {
-                                b.vecMaxCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                handled = true;
-                            },
-                            else => {},
+                    // Fast contiguous vector load for `X const_y x[]` and `X Y x[]` (zero gather).
+                    const direct_row: ?aj.Reg = if (x_mode == .interior or x_mode == .const_col) blk: {
+                        if (env.abs_row_ptrs.len == n_nodes) {
+                            if (env.abs_row_ptrs[idx]) |rp| break :blk rp;
+                        }
+                        if (prog.nodes.items[la.x] == .coord_x and prog.nodes.items[la.y] == .coord_y and
+                            spec.width <= (1 << 24) and spec.height <= (1 << 24))
+                        {
+                            break :blk env.src_row_ptrs[la.clip].?;
+                        }
+                        break :blk null;
+                    } else null;
+
+                    if (direct_row) |rptr| {
+                        releaseUse(rem_uses, slots, la.x);
+                        releaseUse(rem_uses, slots, la.y);
+                        const mem = switch (x_mode) {
+                            .const_col => |col| aj.Mem.ptr(rptr, @intCast((col + col_disp) * bps)),
+                            .interior => env.rowMem(rptr, shift, @intCast(col_disp * bps)),
+                            .dynamic_left, .dynamic_right => unreachable,
+                        };
+                        const dst = b.newVec();
+                        if (out_ty == .i32) {
+                            pixel.emitLoadI32(b, dst, mem, fmt);
+                        } else {
+                            pixel.emitLoadF32(b, dst, mem, fmt);
+                        }
+                        slots[idx] = .{ .reg = dst, .owned = true };
+                        continue;
+                    }
+
+                    var ix_reg: ?aj.Reg = null;
+                    for (abs_x_cache.items) |e| {
+                        if (e.node == la.x and e.mode == la.mode and e.shift == shift) {
+                            ix_reg = e.reg;
+                            break;
                         }
                     }
-                    if (!handled and ca != null) {
-                        const cv = ca.?;
-                        switch (bin.op) {
-                            .add => {
-                                b.vecAddCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb), cv);
-                                handled = true;
-                            },
-                            .mul => {
-                                b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb), cv);
-                                handled = true;
-                            },
-                            else => {},
+                    if (ix_reg == null) {
+                        const vx_raw = resolveSlotReg(b, prog, info, env, slots, la.x);
+                        const tx = info.value_types.items[la.x];
+                        const fx = ensureF32(b, vx_raw, tx);
+                        const ix = b.newVec();
+                        emitAbsCoordToI32(b, ix, fx, @intCast(spec.width), la.mode);
+                        if (shift != 0) b.vecOp2i(.sll_u32, ix, ix, shift);
+                        try abs_x_cache.append(allocator, .{ .node = la.x, .mode = la.mode, .shift = shift, .reg = ix });
+                        ix_reg = ix;
+                    }
+
+                    var iy_reg: ?aj.Reg = null;
+                    for (abs_y_cache.items) |e| {
+                        if (e.node == la.y and e.mode == la.mode and e.clip == la.clip) {
+                            iy_reg = e.reg;
+                            break;
                         }
                     }
-                    if (!handled and bin.op == .mod) {
-                        if (nodeConstF32(prog, env, bin.b)) |mod_c| {
-                            if (isExactPow2Divisor(mod_c)) {
-                                emitModPow2F32(b, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), mod_c);
-                                handled = true;
+                    if (iy_reg == null) {
+                        const vy_raw = resolveSlotReg(b, prog, info, env, slots, la.y);
+                        const ty = info.value_types.items[la.y];
+                        const fy = ensureF32(b, vy_raw, ty);
+                        const iy = b.newVec();
+                        emitAbsCoordToI32(b, iy, fy, @intCast(spec.height), la.mode);
+                        b.vecOp3(.mul_i32, iy, iy, env.src_stride_vecs[la.clip].?);
+                        try abs_y_cache.append(allocator, .{ .node = la.y, .mode = la.mode, .clip = la.clip, .reg = iy });
+                        iy_reg = iy;
+                    }
+
+                    releaseUse(rem_uses, slots, la.x);
+                    releaseUse(rem_uses, slots, la.y);
+
+                    const byte_off = b.newVec();
+                    b.vecOp3(.add_i32, byte_off, iy_reg.?, ix_reg.?);
+
+                    const dst = b.newVec();
+                    emitGatherFromBase(b, dst, out_ty, env.base_src_ptrs[la.clip].?, byte_off, fmt, can_hw_gather_f32);
+                    slots[idx] = .{ .reg = dst, .owned = true };
+                },
+                .load_prop => |pid| {
+                    slots[idx] = .{ .reg = env.prop_regs[pid], .owned = false };
+                },
+                .coord_x => {
+                    slots[idx] = .{ .reg = env.v_x.?, .owned = false };
+                },
+                .coord_y => {
+                    slots[idx] = .{ .reg = env.v_y.?, .owned = false };
+                },
+                .frame_n => {
+                    slots[idx] = .{ .reg = if (out_ty == .i32) env.v_frame_n_i32.? else env.v_frame_n_f32.?, .owned = false };
+                },
+                .plane_width => {
+                    slots[idx] = .{
+                        .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.width)) else b.constF32Splat(@floatFromInt(spec.width)),
+                        .owned = false,
+                    };
+                },
+                .plane_height => {
+                    slots[idx] = .{
+                        .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.height)) else b.constF32Splat(@floatFromInt(spec.height)),
+                        .owned = false,
+                    };
+                },
+                .unary => |u| {
+                    const src_reg = resolveSlotReg(b, prog, info, env, slots, u.a);
+                    const src_ty = info.value_types.items[u.a];
+                    const dst = b.newVec();
+
+                    if (u.op == .to_f32) {
+                        if (src_ty == .i32) {
+                            b.vecOp2(.cvt_i32_to_f32, dst, src_reg);
+                        } else {
+                            b.vecOp2(.mov, dst, src_reg);
+                        }
+                    } else if (out_ty == .i32 and src_ty == .i32) {
+                        emitUnaryI32(b, u.op, dst, src_reg);
+                    } else if (out_ty == .i32) {
+                        // V7: `not` / `bitnot` on `.f32` operand producing `.i32` under `opt=1`.
+                        emitUnaryF32ToI32(b, u.op, dst, src_reg);
+                    } else {
+                        const a_f = ensureF32(b, src_reg, src_ty);
+                        switch (u.op) {
+                            .sin, .cos => {
+                                const st = trig_cache[u.a] orelse blk: {
+                                    const prepared = math_jit.emitTrigPrepare(b, a_f);
+                                    trig_cache[u.a] = prepared;
+                                    break :blk prepared;
+                                };
+                                switch (u.op) {
+                                    .sin => math_jit.emitSinFromState(b, dst, st),
+                                    .cos => math_jit.emitCosFromState(b, dst, st),
+                                    else => unreachable,
+                                }
+                            },
+                            else => emitUnaryF32(b, u.op, dst, a_f, use_const_mem),
+                        }
+                    }
+                    releaseUse(rem_uses, slots, u.a);
+                    slots[idx] = .{ .reg = dst, .owned = true };
+                },
+                .binary => |bin| {
+                    const ta = info.value_types.items[bin.a];
+                    const tb = info.value_types.items[bin.b];
+                    const dst = b.newVec();
+
+                    if (out_ty == .i32 and ta == .i32 and tb == .i32) {
+                        const a_reg = resolveSlotReg(b, prog, info, env, slots, bin.a);
+                        const b_reg = resolveSlotReg(b, prog, info, env, slots, bin.b);
+                        if (bin.op == .mul) {
+                            if (prog.nodes.items[bin.b] == .const_i32 and prog.nodes.items[bin.b].const_i32 > 0) {
+                                const iv: u32 = @intCast(prog.nodes.items[bin.b].const_i32);
+                                if (std.math.isPowerOfTwo(iv)) {
+                                    const sh: u5 = @intCast(@ctz(iv));
+                                    if (sh == 0) b.vecOp2(.mov, dst, a_reg) else if (sh == 1) b.vecOp3(.add_i32, dst, a_reg, a_reg) else b.vecOp2i(.sll_u32, dst, a_reg, sh);
+                                } else {
+                                    b.vecOp3(.mul_i32, dst, a_reg, b_reg);
+                                }
+                            } else if (prog.nodes.items[bin.a] == .const_i32 and prog.nodes.items[bin.a].const_i32 > 0) {
+                                const iv: u32 = @intCast(prog.nodes.items[bin.a].const_i32);
+                                if (std.math.isPowerOfTwo(iv)) {
+                                    const sh: u5 = @intCast(@ctz(iv));
+                                    if (sh == 0) b.vecOp2(.mov, dst, b_reg) else if (sh == 1) b.vecOp3(.add_i32, dst, b_reg, b_reg) else b.vecOp2i(.sll_u32, dst, b_reg, sh);
+                                } else {
+                                    b.vecOp3(.mul_i32, dst, a_reg, b_reg);
+                                }
+                            } else {
+                                b.vecOp3(.mul_i32, dst, a_reg, b_reg);
                             }
+                        } else {
+                            emitBinaryI32(b, bin.op, dst, a_reg, b_reg);
                         }
-                    }
-                    if (!handled) {
+                    } else if (out_ty == .i32) {
+                        // V7: comparisons, logic, and bitwise ops on float/mixed operands producing `.i32` under `opt=1`.
                         const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta);
                         const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb);
-                        emitBinaryF32(b, bin.op, dst, af, bf);
-                    }
-                }
-                releaseUse(rem_uses, slots, bin.a);
-                releaseUse(rem_uses, slots, bin.b);
-                slots[idx] = .{ .reg = dst, .owned = true };
-            },
-            .ternary => |t| {
-                const ta = info.value_types.items[t.a];
-                const tb = info.value_types.items[t.b];
-                const tc = info.value_types.items[t.c];
-                // Reuse single-use owned accumulator `t.c` in-place for FMA (`vfmadd231ps`/`vfnmadd231ps`)
-                // to eliminate `vmovaps`/`vmovdqa` copies (including `fnmadd(a, t, a)` where `a` has 2 uses here).
-                const c_owned = if (slots[t.c]) |sc| sc.owned else false;
-                const c_sole_here = (rem_uses[t.c] == 1 and t.c != t.a and t.c != t.b) or
-                    (rem_uses[t.c] == 2 and t.c == t.a and t.c != t.b) or
-                    (rem_uses[t.c] == 2 and t.c == t.b and t.c != t.a);
-                const reuse_c = (t.op == .fmadd or t.op == .fnmadd) and tc == .f32 and c_owned and c_sole_here;
-                const dst = if (reuse_c) slots[t.c].?.reg else b.newVec();
-
-                if (out_ty == .i32 and t.op == .select and tb == .i32 and tc == .i32) {
-                    if (fused_cmp[t.a]) {
-                        const cb = prog.nodes.items[t.a].binary;
-                        const lhs_reg = resolveSlotReg(b, prog, info, env, slots, cb.a);
-                        const rhs_reg = resolveSlotReg(b, prog, info, env, slots, cb.b);
-                        const mask = b.newVec();
-                        var invert = false;
-                        switch (cb.op) {
-                            .gt => b.vecOp3(.cmp_gt_i32, mask, lhs_reg, rhs_reg),
-                            .lt => b.vecOp3(.cmp_gt_i32, mask, rhs_reg, lhs_reg),
-                            .eq => b.vecOp3(.cmp_eq_i32, mask, lhs_reg, rhs_reg),
-                            .le => {
-                                b.vecOp3(.cmp_gt_i32, mask, lhs_reg, rhs_reg);
-                                invert = true;
-                            },
-                            .ge => {
-                                b.vecOp3(.cmp_gt_i32, mask, rhs_reg, lhs_reg);
-                                invert = true;
-                            },
-                            else => unreachable,
+                        emitBinaryF32ToI32(b, bin.op, dst, af, bf);
+                    } else {
+                        var handled = false;
+                        // Bit-exact IEEE-754 strength reduction: `x * 2.0 -> x + x` (`vaddps` runs on Zn3FP2/3
+                        // instead of saturated Zn3FP0/1 and needs no constant load/register).
+                        if (bin.op == .mul) {
+                            const c_rhs = if (!folded_load[bin.a]) nodeConstF32(prog, env, bin.b) else null;
+                            const c_lhs = if (!folded_load[bin.b]) nodeConstF32(prog, env, bin.a) else null;
+                            if (c_rhs != null and c_rhs.? == 2.0) {
+                                const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta);
+                                b.vecOp3(.add_f32, dst, af, af);
+                                handled = true;
+                            } else if (c_lhs != null and c_lhs.? == 2.0) {
+                                const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb);
+                                b.vecOp3(.add_f32, dst, bf, bf);
+                                handled = true;
+                            }
                         }
-                        releaseUse(rem_uses, slots, cb.a);
-                        releaseUse(rem_uses, slots, cb.b);
+                        // Pin high-frequency constants (`use_counts >= 6`, e.g. `2.0` in Mandelbrot) in a
+                        // vector register on low-pressure chains instead of reloading `[rip+off]` repeatedly.
+                        const ca = if (!handled and use_const_mem and !folded_load[bin.b] and (!pin_hot_const or info.use_counts.items[bin.a] < 6)) nodeConstF32(prog, env, bin.a) else null;
+                        const cb = if (!handled and use_const_mem and !folded_load[bin.a] and (!pin_hot_const or info.use_counts.items[bin.b] < 6)) nodeConstF32(prog, env, bin.b) else null;
+                        if (cb) |cv| {
+                            switch (bin.op) {
+                                .add => {
+                                    b.vecAddCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
+                                    handled = true;
+                                },
+                                .sub => {
+                                    b.vecSubCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
+                                    handled = true;
+                                },
+                                .mul => {
+                                    b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
+                                    handled = true;
+                                },
+                                .min => {
+                                    b.vecMinCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
+                                    handled = true;
+                                },
+                                .max => {
+                                    b.vecMaxCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
+                                    handled = true;
+                                },
+                                else => {},
+                            }
+                        }
+                        if (!handled and ca != null) {
+                            const cv = ca.?;
+                            switch (bin.op) {
+                                .add => {
+                                    b.vecAddCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb), cv);
+                                    handled = true;
+                                },
+                                .mul => {
+                                    b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb), cv);
+                                    handled = true;
+                                },
+                                else => {},
+                            }
+                        }
+                        if (!handled and bin.op == .mod) {
+                            if (nodeConstF32(prog, env, bin.b)) |mod_c| {
+                                if (isExactPow2Divisor(mod_c)) {
+                                    emitModPow2F32(b, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), mod_c);
+                                    handled = true;
+                                }
+                            }
+                        }
+                        if (!handled and (folded_load[bin.b] or folded_load[bin.a])) {
+                            const vop: aj.VecOp3 = switch (bin.op) {
+                                .add => .add_f32,
+                                .sub => .sub_f32,
+                                .mul => .mul_f32,
+                                .min => .min_f32,
+                                .max => .max_f32,
+                                else => unreachable,
+                            };
+                            if (folded_load[bin.b]) {
+                                const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta);
+                                const mem = loadMemF32Interior(prog.nodes.items[bin.b], w_i32_spec, col_disp, env);
+                                b.vecOp3Mem(vop, dst, af, mem);
+                            } else {
+                                const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb);
+                                const mem = loadMemF32Interior(prog.nodes.items[bin.a], w_i32_spec, col_disp, env);
+                                b.vecOp3Mem(vop, dst, bf, mem);
+                            }
+                            handled = true;
+                        }
+                        if (!handled) {
+                            const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta);
+                            const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb);
+                            emitBinaryF32(b, bin.op, dst, af, bf);
+                        }
+                    }
+                    releaseUse(rem_uses, slots, bin.a);
+                    releaseUse(rem_uses, slots, bin.b);
+                    slots[idx] = .{ .reg = dst, .owned = true };
+                },
+                .ternary => |t| {
+                    const ta = info.value_types.items[t.a];
+                    const tb = info.value_types.items[t.b];
+                    const tc = info.value_types.items[t.c];
+                    const soleHere = struct {
+                        fn run(rem: []const u32, a_idx: ast.NodeIdx, b_idx: ast.NodeIdx, c_idx: ast.NodeIdx, target: ast.NodeIdx) bool {
+                            var n: u32 = 0;
+                            if (a_idx == target) n += 1;
+                            if (b_idx == target) n += 1;
+                            if (c_idx == target) n += 1;
+                            return rem[target] == n;
+                        }
+                    }.run;
+                    // Reuse single-use owned FMA operand in-place (`vfmadd231ps`/`vfmsub231ps`/`vfnmadd231ps`
+                    // on `t.c`, and `vfmadd213ps`/`vfmsub213ps` on `t.a`/`t.b` on x86 FMA) to eliminate
+                    // `vmovdqa`/`vmovaps` copies.
+                    const is_fma = t.op == .fmadd or t.op == .fmsub or t.op == .fnmadd or t.op == .fnmsub;
+                    const c_owned = if (slots[t.c]) |sc| sc.owned else false;
+                    const reuse_c = is_fma and tc == .f32 and c_owned and soleHere(rem_uses, t.a, t.b, t.c, t.c);
+                    var dst: aj.Reg = undefined;
 
-                        const t_idx = if (invert) t.c else t.b;
-                        const f_idx = if (invert) t.b else t.c;
-                        const f_is_zero = prog.nodes.items[f_idx] == .const_i32 and prog.nodes.items[f_idx].const_i32 == 0;
-                        const t_is_zero = prog.nodes.items[t_idx] == .const_i32 and prog.nodes.items[t_idx].const_i32 == 0;
-                        if (f_is_zero) {
-                            const t_reg = resolveSlotReg(b, prog, info, env, slots, t_idx);
-                            b.vecOp3(.and_u32, dst, t_reg, mask);
-                        } else if (t_is_zero) {
-                            const f_reg = resolveSlotReg(b, prog, info, env, slots, f_idx);
-                            b.vecOp3(.andn_u32, dst, mask, f_reg);
+                    if (out_ty == .i32 and t.op == .select and tb == .i32 and tc == .i32) {
+                        dst = b.newVec();
+                        if (fused_cmp[t.a]) {
+                            const cb = prog.nodes.items[t.a].binary;
+                            const lhs_reg = resolveSlotReg(b, prog, info, env, slots, cb.a);
+                            const rhs_reg = resolveSlotReg(b, prog, info, env, slots, cb.b);
+                            const mask = b.newVec();
+                            var invert = false;
+                            switch (cb.op) {
+                                .gt => b.vecOp3(.cmp_gt_i32, mask, lhs_reg, rhs_reg),
+                                .lt => b.vecOp3(.cmp_gt_i32, mask, rhs_reg, lhs_reg),
+                                .eq => b.vecOp3(.cmp_eq_i32, mask, lhs_reg, rhs_reg),
+                                .le => {
+                                    b.vecOp3(.cmp_gt_i32, mask, lhs_reg, rhs_reg);
+                                    invert = true;
+                                },
+                                .ge => {
+                                    b.vecOp3(.cmp_gt_i32, mask, rhs_reg, lhs_reg);
+                                    invert = true;
+                                },
+                                else => unreachable,
+                            }
+                            releaseUse(rem_uses, slots, cb.a);
+                            releaseUse(rem_uses, slots, cb.b);
+
+                            const t_idx = if (invert) t.c else t.b;
+                            const f_idx = if (invert) t.b else t.c;
+                            const f_is_zero = prog.nodes.items[f_idx] == .const_i32 and prog.nodes.items[f_idx].const_i32 == 0;
+                            const t_is_zero = prog.nodes.items[t_idx] == .const_i32 and prog.nodes.items[t_idx].const_i32 == 0;
+                            if (f_is_zero) {
+                                const t_reg = resolveSlotReg(b, prog, info, env, slots, t_idx);
+                                b.vecOp3(.and_u32, dst, t_reg, mask);
+                            } else if (t_is_zero) {
+                                const f_reg = resolveSlotReg(b, prog, info, env, slots, f_idx);
+                                b.vecOp3(.andn_u32, dst, mask, f_reg);
+                            } else {
+                                const t_reg = resolveSlotReg(b, prog, info, env, slots, t_idx);
+                                const f_reg = resolveSlotReg(b, prog, info, env, slots, f_idx);
+                                if (b.cpu.prefersMaskDstReuse()) dst = mask;
+                                pixel.emitSelectByMask(b, dst, f_reg, t_reg, mask);
+                            }
                         } else {
-                            const t_reg = resolveSlotReg(b, prog, info, env, slots, t_idx);
-                            const f_reg = resolveSlotReg(b, prog, info, env, slots, f_idx);
-                            pixel.emitSelectByMask(b, dst, f_reg, t_reg, mask);
+                            const a_reg = resolveSlotReg(b, prog, info, env, slots, t.a);
+                            const b_reg = resolveSlotReg(b, prog, info, env, slots, t.b);
+                            const c_reg = resolveSlotReg(b, prog, info, env, slots, t.c);
+                            const mask = if (b.cpu.prefersMaskDstReuse()) dst else b.newVec();
+                            if (ta == .i32) {
+                                b.vecOp3(.cmp_gt_i32, mask, a_reg, b.vecZero());
+                            } else {
+                                b.vecOp3(.cmp_gt_f32, mask, a_reg, b.vecZero());
+                            }
+                            pixel.emitSelectByMask(b, dst, c_reg, b_reg, mask);
+                        }
+                    } else if (t.op == .select and fused_cmp[t.a]) {
+                        // Fused `(cmp / and / or / xor / not tree) ? true_val : false_val` in FP domain!
+                        const mask = emitBoolMaskF32(b, prog, info, env, slots, rem_uses, fused_cmp, use_const_mem, t.a);
+
+                        const c_zero = if (nodeConstF32(prog, env, t.c)) |cv| isPosZeroF32(cv) else false;
+                        const b_zero = if (nodeConstF32(prog, env, t.b)) |bv| isPosZeroF32(bv) else false;
+                        if (c_zero) {
+                            dst = b.newVec();
+                            const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                            b.vecAndF32(dst, bf, mask);
+                        } else if (b_zero) {
+                            dst = b.newVec();
+                            const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
+                            b.vecAndnF32(dst, mask, cf);
+                        } else {
+                            dst = if (b.cpu.prefersMaskDstReuse()) mask else b.newVec();
+                            const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                            const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
+                            pixel.emitSelectF32ByMask(b, dst, cf, bf, mask);
                         }
                     } else {
-                        const a_reg = resolveSlotReg(b, prog, info, env, slots, t.a);
-                        const b_reg = resolveSlotReg(b, prog, info, env, slots, t.b);
-                        const c_reg = resolveSlotReg(b, prog, info, env, slots, t.c);
-                        const mask = b.newVec();
-                        if (ta == .i32) {
-                            b.vecOp3(.cmp_gt_i32, mask, a_reg, b.vecZero());
-                        } else {
-                            b.vecOp3(.cmp_gt_f32, mask, a_reg, b.vecZero());
-                        }
-                        pixel.emitSelectByMask(b, dst, c_reg, b_reg, mask);
-                    }
-                } else if (t.op == .select and fused_cmp[t.a]) {
-                    // Fused `(cmp / and / or / xor / not tree) ? true_val : false_val` in FP domain!
-                    const mask = emitBoolMaskF32(b, prog, info, env, slots, rem_uses, fused_cmp, use_const_mem, t.a);
-
-                    const c_zero = if (nodeConstF32(prog, env, t.c)) |cv| isPosZeroF32(cv) else false;
-                    const b_zero = if (nodeConstF32(prog, env, t.b)) |bv| isPosZeroF32(bv) else false;
-                    if (c_zero) {
-                        const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
-                        b.vecAndF32(dst, bf, mask);
-                    } else if (b_zero) {
-                        const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
-                        b.vecAndnF32(dst, mask, cf);
-                    } else {
-                        const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
-                        const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
-                        pixel.emitSelectF32ByMask(b, dst, cf, bf, mask);
-                    }
-                } else {
-                    const ca = if (use_const_mem) nodeConstF32(prog, env, t.a) else null;
-                    const cb = if (use_const_mem) nodeConstF32(prog, env, t.b) else null;
-                    const cc = if (use_const_mem) nodeConstF32(prog, env, t.c) else null;
-                    var handled = false;
-                    if (t.op == .fmadd) {
-                        if (cb != null and ca == null and cc == null) {
-                            const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
+                        var handled = false;
+                        if ((t.op == .fmadd or t.op == .fnmadd) and (folded_load[t.a] or folded_load[t.b])) {
+                            dst = if (reuse_c) slots[t.c].?.reg else b.newVec();
                             const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
-                            b.vecFmaACF32(dst, af, cb.?, cf);
-                            handled = true;
-                        } else if (ca != null and cb == null and cc == null) {
-                            const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
-                            const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
-                            b.vecFmaACF32(dst, bf, ca.?, cf);
-                            handled = true;
-                        } else if (cc != null and ca == null and cb == null) {
-                            const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
-                            const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
-                            b.vecFmaBCF32(dst, af, bf, cc.?);
-                            handled = true;
-                        } else if (ca != null and cc != null and cb == null) {
-                            const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
-                            b.vecFmaCCF32(dst, bf, ca.?, cc.?);
-                            handled = true;
-                        } else if (cb != null and cc != null and ca == null) {
-                            const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
-                            b.vecFmaCCF32(dst, af, cb.?, cc.?);
+                            if (folded_load[t.a]) {
+                                const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                                const mem = loadMemF32Interior(prog.nodes.items[t.a], w_i32_spec, col_disp, env);
+                                if (t.op == .fmadd) b.vecFmaMemF32(dst, bf, mem, cf) else b.vecFnmaMemF32(dst, bf, mem, cf);
+                            } else {
+                                const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
+                                const mem = loadMemF32Interior(prog.nodes.items[t.b], w_i32_spec, col_disp, env);
+                                if (t.op == .fmadd) b.vecFmaMemF32(dst, af, mem, cf) else b.vecFnmaMemF32(dst, af, mem, cf);
+                            }
                             handled = true;
                         }
-                    } else if (t.op == .fnmadd) {
-                        if (cb != null and ca == null and cc == null) {
+                        const ca = if (!handled and use_const_mem and (!pin_hot_const or info.use_counts.items[t.a] < 6)) nodeConstF32(prog, env, t.a) else null;
+                        const cb = if (!handled and use_const_mem and (!pin_hot_const or info.use_counts.items[t.b] < 6)) nodeConstF32(prog, env, t.b) else null;
+                        const cc = if (!handled and use_const_mem and (!pin_hot_const or info.use_counts.items[t.c] < 6)) nodeConstF32(prog, env, t.c) else null;
+                        if (!handled and t.op == .fmadd) {
+                            if (cb != null and ca == null and cc == null) {
+                                dst = if (reuse_c) slots[t.c].?.reg else b.newVec();
+                                const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
+                                const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
+                                b.vecFmaACF32(dst, af, cb.?, cf);
+                                handled = true;
+                            } else if (ca != null and cb == null and cc == null) {
+                                dst = if (reuse_c) slots[t.c].?.reg else b.newVec();
+                                const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                                const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
+                                b.vecFmaACF32(dst, bf, ca.?, cf);
+                                handled = true;
+                            } else if (cc != null and ca == null and cb == null) {
+                                const a_owned = if (slots[t.a]) |sa| sa.owned else false;
+                                const b_owned = if (slots[t.b]) |sb| sb.owned else false;
+                                if (b.cpu.has_fma and b.cpu.isa != .neon and ta == .f32 and a_owned and soleHere(rem_uses, t.a, t.b, t.c, t.a)) {
+                                    dst = slots[t.a].?.reg;
+                                } else if (b.cpu.has_fma and b.cpu.isa != .neon and tb == .f32 and b_owned and soleHere(rem_uses, t.a, t.b, t.c, t.b)) {
+                                    dst = slots[t.b].?.reg;
+                                } else {
+                                    dst = b.newVec();
+                                }
+                                const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
+                                const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                                b.vecFmaBCF32(dst, af, bf, cc.?);
+                                handled = true;
+                            } else if (ca != null and cc != null and cb == null) {
+                                dst = b.newVec();
+                                const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                                b.vecFmaCCF32(dst, bf, ca.?, cc.?);
+                                handled = true;
+                            } else if (cb != null and cc != null and ca == null) {
+                                dst = b.newVec();
+                                const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
+                                b.vecFmaCCF32(dst, af, cb.?, cc.?);
+                                handled = true;
+                            }
+                        } else if (!handled and t.op == .fnmadd) {
+                            if (cb != null and ca == null and cc == null) {
+                                dst = if (reuse_c) slots[t.c].?.reg else b.newVec();
+                                const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
+                                const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
+                                b.vecFnmaBCF32(dst, af, cb.?, cf);
+                                handled = true;
+                            } else if (ca != null and cb == null and cc == null) {
+                                dst = if (reuse_c) slots[t.c].?.reg else b.newVec();
+                                const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                                const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
+                                b.vecFnmaBCF32(dst, bf, ca.?, cf);
+                                handled = true;
+                            }
+                        }
+                        if (!handled) {
+                            // On AArch64 NEON, `fmsub(a, b, const_c)` and `fnmsub(a, b, const_c)` lower to
+                            // `fneg + fmla/fmls` (2 insns). Negating a compile-time f32 constant is IEEE-754
+                            // bit-exact and turns them into a single `fmla`/`fmls` with `-const_c`.
+                            if (b.cpu.isa == .neon and (t.op == .fmsub or t.op == .fnmsub)) {
+                                if (nodeConstF32(prog, env, t.c)) |cv| {
+                                    dst = b.newVec();
+                                    const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
+                                    const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
+                                    const neg_c_reg = b.constF32Splat(-cv);
+                                    const alt_op: ast.TernaryOp = if (t.op == .fmsub) .fmadd else .fnmadd;
+                                    emitTernaryF32(b, alt_op, dst, af, bf, neg_c_reg);
+                                    handled = true;
+                                }
+                            }
+                        }
+                        if (!handled) {
+                            if (reuse_c) {
+                                dst = slots[t.c].?.reg;
+                            } else if (is_fma and b.cpu.has_fma and b.cpu.isa != .neon) {
+                                const a_owned = if (slots[t.a]) |sa| sa.owned else false;
+                                const b_owned = if (slots[t.b]) |sb| sb.owned else false;
+                                if (ta == .f32 and a_owned and soleHere(rem_uses, t.a, t.b, t.c, t.a)) {
+                                    dst = slots[t.a].?.reg;
+                                } else if (tb == .f32 and b_owned and soleHere(rem_uses, t.a, t.b, t.c, t.b)) {
+                                    dst = slots[t.b].?.reg;
+                                } else {
+                                    dst = b.newVec();
+                                }
+                            } else {
+                                dst = b.newVec();
+                            }
                             const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
-                            const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
-                            b.vecFnmaBCF32(dst, af, cb.?, cf);
-                            handled = true;
-                        } else if (ca != null and cb == null and cc == null) {
                             const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
                             const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
-                            b.vecFnmaBCF32(dst, bf, ca.?, cf);
-                            handled = true;
+                            emitTernaryF32(b, t.op, dst, af, bf, cf);
                         }
                     }
-                    if (!handled) {
-                        const af = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.a), ta);
-                        const bf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.b), tb);
-                        const cf = ensureF32(b, resolveSlotReg(b, prog, info, env, slots, t.c), tc);
-                        emitTernaryF32(b, t.op, dst, af, bf, cf);
-                    }
-                }
-                releaseUse(rem_uses, slots, t.a);
-                releaseUse(rem_uses, slots, t.b);
-                releaseUse(rem_uses, slots, t.c);
-                slots[idx] = .{ .reg = dst, .owned = true };
-            },
-            .arg_extrema, .arg_sort_elem => unreachable,
+                    releaseUse(rem_uses, slots, t.a);
+                    releaseUse(rem_uses, slots, t.b);
+                    releaseUse(rem_uses, slots, t.c);
+                    slots[idx] = .{ .reg = dst, .owned = true };
+                },
+                .arg_extrema, .arg_sort_elem => unreachable,
+            }
         }
     }
 
-    return resolveSlotReg(b, prog, info, env, slots, prog.root);
+    var results: [count]aj.Reg = undefined;
+    inline for (0..count) |s| {
+        results[s] = resolveSlotReg(b, prog, info, envs[s], slots_arr[s], prog.root);
+    }
+    return results;
 }
 
 fn emitDagBody(
@@ -2170,8 +3170,10 @@ fn emitDagBody(
     x_mode: XMode,
 ) std.mem.Allocator.Error!void {
     // P2: use RIP-relative const-memory operands only on high-pressure / gather bodies;
-    // small low-pressure kernels keep constants hoisted in vector registers.
-    const use_const_mem = info.live_node_count > 24 or info.uses_abs_access;
+    // small low-pressure kernels keep constants hoisted in vector registers (32-reg AVX-512
+    // keeps constants in ZMMs up to 48 live nodes using 4B prologue vbroadcastss).
+    const const_mem_thresh: usize = if (b.cpu.has_avx512) 48 else 24;
+    const use_const_mem = info.live_node_count > const_mem_thresh or info.uses_abs_access;
     const root_reg = try evalDagVector(allocator, b, prog, info, spec, env, x_mode, 0, use_const_mem, null);
     const dst_bps: usize = spec.dst_fmt.bytesPerSample();
     const dst_shift: u8 = switch (dst_bps) {
@@ -2193,6 +3195,10 @@ fn emitDagBody(
 
 /// 2x unrolled interior body evaluating `x` and `x + f32_lanes`,
 /// pairing `f16`/`f32`/`u32` NEON loads and `u8`/`u16`/`f16`/`f32`/`u32` stores.
+/// Largest body (`live_node_count`) that converts NEON u8/u16 loads with the 2^23 bias
+/// sequence; past it, the two extra pinned constants cost spills (kirsch p8: 14 -> 21 stores).
+const neon_bias_load_max_nodes = 48;
+
 fn emitDagBodyX2(
     allocator: std.mem.Allocator,
     b: *aj.Builder,
@@ -2202,11 +3208,13 @@ fn emitDagBodyX2(
     env: BodyEnv,
     v_lane_step_f32: ?aj.Reg,
     v_lane_step_i32: ?aj.Reg,
+    interleave: bool,
 ) std.mem.Allocator.Error!void {
     const lanes: usize = b.cpu.f32_lanes;
-    // P2: small 2x-unrolled kernels keep constants hoisted in vector registers;
-    // larger kernels (e.g. high-degree polyval) fold constants from RIP-relative memory to avoid spills.
-    const use_const_mem = info.live_node_count > 24;
+    // P2: small 2x-unrolled kernels keep constants hoisted in vector registers (32-reg AVX-512
+    // keeps constants in ZMMs up to 48 live nodes using 4B prologue vbroadcastss).
+    const const_mem_thresh: usize = if (b.cpu.has_avx512) 48 else 24;
+    const use_const_mem = info.live_node_count > const_mem_thresh;
 
     // On AArch64 NEON, preload paired `.load_clip` nodes via single 16B `ldr q + fcvtl/fcvtl2` (f16)
     // or `ldp q0, q1` (f32/u32 with running pointers) before evaluating both halves.
@@ -2216,15 +3224,17 @@ fn emitDagBodyX2(
     defer if (pre0) |p| allocator.free(p);
     defer if (pre1) |p| allocator.free(p);
 
-    if (b.cpu.isa == .neon) {
+    if (b.cpu.isa == .neon and !interleave) {
         var any_pair = false;
         for (prog.nodes.items, 0..) |node, idx| {
             if (idx != prog.root and info.use_counts.items[idx] == 0) continue;
             if (node != .load_clip) continue;
             const fmt = spec.src_fmts[node.load_clip];
+            const is_u8_pair = !fmt.is_float and fmt.bits_per_sample <= 8;
+            const is_u16_pair = !fmt.is_float and fmt.bits_per_sample > 8 and fmt.bits_per_sample <= 16;
             const is_f16_pair = fmt.is_float and fmt.bits_per_sample == 16;
             const is_32_pair = env.use_pair_mem and fmt.bits_per_sample == 32;
-            if (!is_f16_pair and !is_32_pair) continue;
+            if (!is_u8_pair and !is_u16_pair and !is_f16_pair and !is_32_pair) continue;
 
             if (!any_pair) {
                 pre0 = try allocator.alloc(?aj.Reg, n_nodes);
@@ -2235,11 +3245,21 @@ fn emitDagBodyX2(
             }
             const clip = node.load_clip;
             const bps = fmt.bytesPerSample();
-            const shift: u8 = if (bps == 2) 1 else 2;
+            const shift: u8 = switch (bps) {
+                1 => 0,
+                2 => 1,
+                else => 2,
+            };
             const mem0 = env.rowMem(env.src_row_ptrs[clip].?, shift, 0);
             const r0 = b.newVec();
             const r1 = b.newVec();
-            if (is_f16_pair) {
+            if ((is_u8_pair or is_u16_pair) and info.value_types.items[idx] == .f32) {
+                b.vecLoadUintToF32x2(r0, r1, mem0, bps);
+            } else if (is_u8_pair) {
+                b.vecLoadU8ToU32x2(r0, r1, mem0);
+            } else if (is_u16_pair) {
+                b.vecLoadU16ToU32x2(r0, r1, mem0);
+            } else if (is_f16_pair) {
                 b.vecCvtF16ToF32x2(r0, r1, mem0);
             } else {
                 b.vecLoadUVecx2(r0, r1, mem0);
@@ -2253,11 +3273,12 @@ fn emitDagBodyX2(
         }
     }
 
-    const res0 = try evalDagVector(allocator, b, prog, info, spec, env, .interior, 0, use_const_mem, pre0);
-
     var env1 = env;
     if (env.hoisted_slots_hi.len == n_nodes) {
         env1.hoisted_slots = env.hoisted_slots_hi;
+    }
+    if (env.hoisted_masks_hi.len == n_nodes) {
+        env1.hoisted_masks = env.hoisted_masks_hi;
     }
     if (env.v_x) |vx0| {
         const vx1 = b.newVec();
@@ -2268,7 +3289,17 @@ fn emitDagBodyX2(
         }
         env1.v_x = vx1;
     }
-    const res1 = try evalDagVector(allocator, b, prog, info, spec, env1, .interior, lanes, use_const_mem, pre1);
+
+    var res0: aj.Reg = undefined;
+    var res1: aj.Reg = undefined;
+    if (interleave) {
+        const pair = try evalDagVectors(2, allocator, b, prog, info, spec, .{ env, env1 }, .interior, .{ 0, lanes }, use_const_mem, .{ pre0, pre1 });
+        res0 = pair[0];
+        res1 = pair[1];
+    } else {
+        res0 = try evalDagVector(allocator, b, prog, info, spec, env, .interior, 0, use_const_mem, pre0);
+        res1 = try evalDagVector(allocator, b, prog, info, spec, env1, .interior, lanes, use_const_mem, pre1);
+    }
 
     const dst_bps: usize = spec.dst_fmt.bytesPerSample();
     const dst_shift: u8 = switch (dst_bps) {
@@ -2283,6 +3314,63 @@ fn emitDagBodyX2(
     } else {
         pixel.emitStoreF32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt, env.use_pair_mem);
     }
+}
+
+/// 4x interleaved interior body for narrow serial FP chains on 32-register AArch64 NEON
+/// (16 pixels/iteration lockstep, zero spills).
+fn emitDagBodyX4(
+    allocator: std.mem.Allocator,
+    b: *aj.Builder,
+    prog: *const ast.Program,
+    info: *const analysis_mod.Analysis,
+    spec: CompileSpec,
+    env: BodyEnv,
+    v_lane_step_f32: ?aj.Reg,
+    v_lane_step_i32: ?aj.Reg,
+) std.mem.Allocator.Error!void {
+    _ = v_lane_step_i32;
+    const lanes: usize = b.cpu.f32_lanes;
+    const use_const_mem = info.live_node_count > 24;
+
+    var envs: [4]BodyEnv = .{ env, env, env, env };
+    if (env.v_x) |vx0| {
+        const vx1 = b.newVec();
+        const vx2 = b.newVec();
+        const vx3 = b.newVec();
+        b.vecOp3(.add_f32, vx1, vx0, v_lane_step_f32.?);
+        b.vecOp3(.add_f32, vx2, vx0, b.constF32Splat(@floatFromInt(lanes * 2)));
+        b.vecOp3(.add_f32, vx3, vx0, b.constF32Splat(@floatFromInt(lanes * 3)));
+        envs[1].v_x = vx1;
+        envs[2].v_x = vx2;
+        envs[3].v_x = vx3;
+    }
+
+    const res = try evalDagVectors(
+        4,
+        allocator,
+        b,
+        prog,
+        info,
+        spec,
+        envs,
+        .interior,
+        .{ 0, lanes, lanes * 2, lanes * 3 },
+        use_const_mem,
+        .{ null, null, null, null },
+    );
+
+    const dst_bps: usize = spec.dst_fmt.bytesPerSample();
+    const dst_shift: u8 = switch (dst_bps) {
+        1 => 0,
+        2 => 1,
+        else => 2,
+    };
+    const m0 = env.rowMem(env.dst_ptr, dst_shift, 0);
+    const m1 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * dst_bps));
+    const m2 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * 2 * dst_bps));
+    const m3 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * 3 * dst_bps));
+    pixel.emitStoreF32x2(b, m0, m1, res[0], res[1], spec.dst_fmt, env.use_pair_mem);
+    pixel.emitStoreF32x2(b, m2, m3, res[2], res[3], spec.dst_fmt, env.use_pair_mem);
 }
 
 fn emitUnaryF32(b: *aj.Builder, op: ast.UnaryOp, dst: aj.Reg, a: aj.Reg, use_const_mem: bool) void {
@@ -2624,7 +3712,7 @@ fn emitBinaryI32(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, rhs: 
 fn emitTernaryF32(b: *aj.Builder, op: ast.TernaryOp, dst: aj.Reg, a: aj.Reg, b_reg: aj.Reg, c_reg: aj.Reg) void {
     switch (op) {
         .select => {
-            const mask = b.newVec();
+            const mask = if (b.cpu.prefersMaskDstReuse() and dst.raw.id != b_reg.raw.id and dst.raw.id != c_reg.raw.id) dst else b.newVec();
             b.vecOp3(.cmp_gt_f32, mask, a, b.vecZero());
             pixel.emitSelectF32ByMask(b, dst, c_reg, b_reg, mask);
         },
@@ -3158,6 +4246,8 @@ test "JIT-vs-oracle bit-exact parity across ISA tiers, widths, spatial, FMA, opt
         try verifyBitExactU8(allocator, cpu, "x[-65,0] x[65,0] max x min", 192, 2, false);
         try verifyBitExactU8(allocator, cpu, "x[-65,0] x[65,0] max x min", 1920, 2, false);
         try verifyBitExactU8(allocator, cpu, "x[-2147483648,0] x max", 65, 2, false);
+        // Bare-load select condition in a > 48-node 5x5 kernel: 32-reg i16/i32 load remat must keep the condition load.
+        try verifyBitExactU8(allocator, cpu, "x[-2,-2] 7 x[-1,-2] x[0,-2] + x[1,-2] + x[2,-2] + x[-2,-1] + x[-1,-1] + x[0,-1] + x[1,-1] + x[2,-1] + x[-2,0] + x[-1,0] + x[0,0] + x[1,0] + x[2,0] + x[-2,1] + x[-1,1] + x[0,1] + x[1,1] + x[2,1] + x[-2,2] + x[-1,2] + x[0,2] + x[1,2] + x[2,2] + ?", 300, 8, false);
         // K4 & M2/M3: f32 -> u8 D4 store parity with qNaN, +-sNaN, +-inf, rounding, and out-of-range inputs
         // (width 225 covers all 15x15 = 225 (x, y) edge-value pairs on x86 and AArch64).
         const d4_exprs = [_][]const u8{ "x", "x trunc", "x floor", "x ceil", "x round", "x[1,0] x max", "x y min", "x y max", "x sqrt", "x exp", "x y +" };

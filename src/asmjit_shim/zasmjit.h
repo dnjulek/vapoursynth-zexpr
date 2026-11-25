@@ -53,7 +53,10 @@ typedef struct {
     uint8_t has_avx2;
     uint8_t has_avx512;
     uint8_t prefer_hw_gather_f32;
-    uint8_t _pad[1];
+    /* Use the ISA's alternative u8/u16 widening-load sequence (vendor-gated on real silicon):
+       NEON: exact zip + 2^23 bias u8/u16 -> f32 instead of ucvtf (Neoverse yes, Apple no);
+       AVX-512: vmovdqu + register vpmovzx instead of memory-form vpmovzx (Intel yes, AMD Zen 4 no). */
+    uint8_t prefer_alt_widen_load;
 } zj_cpu_info_t;
 
 /* Kernel function signature: ZJ_SIG_EXPR_PLANE. */
@@ -276,6 +279,7 @@ zj_reg_t zj_new_vec(zj_ctx* ctx);
 zj_reg_t zj_new_vec128(zj_ctx* ctx);
 zj_label_t zj_new_label(zj_ctx* ctx);
 void zj_bind(zj_ctx* ctx, zj_label_t label);
+void zj_align_code(zj_ctx* ctx, uint32_t alignment);
 zj_reg_t zj_const_f32_splat(zj_ctx* ctx, float val);
 zj_reg_t zj_const_i32_splat(zj_ctx* ctx, int32_t val);
 zj_reg_t zj_const_bytes(zj_ctx* ctx, const uint8_t* data, uint32_t len);
@@ -298,6 +302,7 @@ void zj_jcc_imm(zj_ctx* ctx, zj_cond_t cond, zj_reg_t lhs, int64_t rhs_imm, zj_l
 /* Portable SIMD ops. */
 void zj_vec_op2(zj_ctx* ctx, zj_vec_op2_t op, zj_reg_t dst, zj_reg_t src);
 void zj_vec_op3(zj_ctx* ctx, zj_vec_op3_t op, zj_reg_t dst, zj_reg_t a, zj_reg_t b);
+void zj_vec_op3_mem(zj_ctx* ctx, zj_vec_op3_t op, zj_reg_t dst, zj_reg_t a, zj_mem_t mem);
 void zj_vec_op4(zj_ctx* ctx, zj_vec_op4_t op, zj_reg_t dst, zj_reg_t a, zj_reg_t b, zj_reg_t c);
 void zj_vec_op2i(zj_ctx* ctx, zj_vec_op2i_t op, zj_reg_t dst, zj_reg_t src, uint32_t imm);
 void zj_vec_load(zj_ctx* ctx, zj_vec_load_t op, zj_reg_t dst, zj_mem_t mem);
@@ -312,6 +317,20 @@ void zj_vec_cvt_f16_to_f32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t
 void zj_vec_cvt_f32_to_f16(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src);
 void zj_vec_cvt_f32_to_f16x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0, zj_reg_t src1);
 void zj_vec_load_u_vecx2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem);
+void zj_vec_load_u8_to_u32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem);
+void zj_vec_load_u16_to_u32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem);
+void zj_vec_load_u8_to_u16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem);
+/* Load f32_lanes (x2: 2 * f32_lanes) u8 (bytes_per_sample 1) or u16 (2) pixels converted to f32. */
+void zj_vec_load_uint_to_f32(zj_ctx* ctx, zj_reg_t dst, zj_mem_t mem, uint32_t bytes_per_sample);
+void zj_vec_load_uint_to_f32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_mem_t mem, uint32_t bytes_per_sample);
+void zj_vec_uaddl_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u8, zj_reg_t src_b_u8);
+void zj_vec_usubl_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u8, zj_reg_t src_b_u8);
+void zj_vec_uaddw_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i16, zj_reg_t acc1_i16, zj_reg_t src_u8);
+void zj_vec_usubw_u8_to_i16x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i16, zj_reg_t acc1_i16, zj_reg_t src_u8);
+void zj_vec_uaddl_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u16, zj_reg_t src_b_u16);
+void zj_vec_usubl_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t src_a_u16, zj_reg_t src_b_u16);
+void zj_vec_uaddw_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i32, zj_reg_t acc1_i32, zj_reg_t src_u16);
+void zj_vec_usubw_u16_to_i32x2(zj_ctx* ctx, zj_reg_t dst0, zj_reg_t dst1, zj_reg_t acc0_i32, zj_reg_t acc1_i32, zj_reg_t src_u16);
 void zj_vec_store_u_vecx2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0, zj_reg_t src1);
 void zj_vec_store_u8_from_i32(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src_i32);
 void zj_vec_store_u8_from_i32x2(zj_ctx* ctx, zj_mem_t mem, zj_reg_t src0_i32, zj_reg_t src1_i32);
@@ -342,6 +361,8 @@ void zj_vec_andn_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t mask_not, zj_reg_t b);
 void zj_vec_fma_bc_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, zj_reg_t b, float c_const);
 void zj_vec_fma_cc_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, float b_const, float c_const);
 void zj_vec_fnma_bc_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, float b_const, zj_reg_t c);
+void zj_vec_fma_mem_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, zj_mem_t mem, zj_reg_t c);
+void zj_vec_fnma_mem_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t a, zj_mem_t mem, zj_reg_t c);
 void zj_vec_permute_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t src, const uint32_t* lane_indices, uint32_t lane_count);
 void zj_vec_gather_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base, zj_reg_t byte_offsets_i32, uint8_t can_use_hw_gather);
 void zj_vec_gather_f16(zj_ctx* ctx, zj_reg_t dst_f32, zj_reg_t base, zj_reg_t byte_offsets_i32);

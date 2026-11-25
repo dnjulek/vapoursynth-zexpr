@@ -11,6 +11,52 @@ inline fn emitFma(b: *aj.Builder, dst: aj.Reg, a: aj.Reg, b_reg: aj.Reg, c: aj.R
     b.vecOp4(.madd_f32, dst, a, b_reg, c);
 }
 
+/// On 32-register AVX-512 when `!use_const_mem`, hoist scalar math constants into ZMMs
+/// once in the prologue via 4-byte `vbroadcastss`: 4-cycle reg-FMA latency vs 11-cycle `{1to16}`.
+inline fn hoistOnAvx512(b: *aj.Builder, use_const_mem: bool) bool {
+    return b.cpu.has_avx512 and !use_const_mem;
+}
+
+inline fn emitMulC(b: *aj.Builder, dst: aj.Reg, a: aj.Reg, c: f32, use_const_mem: bool) void {
+    if (hoistOnAvx512(b, use_const_mem)) {
+        b.vecOp3(.mul_f32, dst, a, b.constF32Splat(c));
+    } else {
+        b.vecMulCF32(dst, a, c);
+    }
+}
+
+inline fn emitFnmaBC(b: *aj.Builder, dst: aj.Reg, a: aj.Reg, b_c: f32, c: aj.Reg, use_const_mem: bool) void {
+    if (hoistOnAvx512(b, use_const_mem)) {
+        emitFnma(b, dst, a, b.constF32Splat(b_c), c);
+    } else {
+        b.vecFnmaBCF32(dst, a, b_c, c);
+    }
+}
+
+inline fn emitFmaCC(b: *aj.Builder, dst: aj.Reg, a: aj.Reg, b_c: f32, c_c: f32, use_const_mem: bool) void {
+    if (hoistOnAvx512(b, use_const_mem)) {
+        emitFma(b, dst, a, b.constF32Splat(b_c), b.constF32Splat(c_c));
+    } else {
+        b.vecFmaCCF32(dst, a, b_c, c_c);
+    }
+}
+
+/// Horner step `acc * x + c_const` avoiding copy moves on both x86 (`vfmadd213ps` in-place on `acc`)
+/// and AArch64 NEON (fresh `dst` so `fmla` does not see `dst == acc` and emit a trailing `mov`).
+inline fn emitHornerStep(b: *aj.Builder, acc: aj.Reg, x: aj.Reg, c_const: f32, use_const_mem: bool) aj.Reg {
+    if (b.cpu.isa == .neon) {
+        const next = b.newVec();
+        b.vecFmaBCF32(next, acc, x, c_const);
+        return next;
+    }
+    if (hoistOnAvx512(b, use_const_mem)) {
+        emitFma(b, acc, acc, x, b.constF32Splat(c_const));
+        return acc;
+    }
+    b.vecFmaBCF32(acc, acc, x, c_const);
+    return acc;
+}
+
 /// `dst = c - a * b` (FMA on FMA tiers, separate mul+sub on non-FMA tiers).
 inline fn emitFnma(b: *aj.Builder, dst: aj.Reg, a: aj.Reg, b_reg: aj.Reg, c: aj.Reg) void {
     b.vecOp4(.nmadd_f32, dst, a, b_reg, c);
@@ -32,16 +78,17 @@ pub fn emitExp(b: *aj.Builder, dst: aj.Reg, x: aj.Reg, use_const_mem: bool) void
     }
 
     const ki = b.newVec();
-    b.vecMulCF32(ki, xc, interp.log2e_f32);
+    emitMulC(b, ki, xc, interp.log2e_f32, use_const_mem);
     b.vecOp2(.cvt_round_f32_to_i32, ki, ki);
     const k = b.newVec();
     b.vecOp2(.cvt_i32_to_f32, k, ki);
 
-    const r = b.newVec();
-    b.vecFnmaBCF32(r, k, interp.ln2_hi_f32, xc);
-    b.vecFnmaBCF32(r, k, interp.ln2_lo_f32, r);
+    // Reuse dead `xc` in-place so both x86 `vfnmadd231ps` and NEON `fmls` emit zero copies.
+    const r = xc;
+    emitFnmaBC(b, r, k, interp.ln2_hi_f32, r, use_const_mem);
+    emitFnmaBC(b, r, k, interp.ln2_lo_f32, r, use_const_mem);
 
-    // Estrin's scheme matching interp.expApprox bit-for-bit (3 FMA levels, 0 spills).
+    // Estrin's scheme matching interp.expApprox bit-for-bit (3 FMA levels, 0 spills, 0 copies).
     const r2 = b.newVec();
     const r4 = b.newVec();
     b.vecOp3(.mul_f32, r2, r, r);
@@ -55,21 +102,19 @@ pub fn emitExp(b: *aj.Builder, dst: aj.Reg, x: aj.Reg, use_const_mem: bool) void
     } else {
         b.vecOp3(.add_f32, p01, b.constF32Splat(1.0), r);
     }
-    b.vecFmaCCF32(p23, r, 1.6666667e-1, 0.5);
-    b.vecFmaCCF32(p45, r, 8.3333338e-3, 4.1666668e-2);
+    emitFmaCC(b, p23, r, 1.6666667e-1, 0.5, use_const_mem);
+    emitFmaCC(b, p45, r, 8.3333338e-3, 4.1666668e-2, use_const_mem);
 
-    const p03 = b.newVec();
-    const p46 = b.newVec();
-    emitFma(b, p03, p23, r2, p01);
+    // Reuse dead accumulator `p01` (`dst == c`) so both x86 `vfmadd231ps` and NEON `fmla` emit 0 copies.
+    emitFma(b, p01, p23, r2, p01);
     // p46 = r2 * 1.3888889e-3 + p45 = p45 - r2 * (-1.3888889e-3)
-    b.vecFnmaBCF32(p46, r2, -1.3888889e-3, p45);
+    emitFnmaBC(b, p45, r2, -1.3888889e-3, p45, use_const_mem);
 
-    const p = b.newVec();
-    emitFma(b, p, p46, r4, p03);
+    emitFma(b, p01, p45, r4, p01);
 
     b.vecOp3(.add_i32, ki, ki, b.constI32Splat(127));
     b.vecOp2i(.sll_u32, ki, ki, 23);
-    b.vecOp3(.mul_f32, dst, p, ki);
+    b.vecOp3(.mul_f32, dst, p01, ki);
 }
 
 /// Exact-at-integer minimax `exp2(x)` matching `interp.exp2Approx` bit-for-bit.
@@ -93,12 +138,12 @@ pub fn emitExp2(b: *aj.Builder, dst: aj.Reg, x: aj.Reg, use_const_mem: bool) voi
     b.vecOp3(.sub_f32, r, xc, k);
 
     // Exact-at-integer deg-5 Horner (5 FMAs, 0 r2/r4 muls, max_rel <= 2.9e-7).
-    const p = b.newVec();
-    b.vecFmaCCF32(p, r, interp.exp2_c5, interp.exp2_c4);
-    b.vecFmaBCF32(p, p, r, interp.exp2_c3);
-    b.vecFmaBCF32(p, p, r, interp.exp2_c2);
-    b.vecFmaBCF32(p, p, r, interp.exp2_c1);
-    b.vecFmaBCF32(p, p, r, 1.0);
+    var p = b.newVec();
+    emitFmaCC(b, p, r, interp.exp2_c5, interp.exp2_c4, use_const_mem);
+    p = emitHornerStep(b, p, r, interp.exp2_c3, use_const_mem);
+    p = emitHornerStep(b, p, r, interp.exp2_c2, use_const_mem);
+    p = emitHornerStep(b, p, r, interp.exp2_c1, use_const_mem);
+    p = emitHornerStep(b, p, r, 1.0, use_const_mem);
 
     b.vecOp3(.add_i32, ki, ki, b.constI32Splat(127));
     b.vecOp2i(.sll_u32, ki, ki, 23);
@@ -122,7 +167,8 @@ pub fn emitLog2(b: *aj.Builder, dst: aj.Reg, x: aj.Reg, use_const_mem: bool) voi
     const adj = b.newVec();
     b.vecOp3(.add_i32, adj, xc, c_adj);
 
-    const e = b.newVec();
+    // Materialise `e` directly into `dst` (when `dst != x`) so final `emitFma(dst, p, u, dst)` emits 0 copies.
+    const e = if (dst.raw.id != x.raw.id) dst else b.newVec();
     b.vecOp2i(.sra_i32, e, adj, 23);
     b.vecOp3(.sub_i32, e, e, c_127);
     b.vecOp2(.cvt_i32_to_f32, e, e);
@@ -147,10 +193,10 @@ pub fn emitLog2(b: *aj.Builder, dst: aj.Reg, x: aj.Reg, use_const_mem: bool) voi
     const u_sq = b.newVec();
     b.vecOp3(.mul_f32, u_sq, u, u);
 
-    const p = b.newVec();
-    b.vecFmaCCF32(p, u_sq, interp.log2_u_c3, interp.log2_u_c2);
-    b.vecFmaBCF32(p, p, u_sq, interp.log2_u_c1);
-    b.vecFmaBCF32(p, p, u_sq, interp.log2_u_c0);
+    var p = b.newVec();
+    emitFmaCC(b, p, u_sq, interp.log2_u_c3, interp.log2_u_c2, use_const_mem);
+    p = emitHornerStep(b, p, u_sq, interp.log2_u_c1, use_const_mem);
+    p = emitHornerStep(b, p, u_sq, interp.log2_u_c0, use_const_mem);
     emitFma(b, dst, p, u, e);
 }
 
@@ -196,14 +242,15 @@ pub fn emitLog(b: *aj.Builder, dst: aj.Reg, x: aj.Reg, use_const_mem: bool) void
     const u_sq = b.newVec();
     b.vecOp3(.mul_f32, u_sq, u, u);
 
-    const p = b.newVec();
-    b.vecFmaCCF32(p, u_sq, interp.log_u_c3, interp.log_u_c2);
-    b.vecFmaBCF32(p, p, u_sq, interp.log_u_c1);
-    b.vecFmaBCF32(p, p, u_sq, interp.log_u_c0);
-    b.vecOp3(.mul_f32, p, p, u);
+    var p = b.newVec();
+    emitFmaCC(b, p, u_sq, interp.log_u_c3, interp.log_u_c2, use_const_mem);
+    p = emitHornerStep(b, p, u_sq, interp.log_u_c1, use_const_mem);
+    p = emitHornerStep(b, p, u_sq, interp.log_u_c0, use_const_mem);
+    const acc = if (dst.raw.id != x.raw.id) dst else p;
+    b.vecOp3(.mul_f32, acc, p, u);
 
-    b.vecFnmaBCF32(p, e, -interp.ln2_lo_f32, p);
-    b.vecFnmaBCF32(dst, e, -interp.ln2_hi_f32, p);
+    emitFnmaBC(b, acc, e, -interp.ln2_lo_f32, acc, use_const_mem);
+    emitFnmaBC(b, dst, e, -interp.ln2_hi_f32, acc, use_const_mem);
 }
 
 pub const TrigState = struct {
@@ -230,8 +277,8 @@ pub fn emitTrigPrepare(b: *aj.Builder, x: aj.Reg) TrigState {
     const k = b.newVec();
     b.vecOp2(.cvt_i32_to_f32, k, ki);
 
-    const r = b.newVec();
-    b.vecFnmaBCF32(r, k, interp.pi1_f32, ax);
+    const r = ax;
+    b.vecFnmaBCF32(r, k, interp.pi1_f32, r);
     b.vecFnmaBCF32(r, k, interp.pi2_f32, r);
     b.vecFnmaBCF32(r, k, interp.pi3_f32, r);
     b.vecFnmaBCF32(r, k, interp.pi4_f32, r);
@@ -252,13 +299,11 @@ fn emitSinPoly(b: *aj.Builder, dst: aj.Reg, r: aj.Reg, r2: aj.Reg, r4: aj.Reg) v
     b.vecFmaCCF32(p01, r2, 8.3333338e-3, -1.6666667e-1);
     b.vecFmaCCF32(p23, r2, 2.7557319e-6, -1.9841270e-4);
 
-    const p24 = b.newVec();
-    b.vecFnmaBCF32(p24, r4, 2.5052108e-8, p23); // p23 - r4 * (+2.5052108e-8) == r4 * (-2.5052108e-8) + p23
+    b.vecFnmaBCF32(p23, r4, 2.5052108e-8, p23); // p23 - r4 * (+2.5052108e-8) == r4 * (-2.5052108e-8) + p23
 
-    const p = b.newVec();
-    emitFma(b, p, p24, r4, p01);
-    b.vecOp3(.mul_f32, p, p, r2);
-    emitFma(b, dst, p, r, r);
+    emitFma(b, p01, p23, r4, p01);
+    b.vecOp3(.mul_f32, p01, p01, r2);
+    emitFma(b, dst, p01, r, r);
 }
 
 fn emitCosPoly(b: *aj.Builder, dst: aj.Reg, r2: aj.Reg, r4: aj.Reg) void {
@@ -267,12 +312,10 @@ fn emitCosPoly(b: *aj.Builder, dst: aj.Reg, r2: aj.Reg, r4: aj.Reg) void {
     b.vecFmaCCF32(p01, r2, 4.1666668e-2, -0.5);
     b.vecFmaCCF32(p23, r2, 2.4801587e-5, -1.3888889e-3);
 
-    const p24 = b.newVec();
-    b.vecFnmaBCF32(p24, r4, 2.7557319e-7, p23); // p23 - r4 * (+2.7557319e-7) == r4 * (-2.7557319e-7) + p23
+    b.vecFnmaBCF32(p23, r4, 2.7557319e-7, p23); // p23 - r4 * (+2.7557319e-7) == r4 * (-2.7557319e-7) + p23
 
-    const p = b.newVec();
-    emitFma(b, p, p24, r4, p01);
-    b.vecFmaBCF32(dst, p, r2, 1.0);
+    emitFma(b, p01, p23, r4, p01);
+    b.vecFmaBCF32(dst, p01, r2, 1.0);
 }
 
 pub fn emitSinFromState(b: *aj.Builder, dst: aj.Reg, st: TrigState) void {
@@ -312,8 +355,8 @@ pub fn emitTan(b: *aj.Builder, dst: aj.Reg, x: aj.Reg) void {
     const k = b.newVec();
     b.vecOp2(.cvt_i32_to_f32, k, ki);
 
-    const r = b.newVec();
-    b.vecFnmaBCF32(r, k, interp.half_pi1_f32, ax);
+    const r = ax;
+    b.vecFnmaBCF32(r, k, interp.half_pi1_f32, r);
     b.vecFnmaBCF32(r, k, interp.half_pi2_f32, r);
     b.vecFnmaBCF32(r, k, interp.half_pi3_f32, r);
     b.vecFnmaBCF32(r, k, interp.half_pi4_f32, r);
@@ -376,13 +419,13 @@ pub fn emitAtan(b: *aj.Builder, dst: aj.Reg, x: aj.Reg) void {
     const z2 = b.newVec();
     b.vecOp3(.mul_f32, z2, z, z);
 
-    const p = b.newVec();
+    var p = b.newVec();
     b.vecFmaCCF32(p, z2, interp.atan_c3_f32, interp.atan_c2_f32);
-    b.vecFmaBCF32(p, p, z2, interp.atan_c1_f32);
-    b.vecFmaBCF32(p, p, z2, interp.atan_c0_f32);
+    p = emitHornerStep(b, p, z2, interp.atan_c1_f32, true);
+    p = emitHornerStep(b, p, z2, interp.atan_c0_f32, true);
 
     b.vecOp3(.mul_f32, p, p, z2);
-    emitFma(b, p, p, z, z);
+    emitFma(b, z, p, z, z);
 
     // pi/4 + pi/4 == pi/2 bit-exact in f32 -> saves 1 hoisted const reg and 1 blendv.
     const c_pi4 = b.constF32Splat(std.math.pi * 0.25);
@@ -391,8 +434,8 @@ pub fn emitAtan(b: *aj.Builder, dst: aj.Reg, x: aj.Reg) void {
     b.vecAndF32(off1, m_mid, c_pi4);
     b.vecAndF32(off2, m_hi, c_pi4);
     b.vecOp3(.add_f32, off1, off1, off2);
-    b.vecOp3(.add_f32, p, off1, p);
-    b.vecOp3(.xor_u32, dst, p, x_sign);
+    b.vecOp3(.add_f32, z, off1, z);
+    b.vecOp3(.xor_u32, dst, z, x_sign);
 }
 
 /// Direct division-free Cephes `asin(x)` (4-coeff Horner hidden behind sqrt, 0 divisions)
@@ -419,23 +462,23 @@ pub fn emitAsin(b: *aj.Builder, dst: aj.Reg, x: aj.Reg) void {
     const s = b.newVec();
     b.vecOp2(.sqrt_f32, s, z);
 
-    const p = b.newVec();
+    var p = b.newVec();
     b.vecFmaCCF32(p, z, interp.asin_c3_f32, interp.asin_c2_f32);
-    b.vecFmaBCF32(p, p, z, interp.asin_c1_f32);
-    b.vecFmaBCF32(p, p, z, interp.asin_c0_f32);
+    p = emitHornerStep(b, p, z, interp.asin_c1_f32, true);
+    p = emitHornerStep(b, p, z, interp.asin_c0_f32, true);
 
     const t = b.newVec();
     pixel.emitSelectF32ByMask(b, t, ax, s, hi);
     const r = b.newVec();
     b.vecOp3(.mul_f32, r, t, z);
-    emitFma(b, r, r, p, t);
+    emitFma(b, t, r, p, t);
 
     const r2 = b.newVec();
-    b.vecOp3(.add_f32, r2, r, r);
+    b.vecOp3(.add_f32, r2, t, t);
     const hi_val = b.newVec();
     b.vecOp3(.sub_f32, hi_val, b.constF32Splat(std.math.pi * 0.5), r2);
-    const res = b.newVec();
-    pixel.emitSelectF32ByMask(b, res, r, hi_val, hi);
+    const res = if (b.cpu.prefersMaskDstReuse()) hi else b.newVec();
+    pixel.emitSelectF32ByMask(b, res, t, hi_val, hi);
     b.vecOp3(.xor_u32, dst, res, x_sign);
 }
 
@@ -460,28 +503,28 @@ pub fn emitAcos(b: *aj.Builder, dst: aj.Reg, x: aj.Reg) void {
     const s = b.newVec();
     b.vecOp2(.sqrt_f32, s, z);
 
-    const p = b.newVec();
+    var p = b.newVec();
     b.vecFmaCCF32(p, z, interp.asin_c3_f32, interp.asin_c2_f32);
-    b.vecFmaBCF32(p, p, z, interp.asin_c1_f32);
-    b.vecFmaBCF32(p, p, z, interp.asin_c0_f32);
+    p = emitHornerStep(b, p, z, interp.asin_c1_f32, true);
+    p = emitHornerStep(b, p, z, interp.asin_c0_f32, true);
 
     const t = b.newVec();
     pixel.emitSelectF32ByMask(b, t, x, s, hi);
     const r = b.newVec();
     b.vecOp3(.mul_f32, r, t, z);
-    emitFma(b, r, r, p, t);
+    emitFma(b, t, r, p, t);
 
     const r2 = b.newVec();
-    b.vecOp3(.add_f32, r2, r, r);
+    b.vecOp3(.add_f32, r2, t, t);
     const pi_m_r2 = b.newVec();
     b.vecOp3(.sub_f32, pi_m_r2, b.constF32Splat(std.math.pi), r2);
     const x_neg = b.newVec();
     b.vecOp2i(.sra_i32, x_neg, x, 31);
-    const hi_val = b.newVec();
+    const hi_val = if (b.cpu.prefersMaskDstReuse()) x_neg else b.newVec();
     pixel.emitSelectF32ByMask(b, hi_val, r2, pi_m_r2, x_neg);
 
     const lo_val = b.newVec();
-    b.vecOp3(.sub_f32, lo_val, b.constF32Splat(std.math.pi * 0.5), r);
+    b.vecOp3(.sub_f32, lo_val, b.constF32Splat(std.math.pi * 0.5), t);
     pixel.emitSelectF32ByMask(b, dst, lo_val, hi_val, hi);
 }
 
@@ -511,16 +554,16 @@ pub fn emitAtan2(b: *aj.Builder, dst: aj.Reg, y: aj.Reg, x: aj.Reg) void {
     const r2 = b.newVec();
     b.vecOp3(.mul_f32, r2, ratio, ratio);
 
-    const p = b.newVec();
+    var p = b.newVec();
     b.vecFmaCCF32(p, r2, 0.0028236389625817537, -0.015956902876496315);
-    b.vecFmaBCF32(p, p, r2, 0.042504988610744476);
-    b.vecFmaBCF32(p, p, r2, -0.07489009201526642);
-    b.vecFmaBCF32(p, p, r2, 0.1063479334115982);
-    b.vecFmaBCF32(p, p, r2, -0.1420273631811142);
-    b.vecFmaBCF32(p, p, r2, 0.19992695748806);
-    b.vecFmaBCF32(p, p, r2, -0.33333101868629456);
+    p = emitHornerStep(b, p, r2, 0.042504988610744476, true);
+    p = emitHornerStep(b, p, r2, -0.07489009201526642, true);
+    p = emitHornerStep(b, p, r2, 0.1063479334115982, true);
+    p = emitHornerStep(b, p, r2, -0.1420273631811142, true);
+    p = emitHornerStep(b, p, r2, 0.19992695748806, true);
+    p = emitHornerStep(b, p, r2, -0.33333101868629456, true);
     b.vecOp3(.mul_f32, p, p, r2);
-    const res = b.newVec();
+    const res = ratio;
     emitFma(b, res, p, ratio, ratio);
 
     // If |y| > |x|: res = pi/2 - res

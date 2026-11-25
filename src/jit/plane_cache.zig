@@ -770,7 +770,8 @@ fn hashBase(k: Key) u64 {
         (@as(u8, @intFromBool(k.cpu.has_f16c)) << 3) |
         (@as(u8, @intFromBool(k.cpu.has_avx2)) << 4) |
         (@as(u8, @intFromBool(k.cpu.has_avx512)) << 5) |
-        (@as(u8, @intFromBool(k.cpu.prefer_hw_gather_f32)) << 6);
+        (@as(u8, @intFromBool(k.cpu.prefer_hw_gather_f32)) << 6) |
+        (@as(u8, @intFromBool(k.cpu.prefer_alt_widen_load)) << 7);
     h.update(std.mem.asBytes(&cpu_bits));
     // D5: hash resolved_builtins field by field (never raw struct bytes over `?i32` padding).
     h.update(std.mem.asBytes(&k.resolved_builtins.len));
@@ -805,7 +806,8 @@ fn cpuEql(a: cpu_mod.CpuInfo, b: cpu_mod.CpuInfo) bool {
         a.has_f16c == b.has_f16c and
         a.has_avx2 == b.has_avx2 and
         a.has_avx512 == b.has_avx512 and
-        a.prefer_hw_gather_f32 == b.prefer_hw_gather_f32;
+        a.prefer_hw_gather_f32 == b.prefer_hw_gather_f32 and
+        a.prefer_alt_widen_load == b.prefer_alt_widen_load;
 }
 
 fn keyEql(a: Key, b: Key) bool {
