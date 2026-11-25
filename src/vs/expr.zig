@@ -120,11 +120,45 @@ const ExprData = struct {
 };
 
 fn setFilterErrorFmt(zapi: ZAPI, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
-    w.print(filter_name ++ ": " ++ fmt, args) catch {};
-    buf[w.end] = 0;
-    zapi.setFilterError(buf[0..w.end :0]);
+    common.setFilterErrorFmt(zapi, filter_name, fmt, args);
+}
+
+/// Point `src_ptrs`/`src_strides` at plane `plane_idx` of every input frame.
+fn bindSrcPlanes(
+    zapi: ZAPI,
+    src_frames: []const ?*const vs.Frame,
+    src_ptrs: [][*]const u8,
+    src_strides: []isize,
+    plane_idx: usize,
+) void {
+    for (src_frames, src_ptrs, src_strides) |f, *ptr, *stride| {
+        ptr.* = zapi.vsapi.getReadPtr.?(f, @intCast(plane_idx)).?;
+        stride.* = zapi.vsapi.getStride.?(f, @intCast(plane_idx));
+    }
+}
+
+/// Read the bound frame properties (missing -> NaN) into `buf`; null (with the filter error set) on OOM.
+/// Set the per-frame out-of-memory filter error (`return frameOom(zapi);` in getFrame paths).
+fn frameOom(zapi: ZAPI) ?*const vs.Frame {
+    zapi.setFilterError("Expr: out of memory");
+    return null;
+}
+
+fn readProps(
+    zapi: ZAPI,
+    props: []const common.PropBinding,
+    src_frames: []const ?*const vs.Frame,
+    buf: *common.Scratch(f32, 64),
+) ?[]f32 {
+    const prop_vals = buf.get(props.len) orelse {
+        zapi.setFilterError("Expr: out of memory");
+        return null;
+    };
+    for (props, prop_vals) |pb, *v| {
+        const fprops = zapi.vsapi.getFramePropertiesRO.?(src_frames[pb.clip]);
+        v.* = common.readFrameProp(zapi, fprops, pb.name_z.ptr, std.math.nan(f32));
+    }
+    return prop_vals;
 }
 
 fn executeScalarProg(
@@ -141,31 +175,15 @@ fn executeScalarProg(
     plane_idx: usize,
     frame_n: c_int,
 ) bool {
-    const n_clips = src_frames.len;
     const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(plane_idx)).?;
     const dst_stride: isize = zapi.vsapi.getStride.?(dst_frame, @intCast(plane_idx));
     const pw: usize = @intCast(zapi.vsapi.getFrameWidth.?(dst_frame, @intCast(plane_idx)));
     const ph: usize = @intCast(zapi.vsapi.getFrameHeight.?(dst_frame, @intCast(plane_idx)));
-    for (0..n_clips) |ci| {
-        src_ptrs[ci] = zapi.vsapi.getReadPtr.?(src_frames[ci], @intCast(plane_idx)).?;
-        src_strides[ci] = zapi.vsapi.getStride.?(src_frames[ci], @intCast(plane_idx));
-    }
+    bindSrcPlanes(zapi, src_frames, src_ptrs, src_strides, plane_idx);
 
-    var prop_stack: [64]f32 = undefined;
-    const prop_heap: ?[]f32 = if (props.len > prop_stack.len)
-        allocator.alloc(f32, props.len) catch {
-            zapi.setFilterError("Expr: out of memory");
-            return false;
-        }
-    else
-        null;
-    defer if (prop_heap) |ph_buf| allocator.free(ph_buf);
-    const prop_vals: []f32 = if (prop_heap) |ph_buf| ph_buf else prop_stack[0..props.len];
-
-    for (props, 0..) |pb, pi| {
-        const fprops = zapi.vsapi.getFramePropertiesRO.?(src_frames[pb.clip]);
-        prop_vals[pi] = common.readFrameProp(zapi, fprops, pb.name_z.ptr, std.math.nan(f32));
-    }
+    var prop_buf: common.Scratch(f32, 64) = .{};
+    defer prop_buf.deinit();
+    const prop_vals = readProps(zapi, props, src_frames, &prop_buf) orelse return false;
 
     interp.evalPlane(allocator, prog, profile, .{
         .dst = dst_ptr,
@@ -198,42 +216,23 @@ fn executeCachedEntry(
     plane_idx: usize,
     frame_n: c_int,
 ) bool {
-    const n_clips = src_frames.len;
     switch (entry.exec) {
         .lut => |*l| {
             const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(plane_idx)).?;
             const dst_stride: isize = zapi.vsapi.getStride.?(dst_frame, @intCast(plane_idx));
             const pw: usize = @intCast(zapi.vsapi.getFrameWidth.?(dst_frame, @intCast(plane_idx)));
             const ph: usize = @intCast(zapi.vsapi.getFrameHeight.?(dst_frame, @intCast(plane_idx)));
-            for (0..n_clips) |ci| {
-                src_ptrs[ci] = zapi.vsapi.getReadPtr.?(src_frames[ci], @intCast(plane_idx)).?;
-                src_strides[ci] = zapi.vsapi.getStride.?(src_frames[ci], @intCast(plane_idx));
-            }
+            bindSrcPlanes(zapi, src_frames, src_ptrs, src_strides, plane_idx);
             l.apply(dst_ptr, dst_stride, src_ptrs, src_strides, pw, ph);
             return true;
         },
         .jit => |j| {
             const dst_ptr = zapi.vsapi.getWritePtr.?(dst_frame, @intCast(plane_idx)).?;
             const dst_stride: isize = zapi.vsapi.getStride.?(dst_frame, @intCast(plane_idx));
-            for (0..n_clips) |ci| {
-                src_ptrs[ci] = zapi.vsapi.getReadPtr.?(src_frames[ci], @intCast(plane_idx)).?;
-                src_strides[ci] = zapi.vsapi.getStride.?(src_frames[ci], @intCast(plane_idx));
-            }
-            var prop_stack: [64]f32 = undefined;
-            const prop_heap: ?[]f32 = if (j.props.len > prop_stack.len)
-                allocator.alloc(f32, j.props.len) catch {
-                    zapi.setFilterError("Expr: out of memory");
-                    return false;
-                }
-            else
-                null;
-            defer if (prop_heap) |ph_buf| allocator.free(ph_buf);
-            const prop_vals: []f32 = if (prop_heap) |ph_buf| ph_buf else prop_stack[0..j.props.len];
-
-            for (j.props, 0..) |pb, pi| {
-                const fprops = zapi.vsapi.getFramePropertiesRO.?(src_frames[pb.clip]);
-                prop_vals[pi] = common.readFrameProp(zapi, fprops, pb.name_z.ptr, std.math.nan(f32));
-            }
+            bindSrcPlanes(zapi, src_frames, src_ptrs, src_strides, plane_idx);
+            var prop_buf: common.Scratch(f32, 64) = .{};
+            defer prop_buf.deinit();
+            const prop_vals = readProps(zapi, j.props, src_frames, &prop_buf) orelse return false;
 
             j.kernel.func(
                 dst_ptr,
@@ -275,7 +274,7 @@ fn compileDynamicPlane(
     dst_fmt: ast.SampleFormat,
     plane_key: plane_cache.Key,
     builtin_ctx: ?*const builtins.ResolveContext,
-) (std.mem.Allocator.Error || error{CompileFailed})!*plane_cache.Entry {
+) (plane_cache.PutError || error{CompileFailed})!*plane_cache.Entry {
     var prog = parser.parse(allocator, expr_str, .{
         .mode = .expr,
         .num_clips = num_clips,
@@ -296,19 +295,8 @@ fn compileDynamicPlane(
 
     const pw = plane_key.width;
     const ph = plane_key.height;
-    var leased_rt = false;
-    const rt_ptr: ?*aj.Runtime = if (dyn.cpu.isa != .scalar) switch (global_plane_cache.acquireRuntime()) {
-        .lease => |l| blk: {
-            leased_rt = true;
-            break :blk l.rt;
-        },
-        .unavailable => null,
-        .closed => {
-            setFilterErrorFmt(zapi, "plugin is shutting down", .{});
-            return error.CompileFailed;
-        },
-    } else null;
-    defer if (leased_rt) global_plane_cache.releaseRuntime();
+    const rt_ptr = try leaseRuntime(dyn.cpu.isa != .scalar);
+    defer if (rt_ptr != null) global_plane_cache.releaseRuntime();
 
     const has_fast_u8_lut = rt_ptr != null and aj.Builder.cpuSupportsFastLutU8(dyn.cpu);
     var info = try analysis_mod.analyze(allocator, &prog, src_fmts, dst_fmt, @intCast(pw), @intCast(ph), .{
@@ -334,16 +322,7 @@ fn compileDynamicPlane(
         if (lut_execmem_denied and !dyn.execmem_warned.swap(true, .acq_rel)) {
             zapi.logMessage(.Warning, "zexpr.Expr: executable memory allocation denied; falling back to scalar LUT");
         }
-        var exec: plane_cache.CompiledPlane = .{ .lut = lut };
-        errdefer exec.deinit(allocator, rt_ptr);
-        const store_key = plane_cache.storageKey(plane_key, &exec);
-        return global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.CacheClosed => {
-                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
-                return error.CompileFailed;
-            },
-        };
+        return cacheAdmit(plane_key, .{ .lut = lut }, rt_ptr);
     }
 
     const prop_bindings = try common.buildPropBindings(allocator, &prog);
@@ -383,15 +362,7 @@ fn compileDynamicPlane(
     if (compiled_kernel) |kernel| {
         prog.deinit(allocator);
         owns_props = false;
-        var exec: plane_cache.CompiledPlane = .{ .jit = .{ .kernel = kernel, .props = prop_bindings } };
-        errdefer exec.deinit(allocator, rt_ptr);
-        return global_plane_cache.putOrGet(allocator, plane_key, exec) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.CacheClosed => {
-                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
-                return error.CompileFailed;
-            },
-        };
+        return cacheAdmit(plane_key, .{ .jit = .{ .kernel = kernel, .props = prop_bindings } }, rt_ptr);
     } else if ((rt_ptr == null or jit_execmem_denied) and info.fallback_lut_kind != .none) {
         info.lut_kind = info.fallback_lut_kind;
         info.lut_clips = info.fallback_lut_clips;
@@ -409,32 +380,35 @@ fn compileDynamicPlane(
         prog.deinit(allocator);
         common.freePropBindings(allocator, prop_bindings);
         owns_props = false;
-        var exec: plane_cache.CompiledPlane = .{ .lut = lut };
-        errdefer exec.deinit(allocator, null);
-        const store_key = plane_cache.storageKey(plane_key, &exec);
-        return global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.CacheClosed => {
-                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
-                return error.CompileFailed;
-            },
-        };
+        return cacheAdmit(plane_key, .{ .lut = lut }, null);
     } else {
         // F3: Cache unsupported-JIT / ExecMemDenied scalar program under `plane_key` so repeated
         // frames (e.g. non-LUT `f16` on SSE2/v2) avoid per-frame re-parse/lower/optimize.
         owns_props = false;
-        var exec: plane_cache.CompiledPlane = .{ .scalar = .{ .prog = prog, .props = prop_bindings } };
+        const exec: plane_cache.CompiledPlane = .{ .scalar = .{ .prog = prog, .props = prop_bindings } };
         // `prog` ownership transfers to `exec`; prevent outer `errdefer prog.deinit` from double-freeing on OOM.
         prog = .{};
-        errdefer exec.deinit(allocator, null);
-        return global_plane_cache.putOrGet(allocator, plane_key, exec) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.CacheClosed => {
-                setFilterErrorFmt(zapi, "plugin is shutting down", .{});
-                return error.CompileFailed;
-            },
-        };
+        return cacheAdmit(plane_key, exec, null);
     }
+}
+
+/// Lease the shared runtime when `want` (null when JIT memory is unavailable); a non-null
+/// result must be returned with `global_plane_cache.releaseRuntime()`.
+fn leaseRuntime(want: bool) error{CacheClosed}!?*aj.Runtime {
+    if (!want) return null;
+    return switch (global_plane_cache.acquireRuntime()) {
+        .lease => |l| l.rt,
+        .unavailable => null,
+        .closed => error.CacheClosed,
+    };
+}
+
+/// Admit `exec` into the global cache (LUTs under their dimension-free `storageKey`), destroying it
+/// when admission fails; `error.CacheClosed` means the plugin is shutting down.
+fn cacheAdmit(key: plane_cache.Key, exec: plane_cache.CompiledPlane, rt: ?*aj.Runtime) plane_cache.PutError!*plane_cache.Entry {
+    var owned = exec;
+    errdefer owned.deinit(allocator, rt);
+    return try global_plane_cache.putOrGet(allocator, plane_cache.storageKey(key, &owned), owned);
 }
 
 fn exprGetFrameDynamic(
@@ -448,27 +422,13 @@ fn exprGetFrameDynamic(
     const n_clips = src_frames.len;
 
     // 1. C3 invariant checks across all input frames (format support + dims/planes/subsampling match clip 0).
-    var stack_vfs: [32]vs.VideoFormat = undefined;
-    const heap_vfs: ?[]vs.VideoFormat = if (n_clips > stack_vfs.len)
-        allocator.alloc(vs.VideoFormat, n_clips) catch {
-            zapi.setFilterError("Expr: out of memory");
-            return null;
-        }
-    else
-        null;
-    defer if (heap_vfs) |hv| allocator.free(hv);
-    const frame_vfs: []vs.VideoFormat = if (heap_vfs) |hv| hv else stack_vfs[0..n_clips];
+    var vfs_buf: common.Scratch(vs.VideoFormat, 32) = .{};
+    defer vfs_buf.deinit();
+    const frame_vfs = vfs_buf.get(n_clips) orelse return frameOom(zapi);
 
-    var stack_fmts: [32]ast.SampleFormat = undefined;
-    const heap_fmts: ?[]ast.SampleFormat = if (n_clips > stack_fmts.len)
-        allocator.alloc(ast.SampleFormat, n_clips) catch {
-            zapi.setFilterError("Expr: out of memory");
-            return null;
-        }
-    else
-        null;
-    defer if (heap_fmts) |hf| allocator.free(hf);
-    const frame_src_fmts: []ast.SampleFormat = if (heap_fmts) |hf| hf else stack_fmts[0..n_clips];
+    var fmts_buf: common.Scratch(ast.SampleFormat, 32) = .{};
+    defer fmts_buf.deinit();
+    const frame_src_fmts = fmts_buf.get(n_clips) orelse return frameOom(zapi);
 
     var fw0: c_int = 0;
     var fh0: c_int = 0;
@@ -565,26 +525,12 @@ fn exprGetFrameDynamic(
     var ok = false;
     defer if (!ok) zapi.freeFrame(dst_frame);
 
-    var stack_ptrs: [32][*]const u8 = undefined;
-    var stack_strides: [32]isize = undefined;
-    const heap_ptrs: ?[][*]const u8 = if (n_clips > stack_ptrs.len)
-        allocator.alloc([*]const u8, n_clips) catch {
-            zapi.setFilterError("Expr: out of memory");
-            return null;
-        }
-    else
-        null;
-    defer if (heap_ptrs) |hp| allocator.free(hp);
-    const heap_strides: ?[]isize = if (n_clips > stack_strides.len)
-        allocator.alloc(isize, n_clips) catch {
-            zapi.setFilterError("Expr: out of memory");
-            return null;
-        }
-    else
-        null;
-    defer if (heap_strides) |hs| allocator.free(hs);
-    const src_ptrs: [][*]const u8 = if (heap_ptrs) |hp| hp else stack_ptrs[0..n_clips];
-    const src_strides: []isize = if (heap_strides) |hs| hs else stack_strides[0..n_clips];
+    var ptrs_buf: common.Scratch([*]const u8, 32) = .{};
+    defer ptrs_buf.deinit();
+    const src_ptrs = ptrs_buf.get(n_clips) orelse return frameOom(zapi);
+    var strides_buf: common.Scratch(isize, 32) = .{};
+    defer strides_buf.deinit();
+    const src_strides = strides_buf.get(n_clips) orelse return frameOom(zapi);
 
     // Check if any active plane uses built-in constants.
     var any_builtins = false;
@@ -595,33 +541,13 @@ fn exprGetFrameDynamic(
         }
     }
 
-    var stack_metas: [32]builtins.ClipMeta = undefined;
-    const heap_metas: ?[]builtins.ClipMeta = if (any_builtins and n_clips > stack_metas.len)
-        allocator.alloc(builtins.ClipMeta, n_clips) catch {
-            zapi.setFilterError("Expr: out of memory");
-            return null;
-        }
-    else
-        null;
-    defer if (heap_metas) |hm| allocator.free(hm);
-    const src_metas: []builtins.ClipMeta = if (any_builtins)
-        (if (heap_metas) |hm| hm else stack_metas[0..n_clips])
-    else
-        &.{};
+    var metas_buf: common.Scratch(builtins.ClipMeta, 32) = .{};
+    defer metas_buf.deinit();
+    const src_metas: []builtins.ClipMeta = if (any_builtins) metas_buf.get(n_clips) orelse return frameOom(zapi) else &.{};
 
-    var stack_full: [32]bool = undefined;
-    const heap_full: ?[]bool = if (any_builtins and n_clips > stack_full.len)
-        allocator.alloc(bool, n_clips) catch {
-            zapi.setFilterError("Expr: out of memory");
-            return null;
-        }
-    else
-        null;
-    defer if (heap_full) |hf| allocator.free(hf);
-    const clip_is_full: []bool = if (any_builtins)
-        (if (heap_full) |hf| hf else stack_full[0..n_clips])
-    else
-        &.{};
+    var full_buf: common.Scratch(bool, 32) = .{};
+    defer full_buf.deinit();
+    const clip_is_full: []bool = if (any_builtins) full_buf.get(n_clips) orelse return frameOom(zapi) else &.{};
     var dst_is_full = true;
 
     if (any_builtins) {
@@ -643,19 +569,9 @@ fn exprGetFrameDynamic(
         if (expr_str.len == 0) continue;
 
         const specs = dyn.plane_builtins[p];
-        var stack_rb: [32]builtins.BuiltinVal = undefined;
-        const heap_rb: ?[]builtins.BuiltinVal = if (specs.len > stack_rb.len)
-            allocator.alloc(builtins.BuiltinVal, specs.len) catch {
-                zapi.setFilterError("Expr: out of memory");
-                return null;
-            }
-        else
-            null;
-        defer if (heap_rb) |hr| allocator.free(hr);
-        const resolved_vals: []builtins.BuiltinVal = if (specs.len > 0)
-            (if (heap_rb) |hr| hr else stack_rb[0..specs.len])
-        else
-            &.{};
+        var rb_buf: common.Scratch(builtins.BuiltinVal, 32) = .{};
+        defer rb_buf.deinit();
+        const resolved_vals: []builtins.BuiltinVal = if (specs.len > 0) rb_buf.get(specs.len) orelse return frameOom(zapi) else &.{};
 
         var rctx_storage: builtins.ResolveContext = undefined;
         var rctx_ptr: ?*const builtins.ResolveContext = null;
@@ -701,29 +617,17 @@ fn exprGetFrameDynamic(
                 .opt_int = dyn.opt_int,
                 .builtin_ctx = rctx_ptr,
             }) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    zapi.setFilterError("Expr: out of memory");
-                    return null;
-                },
+                error.OutOfMemory => return frameOom(zapi),
                 else => unreachable,
             };
             defer prog.deinit(allocator);
 
-            lower_mod.lower(allocator, &prog, d.profile) catch {
-                zapi.setFilterError("Expr: out of memory");
-                return null;
-            };
+            lower_mod.lower(allocator, &prog, d.profile) catch return frameOom(zapi);
             optimize_mod.optimize(allocator, &prog, d.profile, .{
                 .enable_value_changing = true,
                 .enable_fma = d.profile.use_fma,
-            }) catch {
-                zapi.setFilterError("Expr: out of memory");
-                return null;
-            };
-            const prop_bindings = common.buildPropBindings(allocator, &prog) catch {
-                zapi.setFilterError("Expr: out of memory");
-                return null;
-            };
+            }) catch return frameOom(zapi);
+            const prop_bindings = common.buildPropBindings(allocator, &prog) catch return frameOom(zapi);
             defer common.freePropBindings(allocator, prop_bindings);
 
             if (!executeScalarProg(
@@ -770,8 +674,9 @@ fn exprGetFrameDynamic(
                 plane_key,
                 rctx_ptr,
             ) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    zapi.setFilterError("Expr: out of memory");
+                error.OutOfMemory => return frameOom(zapi),
+                error.CacheClosed => {
+                    setFilterErrorFmt(zapi, "plugin is shutting down", .{});
                     return null;
                 },
                 error.CompileFailed => return null,
@@ -812,34 +717,15 @@ fn exprGetFrame(
 
     switch (reason) {
         .Initial => {
-            for (d.nodes, d.clip_num_frames) |node, nf| {
-                zapi.requestFrameFilter(common.clampFrameIdx(n, nf), node);
-            }
+            common.requestInputs(zapi, n, d.nodes, d.clip_num_frames);
             return null;
         },
         .AllFramesReady => {
             const n_clips = d.nodes.len;
-            var stack_frames: [32]?*const vs.Frame = @splat(null);
-            const heap_frames: ?[]?*const vs.Frame = if (n_clips > stack_frames.len)
-                allocator.alloc(?*const vs.Frame, n_clips) catch {
-                    zapi.setFilterError("Expr: out of memory");
-                    return null;
-                }
-            else
-                null;
-            defer if (heap_frames) |hf| allocator.free(hf);
-            const src_frames: []?*const vs.Frame = if (heap_frames) |hf| hf else stack_frames[0..n_clips];
-            @memset(src_frames, null);
-
-            defer {
-                for (src_frames) |maybe_f| {
-                    if (maybe_f) |f| zapi.freeFrame(f);
-                }
-            }
-
-            for (d.nodes, d.clip_num_frames, 0..) |node, nf, i| {
-                src_frames[i] = zapi.getFrameFilter(common.clampFrameIdx(n, nf), node);
-            }
+            var inputs: common.InputFrames = .{};
+            defer inputs.deinit(zapi);
+            if (!inputs.fetch(zapi, n, d.nodes, d.clip_num_frames)) return frameOom(zapi);
+            const src_frames = inputs.frames;
 
             switch (d.mode) {
                 .dynamic => |*dyn| return exprGetFrameDynamic(d, dyn, zapi, core, n, src_frames),
@@ -867,27 +753,12 @@ fn exprGetFrame(
                     var ok = false;
                     defer if (!ok) zapi.freeFrame(dst_frame);
 
-                    var stack_ptrs: [32][*]const u8 = undefined;
-                    var stack_strides: [32]isize = undefined;
-                    const heap_ptrs: ?[][*]const u8 = if (n_clips > stack_ptrs.len)
-                        allocator.alloc([*]const u8, n_clips) catch {
-                            zapi.setFilterError("Expr: out of memory");
-                            return null;
-                        }
-                    else
-                        null;
-                    defer if (heap_ptrs) |hp| allocator.free(hp);
-                    const heap_strides: ?[]isize = if (n_clips > stack_strides.len)
-                        allocator.alloc(isize, n_clips) catch {
-                            zapi.setFilterError("Expr: out of memory");
-                            return null;
-                        }
-                    else
-                        null;
-                    defer if (heap_strides) |hs| allocator.free(hs);
-
-                    const src_ptrs: [][*]const u8 = if (heap_ptrs) |hp| hp else stack_ptrs[0..n_clips];
-                    const src_strides: []isize = if (heap_strides) |hs| hs else stack_strides[0..n_clips];
+                    var ptrs_buf: common.Scratch([*]const u8, 32) = .{};
+                    defer ptrs_buf.deinit();
+                    const src_ptrs = ptrs_buf.get(n_clips) orelse return frameOom(zapi);
+                    var strides_buf: common.Scratch(isize, 32) = .{};
+                    defer strides_buf.deinit();
+                    const src_strides = strides_buf.get(n_clips) orelse return frameOom(zapi);
 
                     for (0..st.num_planes) |p| {
                         const exec: *const SinglePlaneExec = switch (st.planes[p]) {
@@ -964,9 +835,10 @@ pub fn create(
     _ = user_data;
     const zapi = ZAPI.init(vsapi, core, null);
     const map_out = zapi.initZMap(out);
-    createImpl(zapi, in, out, map_out, core, vsapi) catch |err| switch (err) {
+    createImpl(zapi, in, out, map_out) catch |err| switch (err) {
         error.Invalid => {},
         error.OutOfMemory => map_out.setError("Expr: out of memory"),
+        error.CacheClosed => map_out.setError("Expr: plugin is shutting down"),
     };
 }
 
@@ -988,7 +860,7 @@ fn compileSinglePlane(
     execmem_warned: *bool,
     existing_prog: ?*ast.Program,
     builtin_ctx: ?*const builtins.ResolveContext,
-) (common.ArgError || std.mem.Allocator.Error)!SinglePlaneExec {
+) (common.ArgError || plane_cache.PutError)!SinglePlaneExec {
     if (!force_scalar) {
         if (global_plane_cache.getOrDim(plane_key)) |entry| {
             return .{ .cached = entry };
@@ -1049,16 +921,7 @@ fn compileSinglePlane(
             zapi.logMessage(.Warning, "zexpr.Expr: executable memory allocation denied; falling back to scalar LUT");
         }
         // C9 + Phase 3: ALL LUTs (scalar and runtime-dimension SIMD u8) store under `0x0` via `storageKey`.
-        const entry = cache_blk: {
-            var exec: plane_cache.CompiledPlane = .{ .lut = lut };
-            errdefer exec.deinit(allocator, rt_ptr);
-            const store_key = plane_cache.storageKey(plane_key, &exec);
-            break :cache_blk global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
-            };
-        };
-        return .{ .cached = entry };
+        return .{ .cached = try cacheAdmit(plane_key, .{ .lut = lut }, rt_ptr) };
     }
 
     const prop_bindings = try common.buildPropBindings(allocator, &prog);
@@ -1099,15 +962,7 @@ fn compileSinglePlane(
     if (compiled_kernel) |kernel| {
         prog.deinit(allocator);
         owns_props = false;
-        const entry = cache_blk: {
-            var exec: plane_cache.CompiledPlane = .{ .jit = .{ .kernel = kernel, .props = prop_bindings } };
-            errdefer exec.deinit(allocator, rt_ptr);
-            break :cache_blk global_plane_cache.putOrGet(allocator, plane_key, exec) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
-            };
-        };
-        return .{ .cached = entry };
+        return .{ .cached = try cacheAdmit(plane_key, .{ .jit = .{ .kernel = kernel, .props = prop_bindings } }, rt_ptr) };
     } else if (!force_scalar and (rt_ptr == null or jit_execmem_denied) and info.fallback_lut_kind != .none) {
         // M1 + C9: when executable memory is unavailable and the plane can be served by a scalar table,
         // build and cache the table (via scalar oracle, zero execmem) instead of dropping to per-pixel interp.
@@ -1127,16 +982,7 @@ fn compileSinglePlane(
         prog.deinit(allocator);
         common.freePropBindings(allocator, prop_bindings);
         owns_props = false;
-        const entry = cache_blk: {
-            var exec: plane_cache.CompiledPlane = .{ .lut = lut };
-            errdefer exec.deinit(allocator, null);
-            const store_key = plane_cache.storageKey(plane_key, &exec);
-            break :cache_blk global_plane_cache.putOrGet(allocator, store_key, exec) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.CacheClosed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
-            };
-        };
-        return .{ .cached = entry };
+        return .{ .cached = try cacheAdmit(plane_key, .{ .lut = lut }, null) };
     } else {
         const scalar_exec = try allocator.create(plane_cache.ScalarExec);
         scalar_exec.* = .{ .prog = prog, .props = prop_bindings };
@@ -1150,25 +996,21 @@ fn createImpl(
     in: ?*const vs.Map,
     out: ?*vs.Map,
     map_out: ZAPI.ZMap(?*vs.Map),
-    core: ?*vs.Core,
-    vsapi: ?*const vs.API,
-) (common.ArgError || std.mem.Allocator.Error)!void {
+) (common.ArgError || plane_cache.PutError)!void {
     const nodes = common.getNodes(allocator, zapi, in, "clips") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TooManyClips => return common.fail(map_out, filter_name, "too many input clips (max 65535)", .{}),
         error.Missing => return common.fail(map_out, filter_name, "at least one clip is required", .{}),
     };
-    var owns_nodes = true;
-    errdefer if (owns_nodes) {
+    errdefer {
         for (nodes) |n| zapi.freeNode(n);
         allocator.free(nodes);
-    };
+    }
 
     const vi0 = zapi.getVideoInfo(nodes[0]);
 
     const clip_num_frames = try allocator.alloc(i32, nodes.len);
-    var owns_clip_nf = true;
-    errdefer if (owns_clip_nf) allocator.free(clip_num_frames);
+    errdefer allocator.free(clip_num_frames);
 
     var any_var_fmt = false;
     var any_var_res = false;
@@ -1224,7 +1066,7 @@ fn createImpl(
         }
         var new_fmt: vs.VideoFormat = undefined;
         const fmt_enum: vs.PresetVideoFormat = @fromBackingInt(@intCast(@as(u32, @intCast(fmt_id_64))));
-        if (vsapi.?.getVideoFormatByID.?(&new_fmt, fmt_enum, core) == 0 or new_fmt.colorFamily == .Undefined) {
+        if (zapi.vsapi.getVideoFormatByID.?(&new_fmt, fmt_enum, zapi.core) == 0 or new_fmt.colorFamily == .Undefined) {
             return common.fail(map_out, filter_name, "invalid format id", .{});
         }
         if (common.toSampleFormat(new_fmt) == null) {
@@ -1309,7 +1151,7 @@ fn createImpl(
         @intCast(vi0.format.numPlanes)
     else
         max_planes;
-    const expr_count_raw = vsapi.?.mapNumElements.?(in, "expr");
+    const expr_count_raw = zapi.vsapi.mapNumElements.?(in, "expr");
     if (expr_count_raw <= 0 or expr_count_raw > @as(c_int, @intCast(expr_planes))) {
         return common.fail(map_out, filter_name, "expr must have between 1 and {d} elements", .{expr_planes});
     }
@@ -1427,13 +1269,9 @@ fn createImpl(
         };
         var plane_range_clips: [max_planes]PlaneRangeClips = .{ .{}, .{}, .{} };
 
-        var stack_metas: [32]builtins.ClipMeta = undefined;
-        const heap_metas: ?[]builtins.ClipMeta = if (nodes.len > stack_metas.len)
-            try allocator.alloc(builtins.ClipMeta, nodes.len)
-        else
-            null;
-        defer if (heap_metas) |hm| allocator.free(hm);
-        const src_metas: []builtins.ClipMeta = if (heap_metas) |hm| hm else stack_metas[0..nodes.len];
+        var metas_buf: common.Scratch(builtins.ClipMeta, 32) = .{};
+        defer metas_buf.deinit();
+        const src_metas = metas_buf.get(nodes.len) orelse return error.OutOfMemory;
 
         for (0..num_planes) |p| {
             if (!needs_compile[p]) continue;
@@ -1503,16 +1341,8 @@ fn createImpl(
 
         if (!use_dynamic) {
             // Phase 3: compile missed planes (or precompile 2^k variants for 1 <= k <= 2) against the shared JitRuntime.
-            var leased_rt = false;
-            const rt_ptr: ?*aj.Runtime = if (any_miss and cpu.isa != .scalar) switch (global_plane_cache.acquireRuntime()) {
-                .lease => |l| blk: {
-                    leased_rt = true;
-                    break :blk l.rt;
-                },
-                .unavailable => null,
-                .closed => return common.fail(map_out, filter_name, "plugin is shutting down", .{}),
-            } else null;
-            defer if (leased_rt) global_plane_cache.releaseRuntime();
+            const rt_ptr = try leaseRuntime(any_miss and cpu.isa != .scalar);
+            defer if (rt_ptr != null) global_plane_cache.releaseRuntime();
             var execmem_warned = false;
 
             for (0..num_planes) |p| {
@@ -1630,36 +1460,13 @@ fn createImpl(
                 planes[p] = .{ .single = single };
             }
 
-            const deps = try allocator.alloc(vs.FilterDependency, nodes.len);
-            defer allocator.free(deps);
-
-            const data = try allocator.create(ExprData);
-            owns_nodes = false;
-            owns_src_fmts = false;
-            owns_clip_nf = false;
-            owns_planes = false;
-            data.* = .{
-                .nodes = nodes,
-                .clip_num_frames = clip_num_frames,
-                .out_vi = out_vi,
-                .profile = profile,
-                .mode = .{ .static = .{
-                    .src_fmts = src_fmts,
-                    .dst_fmt = dst_fmt,
-                    .planes = planes,
-                    .num_planes = num_planes,
-                } },
-            };
-
-            for (nodes, clip_num_frames, 0..) |node, nf, i| {
-                deps[i] = .{
-                    .source = node,
-                    .requestPattern = if (nf >= out_vi.numFrames) .StrictSpatial else .FrameReuseLastOnly,
-                };
-            }
-
-            zapi.createVideoFilter(out, filter_name, &data.out_vi, exprGetFrame, exprFree, .Parallel, deps, data);
-            return;
+            // On success `createFilter` owns everything; the `errdefer`s above only run on its OOM.
+            return createFilter(zapi, out, nodes, clip_num_frames, out_vi, profile, .{ .static = .{
+                .src_fmts = src_fmts,
+                .dst_fmt = dst_fmt,
+                .planes = planes,
+                .num_planes = num_planes,
+            } });
         }
 
         // `k > 2` triggered dynamic mode: release any Phase 1 cached refs & static `src_fmts` before dynamic setup.
@@ -1681,8 +1488,7 @@ fn createImpl(
         .force_scalar = force_scalar,
         .execmem_warned = .init(false),
     };
-    var owns_dyn = true;
-    errdefer if (owns_dyn) dyn.deinit();
+    errdefer dyn.deinit();
 
     for (0..expr_planes) |p| {
         const expr_str = plane_exprs[p];
@@ -1730,27 +1536,30 @@ fn createImpl(
         }
     }
 
+    return createFilter(zapi, out, nodes, clip_num_frames, out_vi, profile, .{ .dynamic = dyn });
+}
+
+/// Hand `nodes`, `clip_num_frames` and `mode` to a new `ExprData` filter instance; on OOM nothing is
+/// taken over (the caller's `errdefer`s release them).
+fn createFilter(
+    zapi: ZAPI,
+    out: ?*vs.Map,
+    nodes: []*vs.Node,
+    clip_num_frames: []i32,
+    out_vi: vs.VideoInfo,
+    profile: interp.TargetProfile,
+    mode: ExprModeData,
+) std.mem.Allocator.Error!void {
     const deps = try allocator.alloc(vs.FilterDependency, nodes.len);
     defer allocator.free(deps);
-
     const data = try allocator.create(ExprData);
-    owns_nodes = false;
-    owns_clip_nf = false;
-    owns_dyn = false;
     data.* = .{
         .nodes = nodes,
         .clip_num_frames = clip_num_frames,
         .out_vi = out_vi,
         .profile = profile,
-        .mode = .{ .dynamic = dyn },
+        .mode = mode,
     };
-
-    for (nodes, clip_num_frames, 0..) |node, nf, i| {
-        deps[i] = .{
-            .source = node,
-            .requestPattern = if (nf >= out_vi.numFrames) .StrictSpatial else .FrameReuseLastOnly,
-        };
-    }
-
+    common.fillDeps(deps, nodes, clip_num_frames, out_vi.numFrames);
     zapi.createVideoFilter(out, filter_name, &data.out_vi, exprGetFrame, exprFree, .Parallel, deps, data);
 }

@@ -9,16 +9,29 @@ const plane_cache = @import("../jit/plane_cache.zig");
 const vs = vapoursynth.vapoursynth4;
 const ZAPI = vapoursynth.ZAPI;
 
+/// Same allocator as the filters (`std.heap.c_allocator`), for per-frame `Scratch` fallbacks.
+const scratch_allocator = std.heap.c_allocator;
+
 pub const ArgError = error{Invalid};
 
-pub fn fail(map_out: ZAPI.ZMap(?*vs.Map), comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) ArgError {
-    var buf: [512]u8 = undefined;
+/// Format `prefix: fmt` into `buf` as a C string, truncating messages that do not fit.
+fn formatMsg(buf: *[512]u8, comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
     var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
     w.print(prefix ++ ": " ++ fmt, args) catch {};
     buf[w.end] = 0;
-    const msg: [:0]const u8 = buf[0..w.end :0];
-    map_out.setError(msg);
+    return buf[0..w.end :0];
+}
+
+pub fn fail(map_out: ZAPI.ZMap(?*vs.Map), comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) ArgError {
+    var buf: [512]u8 = undefined;
+    map_out.setError(formatMsg(&buf, prefix, fmt, args));
     return error.Invalid;
+}
+
+/// getFrame counterpart of `fail`: sets a formatted filter error.
+pub fn setFilterErrorFmt(zapi: ZAPI, comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    zapi.setFilterError(formatMsg(&buf, prefix, fmt, args));
 }
 
 pub const PropBinding = plane_cache.PropBinding;
@@ -32,13 +45,17 @@ pub const ScalarPropBinding = union(enum) {
     builtin: builtins.BuiltinSpec,
 };
 
-pub fn freeScalarPropBindings(allocator: std.mem.Allocator, props: []ScalarPropBinding) void {
+fn freeScalarPropNames(allocator: std.mem.Allocator, props: []const ScalarPropBinding) void {
     for (props) |p| {
         switch (p) {
             .frame_prop => |fp| allocator.free(fp.name_z),
             .builtin => {},
         }
     }
+}
+
+pub fn freeScalarPropBindings(allocator: std.mem.Allocator, props: []ScalarPropBinding) void {
+    freeScalarPropNames(allocator, props);
     allocator.free(props);
 }
 
@@ -49,12 +66,7 @@ pub fn buildScalarPropBindings(
     const out = try allocator.alloc(ScalarPropBinding, prog.props.items.len);
     var built: usize = 0;
     errdefer {
-        for (out[0..built]) |p| {
-            switch (p) {
-                .frame_prop => |fp| allocator.free(fp.name_z),
-                .builtin => {},
-            }
-        }
+        freeScalarPropNames(allocator, out[0..built]);
         allocator.free(out);
     }
     for (prog.props.items, 0..) |p, i| {
@@ -118,13 +130,7 @@ pub fn clipMetaFromFrame(
         readFrameIsFullRange(zapi, zapi.vsapi.getFramePropertiesRO.?(frame), vf)
     else
         (cf == .rgb);
-    return .{
-        .is_float = vf.sampleType == .Float,
-        .bits_per_sample = @intCast(vf.bitsPerSample),
-        .color_family = cf,
-        .plane_idx = plane_idx,
-        .is_full_range = is_full,
-    };
+    return clipMetaFromVi(vf, plane_idx, is_full);
 }
 
 pub inline fn clampFrameIdx(n: c_int, num_frames: i32) c_int {
@@ -132,6 +138,65 @@ pub inline fn clampFrameIdx(n: c_int, num_frames: i32) c_int {
     if (n >= num_frames) return @intCast(num_frames - 1);
     return n;
 }
+
+/// `.Initial`: request frame `n` (clamped to each clip's length) from every input node.
+pub fn requestInputs(zapi: ZAPI, n: c_int, nodes: []const *vs.Node, num_frames: []const i32) void {
+    for (nodes, num_frames) |node, nf| {
+        zapi.requestFrameFilter(clampFrameIdx(n, nf), node);
+    }
+}
+
+/// Filter dependencies: `.StrictSpatial` for inputs at least as long as the output, else
+/// `.FrameReuseLastOnly` (their frame index is clamped to the last frame).
+pub fn fillDeps(deps: []vs.FilterDependency, nodes: []const *vs.Node, num_frames: []const i32, out_num_frames: c_int) void {
+    for (deps, nodes, num_frames) |*dep, node, nf| {
+        dep.* = .{
+            .source = node,
+            .requestPattern = if (nf >= out_num_frames) .StrictSpatial else .FrameReuseLastOnly,
+        };
+    }
+}
+
+/// Per-frame scratch of `N` stack items with a heap fallback for larger counts.
+/// The returned slice points into this value, so it must not move while the slice is in use.
+pub fn Scratch(comptime T: type, comptime N: usize) type {
+    return struct {
+        stack: [N]T = undefined,
+        heap: ?[]T = null,
+
+        /// `len` items, or null when the heap fallback is out of memory.
+        pub fn get(self: *@This(), len: usize) ?[]T {
+            if (len <= N) return self.stack[0..len];
+            self.heap = scratch_allocator.alloc(T, len) catch return null;
+            return self.heap.?;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.heap) |h| scratch_allocator.free(h);
+        }
+    };
+}
+
+/// `.AllFramesReady`: the input frames (frame `n` clamped per clip), released by `deinit`.
+pub const InputFrames = struct {
+    buf: Scratch(?*const vs.Frame, 32) = .{},
+    frames: []?*const vs.Frame = &.{},
+
+    /// Fetch every input frame; false on out of memory.
+    pub fn fetch(self: *InputFrames, zapi: ZAPI, n: c_int, nodes: []const *vs.Node, num_frames: []const i32) bool {
+        const frames = self.buf.get(nodes.len) orelse return false;
+        for (frames, nodes, num_frames) |*f, node, nf| {
+            f.* = zapi.getFrameFilter(clampFrameIdx(n, nf), node);
+        }
+        self.frames = frames;
+        return true;
+    }
+
+    pub fn deinit(self: *InputFrames, zapi: ZAPI) void {
+        for (self.frames) |mf| if (mf) |f| zapi.freeFrame(f);
+        self.buf.deinit();
+    }
+};
 
 /// Safe `mapGetData` wrapper that allows empty strings `""` (ZMap.getData returns null for len == 0).
 pub fn getDataAllowEmpty(zapi: ZAPI, map: ?*const vs.Map, key: [*:0]const u8, idx: usize) ?[]const u8 {

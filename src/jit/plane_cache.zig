@@ -93,7 +93,6 @@ pub const CompiledPlane = union(enum) {
 };
 
 pub const Entry = struct {
-    hash: u64,
     key: Key,
     exec: CompiledPlane,
     ref_count: usize,
@@ -235,7 +234,6 @@ pub fn PlaneCacheCustom(
 
     return struct {
         const Self = @This();
-        pub const hash_table_size = table_size;
 
         mutex: std.Io.Mutex = .init,
         state: CacheState = .open,
@@ -256,7 +254,6 @@ pub fn PlaneCacheCustom(
         count: usize = 0,
         lut_bytes: usize = 0,
         hits: u64 = 0,
-        misses: u64 = 0,
 
         inline fn lock(self: *Self) void {
             std.Io.Threaded.mutexLockUncancelable(&self.mutex);
@@ -284,79 +281,57 @@ pub fn PlaneCacheCustom(
             self.free_head = s;
         }
 
-        fn lruPushFrontLocked(self: *Self, s: u16) void {
-            self.slots[s].prev_lru = none_idx;
-            self.slots[s].next_lru = self.lru_head;
-            if (self.lru_head != none_idx) {
-                self.slots[self.lru_head].prev_lru = s;
+        /// Intrusive doubly-linked list ops shared by the global LRU (`list = "lru"`) and the
+        /// LUT-only LRU (`list = "lut"`): `prev_<list>`/`next_<list>` links, `<list>_head`/`<list>_tail`.
+        fn pushFrontLocked(self: *Self, comptime list: []const u8, s: u16) void {
+            const head = &@field(self, list ++ "_head");
+            @field(self.slots[s], "prev_" ++ list) = none_idx;
+            @field(self.slots[s], "next_" ++ list) = head.*;
+            if (head.* != none_idx) {
+                @field(self.slots[head.*], "prev_" ++ list) = s;
             } else {
-                self.lru_tail = s;
+                @field(self, list ++ "_tail") = s;
             }
-            self.lru_head = s;
+            head.* = s;
         }
 
-        fn lruUnlinkLocked(self: *Self, s: u16) void {
-            const p = self.slots[s].prev_lru;
-            const n = self.slots[s].next_lru;
+        fn unlinkLocked(self: *Self, comptime list: []const u8, s: u16) void {
+            const p = @field(self.slots[s], "prev_" ++ list);
+            const n = @field(self.slots[s], "next_" ++ list);
             if (p != none_idx) {
-                self.slots[p].next_lru = n;
+                @field(self.slots[p], "next_" ++ list) = n;
             } else {
-                self.lru_head = n;
+                @field(self, list ++ "_head") = n;
             }
             if (n != none_idx) {
-                self.slots[n].prev_lru = p;
+                @field(self.slots[n], "prev_" ++ list) = p;
             } else {
-                self.lru_tail = p;
+                @field(self, list ++ "_tail") = p;
             }
-            self.slots[s].prev_lru = none_idx;
-            self.slots[s].next_lru = none_idx;
+            @field(self.slots[s], "prev_" ++ list) = none_idx;
+            @field(self.slots[s], "next_" ++ list) = none_idx;
         }
 
-        fn lruMoveToFrontLocked(self: *Self, s: u16) void {
-            if (self.lru_head == s) return;
-            self.lruUnlinkLocked(s);
-            self.lruPushFrontLocked(s);
-        }
-
-        fn lutPushFrontLocked(self: *Self, s: u16) void {
-            self.slots[s].prev_lut = none_idx;
-            self.slots[s].next_lut = self.lut_head;
-            if (self.lut_head != none_idx) {
-                self.slots[self.lut_head].prev_lut = s;
-            } else {
-                self.lut_tail = s;
-            }
-            self.lut_head = s;
-        }
-
-        fn lutUnlinkLocked(self: *Self, s: u16) void {
-            const p = self.slots[s].prev_lut;
-            const n = self.slots[s].next_lut;
-            if (p != none_idx) {
-                self.slots[p].next_lut = n;
-            } else {
-                self.lut_head = n;
-            }
-            if (n != none_idx) {
-                self.slots[n].prev_lut = p;
-            } else {
-                self.lut_tail = p;
-            }
-            self.slots[s].prev_lut = none_idx;
-            self.slots[s].next_lut = none_idx;
-        }
-
-        fn lutMoveToFrontLocked(self: *Self, s: u16) void {
-            if (self.lut_head == s) return;
-            self.lutUnlinkLocked(s);
-            self.lutPushFrontLocked(s);
+        fn moveToFrontLocked(self: *Self, comptime list: []const u8, s: u16) void {
+            if (@field(self, list ++ "_head") == s) return;
+            self.unlinkLocked(list, s);
+            self.pushFrontLocked(list, s);
         }
 
         fn touchLocked(self: *Self, s: u16) void {
-            self.lruMoveToFrontLocked(s);
+            self.moveToFrontLocked("lru", s);
             if (self.slots[s].lut_bytes > 0) {
-                self.lutMoveToFrontLocked(s);
+                self.moveToFrontLocked("lut", s);
             }
+        }
+
+        /// Cache hit: move slot `s` to MRU and hand the caller a new reference to its entry.
+        fn takeHitLocked(self: *Self, s: u16) *Entry {
+            self.touchLocked(s);
+            const e = self.slots[s].entry.?;
+            e.ref_count += 1;
+            self.live_external_refs += 1;
+            return e;
         }
 
         fn findSlotLocked(self: *const Self, h: u64, key: Key) ?u16 {
@@ -405,9 +380,9 @@ pub fn PlaneCacheCustom(
             const meta = self.slots[s];
             const e = meta.entry.?;
             self.indexRemoveLocked(s, meta.hash);
-            self.lruUnlinkLocked(s);
+            self.unlinkLocked("lru", s);
             if (meta.lut_bytes > 0) {
-                self.lutUnlinkLocked(s);
+                self.unlinkLocked("lut", s);
                 self.lut_bytes -= meta.lut_bytes;
             }
             self.count -= 1;
@@ -466,14 +441,9 @@ pub fn PlaneCacheCustom(
             if (self.state == .closed) return null;
 
             if (self.findSlotLocked(h, key)) |s| {
-                self.touchLocked(s);
-                const e = self.slots[s].entry.?;
-                e.ref_count += 1;
-                self.live_external_refs += 1;
                 self.hits += 1;
-                return e;
+                return self.takeHitLocked(s);
             }
-            self.misses += 1;
             return null;
         }
 
@@ -487,27 +457,18 @@ pub fn PlaneCacheCustom(
             if (self.state == .closed) return null;
 
             if (self.findSlotLocked(hp.exact, key)) |s| {
-                self.touchLocked(s);
-                const e = self.slots[s].entry.?;
-                e.ref_count += 1;
-                self.live_external_refs += 1;
                 self.hits += 1;
-                return e;
+                return self.takeHitLocked(s);
             }
             if (has_dims) {
                 var dim_key = key;
                 dim_key.width = 0;
                 dim_key.height = 0;
                 if (self.findSlotLocked(hp.dim_free, dim_key)) |s| {
-                    self.touchLocked(s);
-                    const e = self.slots[s].entry.?;
-                    e.ref_count += 1;
-                    self.live_external_refs += 1;
                     self.hits += 1;
-                    return e;
+                    return self.takeHitLocked(s);
                 }
             }
-            self.misses += 1;
             return null;
         }
 
@@ -554,10 +515,7 @@ pub fn PlaneCacheCustom(
                 rt_ptr = self.runtimePtrLocked();
 
                 if (self.findSlotLocked(h, key)) |s| {
-                    self.touchLocked(s);
-                    const e = self.slots[s].entry.?;
-                    e.ref_count += 1;
-                    self.live_external_refs += 1;
+                    const e = self.takeHitLocked(s);
                     duplicate_exec = exec;
                     self.active_rt_users += 1;
                     held_rt_user = true;
@@ -568,7 +526,6 @@ pub fn PlaneCacheCustom(
                 // returned with caller-only ownership instead of wiping healthy cached entries.
                 if (new_lut_bytes > max_lut_bytes) {
                     new_entry.* = .{
-                        .hash = h,
                         .key = owned_key,
                         .exec = exec,
                         .ref_count = 1,
@@ -594,7 +551,6 @@ pub fn PlaneCacheCustom(
 
                 const slot = self.allocSlotLocked();
                 new_entry.* = .{
-                    .hash = h,
                     .key = owned_key,
                     .exec = exec,
                     .ref_count = 2, // 1 for cache slot + 1 for caller
@@ -606,9 +562,9 @@ pub fn PlaneCacheCustom(
                     .lut_bytes = new_lut_bytes,
                 };
                 self.indexInsertLocked(slot, h);
-                self.lruPushFrontLocked(slot);
+                self.pushFrontLocked("lru", slot);
                 if (new_lut_bytes > 0) {
-                    self.lutPushFrontLocked(slot);
+                    self.pushFrontLocked("lut", slot);
                     self.lut_bytes += new_lut_bytes;
                 }
                 self.count += 1;
@@ -683,25 +639,7 @@ pub fn PlaneCacheCustom(
             defer self.unlock();
             if (self.state == .closed) return false;
             if (self.live_external_refs != 0 or self.active_rt_users != 0) return false;
-
-            self.state = .closed;
-            var s = self.lru_head;
-            while (s != none_idx) {
-                const next = self.slots[s].next_lru;
-                const e = self.slots[s].entry.?;
-                e.ref_count -= 1;
-                std.debug.assert(e.ref_count == 0);
-                // Pass `rt = null` so per-kernel `Runtime.release` (and its internal lock) is
-                // skipped; `self.rt.deinit()` reclaims all executable blocks in one bulk reset.
-                destroyEntry(allocator, e, null);
-                self.slots[s] = .{};
-                s = next;
-            }
-            self.resetStorageLocked();
-            if (self.rt) |*r| {
-                r.deinit();
-                self.rt = null;
-            }
+            self.teardownLocked(allocator);
             return true;
         }
 
@@ -712,6 +650,11 @@ pub fn PlaneCacheCustom(
             defer self.unlock();
             std.debug.assert(self.live_external_refs == 0);
             std.debug.assert(self.active_rt_users == 0);
+            self.teardownLocked(allocator);
+        }
+
+        /// Close the cache, destroy every cached entry and the shared runtime (quiescent callers only).
+        fn teardownLocked(self: *Self, allocator: std.mem.Allocator) void {
             self.state = .closed;
             var s = self.lru_head;
             while (s != none_idx) {
@@ -719,6 +662,8 @@ pub fn PlaneCacheCustom(
                 const e = self.slots[s].entry.?;
                 e.ref_count -= 1;
                 std.debug.assert(e.ref_count == 0);
+                // Pass `rt = null` so per-kernel `Runtime.release` (and its internal lock) is
+                // skipped; `self.rt.deinit()` reclaims all executable blocks in one bulk reset.
                 destroyEntry(allocator, e, null);
                 self.slots[s] = .{};
                 s = next;
@@ -763,15 +708,7 @@ fn hashBase(k: Key) u64 {
     h.update(std.mem.asBytes(&cpu_isa));
     h.update(std.mem.asBytes(&k.cpu.vec_bytes));
     h.update(std.mem.asBytes(&k.cpu.f32_lanes));
-    const cpu_bits: u8 =
-        (@as(u8, @intFromBool(k.cpu.has_ssse3)) << 0) |
-        (@as(u8, @intFromBool(k.cpu.has_sse4_1)) << 1) |
-        (@as(u8, @intFromBool(k.cpu.has_fma)) << 2) |
-        (@as(u8, @intFromBool(k.cpu.has_f16c)) << 3) |
-        (@as(u8, @intFromBool(k.cpu.has_avx2)) << 4) |
-        (@as(u8, @intFromBool(k.cpu.has_avx512)) << 5) |
-        (@as(u8, @intFromBool(k.cpu.prefer_hw_gather_f32)) << 6) |
-        (@as(u8, @intFromBool(k.cpu.prefer_alt_widen_load)) << 7);
+    const cpu_bits = cpuFlagBits(k.cpu);
     h.update(std.mem.asBytes(&cpu_bits));
     // D5: hash resolved_builtins field by field (never raw struct bytes over `?i32` padding).
     h.update(std.mem.asBytes(&k.resolved_builtins.len));
@@ -788,26 +725,27 @@ fn mixDims(base: u64, width: usize, height: usize) u64 {
     return h.final();
 }
 
-fn hashKey(k: Key) u64 {
-    return mixDims(hashBase(k), k.width, k.height);
-}
-
 fn fmtEql(a: ast.SampleFormat, b: ast.SampleFormat) bool {
     return a.is_float == b.is_float and a.bits_per_sample == b.bits_per_sample;
+}
+
+/// All boolean `CpuInfo` feature flags packed into one byte (shared by `hashBase` and `cpuEql`).
+fn cpuFlagBits(c: cpu_mod.CpuInfo) u8 {
+    return (@as(u8, @intFromBool(c.has_ssse3)) << 0) |
+        (@as(u8, @intFromBool(c.has_sse4_1)) << 1) |
+        (@as(u8, @intFromBool(c.has_fma)) << 2) |
+        (@as(u8, @intFromBool(c.has_f16c)) << 3) |
+        (@as(u8, @intFromBool(c.has_avx2)) << 4) |
+        (@as(u8, @intFromBool(c.has_avx512)) << 5) |
+        (@as(u8, @intFromBool(c.prefer_hw_gather_f32)) << 6) |
+        (@as(u8, @intFromBool(c.prefer_alt_widen_load)) << 7);
 }
 
 fn cpuEql(a: cpu_mod.CpuInfo, b: cpu_mod.CpuInfo) bool {
     return a.isa == b.isa and
         a.vec_bytes == b.vec_bytes and
         a.f32_lanes == b.f32_lanes and
-        a.has_ssse3 == b.has_ssse3 and
-        a.has_sse4_1 == b.has_sse4_1 and
-        a.has_fma == b.has_fma and
-        a.has_f16c == b.has_f16c and
-        a.has_avx2 == b.has_avx2 and
-        a.has_avx512 == b.has_avx512 and
-        a.prefer_hw_gather_f32 == b.prefer_hw_gather_f32 and
-        a.prefer_alt_widen_load == b.prefer_alt_widen_load;
+        cpuFlagBits(a) == cpuFlagBits(b);
 }
 
 fn keyEql(a: Key, b: Key) bool {
@@ -828,13 +766,94 @@ fn keyEql(a: Key, b: Key) bool {
     return true;
 }
 
-test "PlaneCache LRU hit, eviction, active ref survival, and key isolation" {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-    const analysis_mod = @import("../expr/analysis.zig");
-    const codegen = @import("codegen.zig");
+// Test-only helpers (lazily analyzed, so the production library never compiles them).
+const parser = @import("../expr/parser.zig");
+const lower_mod = @import("../expr/lower.zig");
+const optimize_mod = @import("../expr/optimize.zig");
+const analysis_mod = @import("../expr/analysis.zig");
+const codegen = @import("codegen.zig");
 
+fn testLease(res: RuntimeAcquireResult) !*aj.Runtime {
+    return switch (res) {
+        .lease => |l| l.rt,
+        else => error.OutOfMemory,
+    };
+}
+
+const TestPlan = struct {
+    prog: ast.Program,
+    info: analysis_mod.Analysis,
+
+    fn deinit(self: *TestPlan, a: std.mem.Allocator) void {
+        self.info.deinit(a);
+        self.prog.deinit(a);
+    }
+};
+
+/// Parse, lower, optimize and analyze `k.expr` for a `w x h` plane, resolving built-ins
+/// against `meta` (as clip 0 and the output) when given.
+fn testPlan(a: std.mem.Allocator, k: Key, meta: ?builtins_mod.ClipMeta, w: i32, h: i32, fast_u8_lut: bool) !TestPlan {
+    var metas: [1]builtins_mod.ClipMeta = undefined;
+    var ctx: builtins_mod.ResolveContext = undefined;
+    const ctx_ptr: ?*const builtins_mod.ResolveContext = if (meta) |m| blk: {
+        metas = .{m};
+        ctx = .{ .src_metas = &metas, .dst_meta = m, .opt_int = false };
+        break :blk &ctx;
+    } else null;
+    var prog = try parser.parse(a, k.expr, .{
+        .mode = .expr,
+        .num_clips = @intCast(k.src_fmts.len),
+        .default_boundary = k.default_boundary,
+        .opt_int = k.opt_int,
+        .builtin_ctx = ctx_ptr,
+    });
+    errdefer prog.deinit(a);
+    try lower_mod.lower(a, &prog, k.profile);
+    try optimize_mod.optimize(a, &prog, k.profile, .{ .enable_value_changing = true, .enable_fma = k.profile.use_fma });
+    const info = try analysis_mod.analyze(a, &prog, k.src_fmts, k.dst_fmt, w, h, .{
+        .has_fast_u8_lut = fast_u8_lut,
+        .f32_lanes = k.cpu.f32_lanes,
+    });
+    return .{ .prog = prog, .info = info };
+}
+
+/// JIT-compile `k` at its own dimensions into a caller-owned `CompiledPlane.jit`.
+fn testJit(a: std.mem.Allocator, r: *aj.Runtime, k: Key, meta: ?builtins_mod.ClipMeta) !CompiledPlane {
+    var plan = try testPlan(a, k, meta, @intCast(k.width), @intCast(k.height), false);
+    defer plan.deinit(a);
+    const props = try buildPropBindings(a, &plan.prog);
+    errdefer freePropBindings(a, props);
+    const compiled = try codegen.compilePlane(a, r, k.cpu, &plan.prog, &plan.info, .{
+        .width = k.width,
+        .height = k.height,
+        .src_fmts = k.src_fmts,
+        .dst_fmt = k.dst_fmt,
+    });
+    return .{ .jit = .{ .kernel = compiled.kernel, .props = props } };
+}
+
+/// Build the LUT for `k` (analyzed as a `w x h` plane) into a caller-owned `Lut`.
+fn testLut(a: std.mem.Allocator, r: *aj.Runtime, k: Key, meta: ?builtins_mod.ClipMeta, w: i32, h: i32, fast_u8_lut: bool) !lut_mod.Lut {
+    var plan = try testPlan(a, k, meta, w, h, fast_u8_lut);
+    defer plan.deinit(a);
+    return lut_mod.Lut.build(a, r, k.cpu, k.profile, &plan.prog, &plan.info, k.src_fmts, k.dst_fmt, null);
+}
+
+/// A scalar `lut1d_u8` entry with a `len`-byte table filled with `fill`.
+fn testTableLut(a: std.mem.Allocator, len: usize, fill: u8) !CompiledPlane {
+    const tbl = try a.alignedAlloc(u8, .@"64", len);
+    @memset(tbl, fill);
+    return .{ .lut = .{ .kind = .lut1d_u8, .clips = .{ 0, 0 }, .dst_fmt = .{ .is_float = false, .bits_per_sample = 8 }, .table = tbl } };
+}
+
+/// `putOrGet` that destroys `exec` when admission fails (the error leaves it with the caller).
+fn testAdmit(cache: anytype, a: std.mem.Allocator, r: ?*aj.Runtime, k: Key, exec: CompiledPlane) !*Entry {
+    var owned = exec;
+    errdefer owned.deinit(a, r);
+    return try cache.putOrGet(a, k, owned);
+}
+
+test "PlaneCache LRU hit, eviction, active ref survival, and key isolation" {
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     if (cpu.isa == .scalar) return;
@@ -842,48 +861,16 @@ test "PlaneCache LRU hit, eviction, active ref survival, and key isolation" {
 
     var cache: PlaneCache(2) = .{};
     defer cache.deinit(alloc);
-    const rt = switch (cache.acquireRuntime()) {
-        .lease => |l| l.rt,
-        else => return error.OutOfMemory,
-    };
+    const rt = try testLease(cache.acquireRuntime());
     defer cache.releaseRuntime();
 
     const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
     const src_fmts = [_]ast.SampleFormat{u8_fmt};
 
     const compileOne = struct {
-        fn run(
-            a: std.mem.Allocator,
-            c: *PlaneCache(2),
-            r: *aj.Runtime,
-            k: Key,
-        ) !*Entry {
+        fn run(a: std.mem.Allocator, c: *PlaneCache(2), r: *aj.Runtime, k: Key) !*Entry {
             if (c.get(k)) |hit| return hit;
-            var prog = try parser.parse(a, k.expr, .{
-                .mode = .expr,
-                .num_clips = @intCast(k.src_fmts.len),
-                .default_boundary = k.default_boundary,
-                .opt_int = k.opt_int,
-            });
-            defer prog.deinit(a);
-            try lower_mod.lower(a, &prog, k.profile);
-            try optimize_mod.optimize(a, &prog, k.profile, .{
-                .enable_value_changing = true,
-                .enable_fma = k.profile.use_fma,
-            });
-            var info = try analysis_mod.analyze(a, &prog, k.src_fmts, k.dst_fmt, @intCast(k.width), @intCast(k.height), .{ .f32_lanes = k.cpu.f32_lanes });
-            defer info.deinit(a);
-            const props = try buildPropBindings(a, &prog);
-            errdefer freePropBindings(a, props);
-            const compiled = try codegen.compilePlane(a, r, k.cpu, &prog, &info, .{
-                .width = k.width,
-                .height = k.height,
-                .src_fmts = k.src_fmts,
-                .dst_fmt = k.dst_fmt,
-            });
-            var exec: CompiledPlane = .{ .jit = .{ .kernel = compiled.kernel, .props = props } };
-            errdefer exec.deinit(a, r);
-            return try c.putOrGet(a, k, exec);
+            return testAdmit(c, a, r, k, try testJit(a, r, k, null));
         }
     }.run;
 
@@ -935,12 +922,6 @@ test "PlaneCache LRU hit, eviction, active ref survival, and key isolation" {
 }
 
 test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase A LUT sharing" {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-    const analysis_mod = @import("../expr/analysis.zig");
-    const codegen = @import("codegen.zig");
-
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     if (cpu.isa == .scalar) return;
@@ -948,10 +929,7 @@ test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase 
 
     var cache: PlaneCache(8) = .{};
     defer cache.deinit(alloc);
-    const rt = switch (cache.acquireRuntime()) {
-        .lease => |l| l.rt,
-        else => return error.OutOfMemory,
-    };
+    const rt = try testLease(cache.acquireRuntime());
     defer cache.releaseRuntime();
 
     const f32_fmt: ast.SampleFormat = .{ .is_float = true, .bits_per_sample = 32 };
@@ -986,7 +964,7 @@ test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase 
     var k_f1 = k_y;
     k_f1.resolved_builtins = &flt_one;
     try std.testing.expect(!keyEql(k_i1, k_f1));
-    try std.testing.expect(hashKey(k_i1) != hashKey(k_f1));
+    try std.testing.expect(defaultHashPair(k_i1).exact != defaultHashPair(k_f1).exact);
 
     // 3. Non-builtin expression key keeps resolved_builtins.len == 0 (zero allocation).
     const k_plain: Key = .{
@@ -1005,22 +983,6 @@ test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase 
     // 4. Phase A LUT sharing (C11/D3): costly 1D u16 gamma `x range_max / 2.2 pow range_max *`
     // builds a dimension-free LUT on Y (32x16) and hits on U/V (16x8) with identical `[65535]`.
     const y16_meta: builtins_mod.ClipMeta = .{ .is_float = false, .bits_per_sample = 16, .color_family = .yuv, .plane_idx = 0, .is_full_range = false };
-    const rctx: builtins_mod.ResolveContext = .{ .src_metas = &.{y16_meta}, .dst_meta = y16_meta, .opt_int = false };
-    var prog = try parser.parse(alloc, "x range_max / 2.2 pow range_max *", .{
-        .mode = .expr,
-        .num_clips = 1,
-        .builtin_ctx = &rctx,
-    });
-    defer prog.deinit(alloc);
-    try lower_mod.lower(alloc, &prog, profile);
-    try optimize_mod.optimize(alloc, &prog, profile, .{ .enable_value_changing = true, .enable_fma = profile.use_fma });
-    var info = try analysis_mod.analyze(alloc, &prog, &u16_srcs, u16_fmt, 32, 16, .{ .f32_lanes = cpu.f32_lanes });
-    defer info.deinit(alloc);
-    try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info.lut_kind);
-
-    const lut = try lut_mod.Lut.build(alloc, rt, cpu, profile, &prog, &info, &u16_srcs, u16_fmt, null);
-    try std.testing.expect(lut.simd_kernel == null);
-
     const u16_rmax = [_]builtins_mod.BuiltinVal{try builtins_mod.resolveMeta(.range_max, y16_meta)};
     const k_lut_dimfree: Key = .{
         .expr = "x range_max / 2.2 pow range_max *",
@@ -1034,11 +996,14 @@ test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase 
         .profile = profile,
         .resolved_builtins = &u16_rmax,
     };
-    const e_y = blk: {
-        var exec: CompiledPlane = .{ .lut = lut };
-        errdefer exec.deinit(alloc, rt);
-        break :blk try cache.putOrGet(alloc, k_lut_dimfree, exec);
-    };
+    {
+        var plan = try testPlan(alloc, k_lut_dimfree, y16_meta, 32, 16, false);
+        defer plan.deinit(alloc);
+        try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, plan.info.lut_kind);
+    }
+    const lut = try testLut(alloc, rt, k_lut_dimfree, y16_meta, 32, 16, false);
+    try std.testing.expect(lut.simd_kernel == null);
+    const e_y = try testAdmit(&cache, alloc, rt, k_lut_dimfree, .{ .lut = lut });
     defer cache.release(alloc, e_y);
 
     // U/V plane lookup with identical `[65535]` resolved_builtins hits the exact same entry!
@@ -1049,41 +1014,14 @@ test "PlaneCache resolved_builtins isolation, D5 i32_val distinction, and Phase 
     // Confirm JIT isolation on Y vs U/V in f32 too.
     const y_meta: builtins_mod.ClipMeta = .{ .is_float = true, .bits_per_sample = 32, .color_family = .yuv, .plane_idx = 0, .is_full_range = true };
     const uv_meta: builtins_mod.ClipMeta = .{ .is_float = true, .bits_per_sample = 32, .color_family = .yuv, .plane_idx = 1, .is_full_range = true };
-    const compileF32 = struct {
-        fn run(a: std.mem.Allocator, c: *PlaneCache(8), r: *aj.Runtime, k: Key, m: builtins_mod.ClipMeta) !*Entry {
-            const ctx: builtins_mod.ResolveContext = .{ .src_metas = &.{m}, .dst_meta = m, .opt_int = false };
-            var pr = try parser.parse(a, k.expr, .{ .mode = .expr, .num_clips = 1, .builtin_ctx = &ctx });
-            defer pr.deinit(a);
-            try lower_mod.lower(a, &pr, k.profile);
-            try optimize_mod.optimize(a, &pr, k.profile, .{ .enable_value_changing = true, .enable_fma = k.profile.use_fma });
-            var inf = try analysis_mod.analyze(a, &pr, k.src_fmts, k.dst_fmt, @intCast(k.width), @intCast(k.height), .{ .f32_lanes = k.cpu.f32_lanes });
-            defer inf.deinit(a);
-            const props = try buildPropBindings(a, &pr);
-            errdefer freePropBindings(a, props);
-            const compiled = try codegen.compilePlane(a, r, k.cpu, &pr, &inf, .{
-                .width = k.width,
-                .height = k.height,
-                .src_fmts = k.src_fmts,
-                .dst_fmt = k.dst_fmt,
-            });
-            var exec: CompiledPlane = .{ .jit = .{ .kernel = compiled.kernel, .props = props } };
-            errdefer exec.deinit(a, r);
-            return try c.putOrGet(a, k, exec);
-        }
-    }.run;
-    const ej_y = try compileF32(alloc, &cache, rt, k_y, y_meta);
+    const ej_y = try testAdmit(&cache, alloc, rt, k_y, try testJit(alloc, rt, k_y, y_meta));
     defer cache.release(alloc, ej_y);
-    const ej_uv = try compileF32(alloc, &cache, rt, k_uv, uv_meta);
+    const ej_uv = try testAdmit(&cache, alloc, rt, k_uv, try testJit(alloc, rt, k_uv, uv_meta));
     defer cache.release(alloc, ej_uv);
     try std.testing.expect(ej_y != ej_uv);
 }
 
 test "PlaneCache Phase B limited YUV16 LUT sharing (D3) and partial-variant refcount cleanup (F2)" {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-    const analysis_mod = @import("../expr/analysis.zig");
-
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     if (cpu.isa == .scalar) return;
@@ -1091,10 +1029,7 @@ test "PlaneCache Phase B limited YUV16 LUT sharing (D3) and partial-variant refc
 
     var cache: PlaneCache(8) = .{};
     defer cache.deinit(alloc);
-    const rt = switch (cache.acquireRuntime()) {
-        .lease => |l| l.rt,
-        else => return error.OutOfMemory,
-    };
+    const rt = try testLease(cache.acquireRuntime());
     defer cache.releaseRuntime();
 
     const u16_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 16 };
@@ -1139,17 +1074,7 @@ test "PlaneCache Phase B limited YUV16 LUT sharing (D3) and partial-variant refc
                 .resolved_builtins = rb,
             };
             if (c.get(k)) |hit| return hit;
-            const ctx: builtins_mod.ResolveContext = .{ .src_metas = &.{m}, .dst_meta = m, .opt_int = false };
-            var pr = try parser.parse(a, e, .{ .mode = .expr, .num_clips = 1, .builtin_ctx = &ctx });
-            defer pr.deinit(a);
-            try lower_mod.lower(a, &pr, prof);
-            try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
-            var inf = try analysis_mod.analyze(a, &pr, &.{.{ .is_float = false, .bits_per_sample = 16 }}, .{ .is_float = false, .bits_per_sample = 16 }, 32, 16, .{ .f32_lanes = c_info.f32_lanes });
-            defer inf.deinit(a);
-            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, &.{.{ .is_float = false, .bits_per_sample = 16 }}, .{ .is_float = false, .bits_per_sample = 16 }, null);
-            var exec: CompiledPlane = .{ .lut = lut };
-            errdefer exec.deinit(a, r);
-            return try c.putOrGet(a, k, exec);
+            return testAdmit(c, a, r, k, .{ .lut = try testLut(a, r, k, m, 32, 16, false) });
         }
     }.run;
 
@@ -1238,12 +1163,6 @@ test "PlaneCache Phase B limited YUV16 LUT sharing (D3) and partial-variant refc
 }
 
 test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries and supports getOrDim" {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-    const analysis_mod = @import("../expr/analysis.zig");
-    const codegen = @import("codegen.zig");
-
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     if (cpu.isa == .scalar) return;
@@ -1252,10 +1171,7 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
     // 8 total slots, but only 150 KiB LUT cap -> holds at most ONE 128 KiB u16 LUT, never two.
     var cache: PlaneCacheWithLutCap(8, 150 * 1024) = .{};
     defer cache.deinit(alloc);
-    const rt = switch (cache.acquireRuntime()) {
-        .lease => |l| l.rt,
-        else => return error.OutOfMemory,
-    };
+    const rt = try testLease(cache.acquireRuntime());
     defer cache.releaseRuntime();
 
     const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
@@ -1273,20 +1189,7 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
         .cpu = cpu,
         .profile = profile,
     };
-    const e_jit = blk: {
-        var pr = try parser.parse(alloc, jit_key.expr, .{ .mode = .expr, .num_clips = 1 });
-        defer pr.deinit(alloc);
-        try lower_mod.lower(alloc, &pr, profile);
-        try optimize_mod.optimize(alloc, &pr, profile, .{ .enable_value_changing = true, .enable_fma = profile.use_fma });
-        var inf = try analysis_mod.analyze(alloc, &pr, jit_key.src_fmts, jit_key.dst_fmt, 32, 4, .{ .f32_lanes = cpu.f32_lanes });
-        defer inf.deinit(alloc);
-        const props = try buildPropBindings(alloc, &pr);
-        errdefer freePropBindings(alloc, props);
-        const compiled = try codegen.compilePlane(alloc, rt, cpu, &pr, &inf, .{ .width = 32, .height = 4, .src_fmts = jit_key.src_fmts, .dst_fmt = jit_key.dst_fmt });
-        var exec: CompiledPlane = .{ .jit = .{ .kernel = compiled.kernel, .props = props } };
-        errdefer exec.deinit(alloc, rt);
-        break :blk try cache.putOrGet(alloc, jit_key, exec);
-    };
+    const e_jit = try testAdmit(&cache, alloc, rt, jit_key, try testJit(alloc, rt, jit_key, null));
     cache.release(alloc, e_jit);
 
     // 2. Insert two distinct 128 KiB dimension-free u16 LUTs: second must evict the first LUT (not e_jit!).
@@ -1303,16 +1206,7 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
                 .cpu = c_info,
                 .profile = prof,
             };
-            var pr = try parser.parse(a, expr_s, .{ .mode = .expr, .num_clips = 1 });
-            defer pr.deinit(a);
-            try lower_mod.lower(a, &pr, prof);
-            try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
-            var inf = try analysis_mod.analyze(a, &pr, k.src_fmts, k.dst_fmt, 64, 16, .{ .f32_lanes = c_info.f32_lanes });
-            defer inf.deinit(a);
-            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, k.src_fmts, k.dst_fmt, null);
-            var exec: CompiledPlane = .{ .lut = lut };
-            errdefer exec.deinit(a, r);
-            return try c.putOrGet(a, k, exec);
+            return testAdmit(c, a, r, k, .{ .lut = try testLut(a, r, k, null, 64, 16, false) });
         }
     }.run;
 
@@ -1348,44 +1242,12 @@ test "PlaneCacheWithLutCap enforces LUT byte cap without evicting JIT entries an
 }
 
 test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy lock, and late closed admission" {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-    const analysis_mod = @import("../expr/analysis.zig");
-    const codegen = @import("codegen.zig");
-
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     if (cpu.isa == .scalar) return;
     const profile = interp.TargetProfile.fromCpu(cpu);
     const u8_fmt: ast.SampleFormat = .{ .is_float = false, .bits_per_sample = 8 };
     const src_fmts = [_]ast.SampleFormat{u8_fmt};
-
-    const makeJit = struct {
-        fn run(
-            a: std.mem.Allocator,
-            r: *aj.Runtime,
-            c_info: cpu_mod.CpuInfo,
-            prof: interp.TargetProfile,
-            expr_s: []const u8,
-        ) !CompiledPlane {
-            var pr = try parser.parse(a, expr_s, .{ .mode = .expr, .num_clips = 1 });
-            defer pr.deinit(a);
-            try lower_mod.lower(a, &pr, prof);
-            try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
-            var inf = try analysis_mod.analyze(a, &pr, &src_fmts, u8_fmt, 32, 4, .{ .f32_lanes = c_info.f32_lanes });
-            defer inf.deinit(a);
-            const props = try buildPropBindings(a, &pr);
-            errdefer freePropBindings(a, props);
-            const compiled = try codegen.compilePlane(a, r, c_info, &pr, &inf, .{
-                .width = 32,
-                .height = 4,
-                .src_fmts = &src_fmts,
-                .dst_fmt = u8_fmt,
-            });
-            return .{ .jit = .{ .kernel = compiled.kernel, .props = props } };
-        }
-    }.run;
 
     const base_key: Key = .{
         .expr = "x 1 +",
@@ -1398,6 +1260,8 @@ test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy
         .cpu = cpu,
         .profile = profile,
     };
+    var k2 = base_key;
+    k2.expr = "x 2 +";
 
     // 1. Cold compiler paused after `acquireRuntime()`: shutdown sees active_rt_users == 1
     //    and skips teardown; once lease is released, shutdown drains and destroys `rt`.
@@ -1405,19 +1269,14 @@ test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy
         var cache: PlaneCache(2) = .{};
         defer cache.deinit(alloc);
 
-        const lease_rt = switch (cache.acquireRuntime()) {
-            .lease => |l| l.rt,
-            else => return error.TestUnexpectedResult,
-        };
+        const lease_rt = try testLease(cache.acquireRuntime());
         try std.testing.expectEqual(@as(usize, 1), cache.active_rt_users);
         try std.testing.expect(!cache.shutdown(alloc));
         try std.testing.expectEqual(CacheState.open, cache.state);
         try std.testing.expect(cache.rt != null);
 
         // Compilation still succeeds safely against the borrowed runtime.
-        var exec = try makeJit(alloc, lease_rt, cpu, profile, "x 1 +");
-        errdefer exec.deinit(alloc, lease_rt);
-        const e1 = try cache.putOrGet(alloc, base_key, exec);
+        const e1 = try testAdmit(&cache, alloc, lease_rt, base_key, try testJit(alloc, lease_rt, base_key, null));
         cache.releaseRuntime();
 
         // While caller holds `e1` (live_external_refs == 1), shutdown must still refuse.
@@ -1445,19 +1304,9 @@ test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy
         var cache: Cache1 = .{};
         defer cache.deinit(alloc);
 
-        const lease_rt = switch (cache.acquireRuntime()) {
-            .lease => |l| l.rt,
-            else => return error.TestUnexpectedResult,
-        };
-        var exec1 = try makeJit(alloc, lease_rt, cpu, profile, "x 1 +");
-        errdefer exec1.deinit(alloc, lease_rt);
-        const e1 = try cache.putOrGet(alloc, base_key, exec1);
-
-        var k2 = base_key;
-        k2.expr = "x 2 +";
-        var exec2 = try makeJit(alloc, lease_rt, cpu, profile, "x 2 +");
-        errdefer exec2.deinit(alloc, lease_rt);
-        const e2 = try cache.putOrGet(alloc, k2, exec2);
+        const lease_rt = try testLease(cache.acquireRuntime());
+        const e1 = try testAdmit(&cache, alloc, lease_rt, base_key, try testJit(alloc, lease_rt, base_key, null));
+        const e2 = try testAdmit(&cache, alloc, lease_rt, k2, try testJit(alloc, lease_rt, k2, null));
         cache.releaseRuntime();
         // Drop e2's caller ref (still cached in slot 0); e1 is evicted and pinned only by caller.
         cache.release(alloc, e2);
@@ -1534,7 +1383,6 @@ test "PlaneCache shutdown guards in-flight runtime lease, deferred release, busy
 }
 
 test "PlaneCacheCustom matches reference model under wrap-around clusters, exact/0x0 hash collisions, and multi-LUT eviction" {
-    const parser = @import("../expr/parser.zig");
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     const profile = interp.TargetProfile.fromCpu(cpu);
@@ -1583,17 +1431,7 @@ test "PlaneCacheCustom matches reference model under wrap-around clusters, exact
 
     const makeExec = struct {
         fn build(a: std.mem.Allocator, expr_s: []const u8, lut_len: usize) !CompiledPlane {
-            if (lut_len > 0) {
-                const tbl = try a.alignedAlloc(u8, .@"64", lut_len);
-                @memset(tbl, 0);
-                return .{ .lut = .{
-                    .kind = .lut1d_u8,
-                    .clips = .{ 0, 0 },
-                    .dst_fmt = u8_fmt,
-                    .table = tbl,
-                    .simd_kernel = null,
-                } };
-            }
+            if (lut_len > 0) return testTableLut(a, lut_len, 0);
             var pr = try parser.parse(a, expr_s, .{ .mode = .expr, .num_clips = 1 });
             errdefer pr.deinit(a);
             const props = try buildPropBindings(a, &pr);
@@ -1646,7 +1484,7 @@ test "PlaneCacheCustom matches reference model under wrap-around clusters, exact
             try std.testing.expectEqual(ref.len, occupied_buckets);
             for (ref) |re| {
                 const k = re.ptr.key;
-                const found = c.findSlotLocked(re.ptr.hash, k) orelse return error.TestUnexpectedResult;
+                const found = c.findSlotLocked(wrapCollideHash(k).exact, k) orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(re.ptr, c.slots[found].entry.?);
             }
         }
@@ -1693,30 +1531,18 @@ test "PlaneCacheCustom matches reference model under wrap-around clusters, exact
     }.run;
 
     // Step 1: Insert 0x0 LUT "x 1 +" (100B), 0x0 LUT "x 2 +" (100B), exact JIT "x 1 +" (32x4, collides hash with 0x0!), and JIT "x 3 +" (16x4).
-    const e_lut1 = blk: {
-        var ex = try makeExec(alloc, "x 1 +", 100);
-        errdefer ex.deinit(alloc, null);
-        break :blk try cache.putOrGet(alloc, makeKey("x 1 +", 0, 0, cpu, profile), ex);
-    };
+    const e_lut1 = try testAdmit(&cache, alloc, null, makeKey("x 1 +", 0, 0, cpu, profile), try makeExec(alloc, "x 1 +", 100));
     try refInsert(alloc, &ref_all, .{ .expr = "x 1 +", .w = 0, .h = 0, .lut_bytes = 100, .ptr = e_lut1 });
     cache.release(alloc, e_lut1);
     try verifyModel(&cache, ref_all.items);
 
-    const e_lut2 = blk: {
-        var ex = try makeExec(alloc, "x 2 +", 100);
-        errdefer ex.deinit(alloc, null);
-        break :blk try cache.putOrGet(alloc, makeKey("x 2 +", 0, 0, cpu, profile), ex);
-    };
+    const e_lut2 = try testAdmit(&cache, alloc, null, makeKey("x 2 +", 0, 0, cpu, profile), try makeExec(alloc, "x 2 +", 100));
     try refInsert(alloc, &ref_all, .{ .expr = "x 2 +", .w = 0, .h = 0, .lut_bytes = 100, .ptr = e_lut2 });
     cache.release(alloc, e_lut2);
     try verifyModel(&cache, ref_all.items);
 
     // Exact (32x4) entry shares hash with 0x0 LUT "x 1 +"!
-    const e_exact1 = blk: {
-        var ex = try makeExec(alloc, "x 1 +", 0);
-        errdefer ex.deinit(alloc, null);
-        break :blk try cache.putOrGet(alloc, makeKey("x 1 +", 32, 4, cpu, profile), ex);
-    };
+    const e_exact1 = try testAdmit(&cache, alloc, null, makeKey("x 1 +", 32, 4, cpu, profile), try makeExec(alloc, "x 1 +", 0));
     try refInsert(alloc, &ref_all, .{ .expr = "x 1 +", .w = 32, .h = 4, .lut_bytes = 0, .ptr = e_exact1 });
     cache.release(alloc, e_exact1);
     try verifyModel(&cache, ref_all.items);
@@ -1737,20 +1563,14 @@ test "PlaneCacheCustom matches reference model under wrap-around clusters, exact
     }
 
     // Step 3: Insert JIT "x 3 +" -> fills capacity=4 (all wrapped in buckets 6,7,0,1).
-    const e_jit3 = blk: {
-        var ex = try makeExec(alloc, "x 3 +", 0);
-        errdefer ex.deinit(alloc, null);
-        break :blk try cache.putOrGet(alloc, makeKey("x 3 +", 16, 4, cpu, profile), ex);
-    };
+    const e_jit3 = try testAdmit(&cache, alloc, null, makeKey("x 3 +", 16, 4, cpu, profile), try makeExec(alloc, "x 3 +", 0));
     try refInsert(alloc, &ref_all, .{ .expr = "x 3 +", .w = 16, .h = 4, .lut_bytes = 0, .ptr = e_jit3 });
     cache.release(alloc, e_jit3);
     try verifyModel(&cache, ref_all.items);
 
     // Step 4: Duplicate insert of "x 2 +" (0x0) must dedup, touch both LRU lists, and destroy duplicate cleanly.
     {
-        var ex = try makeExec(alloc, "x 2 +", 100);
-        errdefer ex.deinit(alloc, null);
-        const dup = try cache.putOrGet(alloc, makeKey("x 2 +", 0, 0, cpu, profile), ex);
+        const dup = try testAdmit(&cache, alloc, null, makeKey("x 2 +", 0, 0, cpu, profile), try makeExec(alloc, "x 2 +", 100));
         try std.testing.expectEqual(e_lut2, dup);
         refTouch(&ref_all, dup);
         cache.release(alloc, dup);
@@ -1759,11 +1579,7 @@ test "PlaneCacheCustom matches reference model under wrap-around clusters, exact
 
     // Step 5: Multi-LUT eviction in ONE insert! Insert a 250B LUT (budget=300B, current=200B -> must evict BOTH e_lut1 and e_lut2!).
     // This triggers two backward-shift deletions inside a wrapped cluster while preserving e_exact1 and e_jit3!
-    const e_lut3 = blk: {
-        var ex = try makeExec(alloc, "x 4 +", 250);
-        errdefer ex.deinit(alloc, null);
-        break :blk try cache.putOrGet(alloc, makeKey("x 4 +", 0, 0, cpu, profile), ex);
-    };
+    const e_lut3 = try testAdmit(&cache, alloc, null, makeKey("x 4 +", 0, 0, cpu, profile), try makeExec(alloc, "x 4 +", 250));
     try refInsert(alloc, &ref_all, .{ .expr = "x 4 +", .w = 0, .h = 0, .lut_bytes = 250, .ptr = e_lut3 });
     cache.release(alloc, e_lut3);
     try verifyModel(&cache, ref_all.items);
@@ -1772,11 +1588,7 @@ test "PlaneCacheCustom matches reference model under wrap-around clusters, exact
 
     // Step 6: Insert two more JIT entries to force capacity eviction across wrapped buckets.
     for ([_][]const u8{ "x 5 +", "x 6 +" }) |expr_s| {
-        const ej = blk: {
-            var ex = try makeExec(alloc, expr_s, 0);
-            errdefer ex.deinit(alloc, null);
-            break :blk try cache.putOrGet(alloc, makeKey(expr_s, 8, 8, cpu, profile), ex);
-        };
+        const ej = try testAdmit(&cache, alloc, null, makeKey(expr_s, 8, 8, cpu, profile), try makeExec(alloc, expr_s, 0));
         try refInsert(alloc, &ref_all, .{ .expr = expr_s, .w = 8, .h = 8, .lut_bytes = 0, .ptr = ej });
         cache.release(alloc, ej);
         try verifyModel(&cache, ref_all.items);
@@ -1784,7 +1596,6 @@ test "PlaneCacheCustom matches reference model under wrap-around clusters, exact
 }
 
 test "PlaneCacheWithLutCap bypasses admission for oversized single LUT without evicting healthy entries" {
-    const parser = @import("../expr/parser.zig");
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     const profile = interp.TargetProfile.fromCpu(cpu);
@@ -1806,26 +1617,14 @@ test "PlaneCacheWithLutCap bypasses admission for oversized single LUT without e
         .cpu = cpu,
         .profile = profile,
     };
-    const e_small = blk: {
-        const tbl = try alloc.alignedAlloc(u8, .@"64", 256);
-        @memset(tbl, 1);
-        var ex: CompiledPlane = .{ .lut = .{ .kind = .lut1d_u8, .clips = .{ 0, 0 }, .dst_fmt = u8_fmt, .table = tbl } };
-        errdefer ex.deinit(alloc, null);
-        break :blk try cache.putOrGet(alloc, k_small, ex);
-    };
+    const e_small = try testAdmit(&cache, alloc, null, k_small, try testTableLut(alloc, 256, 1));
     cache.release(alloc, e_small);
     try std.testing.expectEqual(@as(usize, 1), cache.count);
     try std.testing.expectEqual(@as(usize, 256), cache.lut_bytes);
 
     var k_big = k_small;
     k_big.expr = "x 2 +";
-    const e_big = blk: {
-        const tbl = try alloc.alignedAlloc(u8, .@"64", 2048);
-        @memset(tbl, 2);
-        var ex: CompiledPlane = .{ .lut = .{ .kind = .lut1d_u8, .clips = .{ 0, 0 }, .dst_fmt = u8_fmt, .table = tbl } };
-        errdefer ex.deinit(alloc, null);
-        break :blk try cache.putOrGet(alloc, k_big, ex);
-    };
+    const e_big = try testAdmit(&cache, alloc, null, k_big, try testTableLut(alloc, 2048, 2));
     // Oversized entry bypasses cache: ref_count == 1 (caller only), healthy entry untouched!
     try std.testing.expectEqual(@as(usize, 1), e_big.ref_count);
     try std.testing.expectEqual(@as(usize, 1), cache.count);
@@ -1841,23 +1640,14 @@ test "PlaneCacheWithLutCap bypasses admission for oversized single LUT without e
 
     // Closed cache must still reject oversized admission with `error.CacheClosed`.
     try std.testing.expect(cache.shutdown(alloc));
-    const tbl2 = try alloc.alignedAlloc(u8, .@"64", 2048);
-    @memset(tbl2, 3);
-    var big_closed: CompiledPlane = .{ .lut = .{ .kind = .lut1d_u8, .clips = .{ 0, 0 }, .dst_fmt = u8_fmt, .table = tbl2 } };
+    var big_closed = try testTableLut(alloc, 2048, 3);
     defer big_closed.deinit(alloc, null);
     try std.testing.expectError(error.CacheClosed, cache.putOrGet(alloc, k_big, big_closed));
     try std.testing.expectEqual(@as(usize, 0), cache.count);
     try std.testing.expectEqual(@as(usize, 0), cache.live_external_refs);
-
-    _ = parser;
 }
 
 test "PlaneCache Phase 3 dimension-free SIMD u8 LUT build counts and entry identity across YUV420P8 planes" {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-    const analysis_mod = @import("../expr/analysis.zig");
-
     const alloc = std.testing.allocator;
     const cpu = cpu_mod.detectWithOverride(null);
     if (!aj.Builder.cpuSupportsFastLutU8(cpu)) return;
@@ -1894,28 +1684,12 @@ test "PlaneCache Phase 3 dimension-free SIMD u8 LUT build counts and entry ident
             };
             if (c.getOrDim(plane_key)) |hit| return hit;
 
-            var rctx_storage: builtins_mod.ResolveContext = undefined;
-            const rctx_ptr: ?*const builtins_mod.ResolveContext = if (meta) |m| blk: {
-                rctx_storage = .{ .src_metas = &.{m}, .dst_meta = m, .opt_int = false };
-                break :blk &rctx_storage;
-            } else null;
-
-            var pr = try parser.parse(a, expr_s, .{
-                .mode = .expr,
-                .num_clips = 1,
-                .builtin_ctx = rctx_ptr,
-            });
-            defer pr.deinit(a);
-            try lower_mod.lower(a, &pr, prof);
-            try optimize_mod.optimize(a, &pr, prof, .{ .enable_value_changing = true, .enable_fma = prof.use_fma });
-            var inf = try analysis_mod.analyze(a, &pr, &src_fmts, u8_fmt, @intCast(w), @intCast(h), .{
-                .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(c_info),
-                .f32_lanes = c_info.f32_lanes,
-            });
-            defer inf.deinit(a);
-            try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, inf.lut_kind);
-
-            const lut = try lut_mod.Lut.build(a, r, c_info, prof, &pr, &inf, &src_fmts, u8_fmt, null);
+            {
+                var plan = try testPlan(a, plane_key, meta, @intCast(w), @intCast(h), aj.Builder.cpuSupportsFastLutU8(c_info));
+                defer plan.deinit(a);
+                try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, plan.info.lut_kind);
+            }
+            const lut = try testLut(a, r, plane_key, meta, @intCast(w), @intCast(h), aj.Builder.cpuSupportsFastLutU8(c_info));
             build_count.* += 1;
             // Review 7 #1: scalar fallback must never false-pass this SIMD sharing test.
             try std.testing.expect(lut.simd_kernel != null);
@@ -1935,10 +1709,7 @@ test "PlaneCache Phase 3 dimension-free SIMD u8 LUT build counts and entry ident
     {
         var cache: PlaneCache(16) = .{};
         defer cache.deinit(alloc);
-        const rt = switch (cache.acquireRuntime()) {
-            .lease => |l| l.rt,
-            else => return error.OutOfMemory,
-        };
+        const rt = try testLease(cache.acquireRuntime());
         defer cache.releaseRuntime();
 
         var builds: usize = 0;
@@ -1972,10 +1743,7 @@ test "PlaneCache Phase 3 dimension-free SIMD u8 LUT build counts and entry ident
     {
         var cache: PlaneCache(16) = .{};
         defer cache.deinit(alloc);
-        const rt = switch (cache.acquireRuntime()) {
-            .lease => |l| l.rt,
-            else => return error.OutOfMemory,
-        };
+        const rt = try testLease(cache.acquireRuntime());
         defer cache.releaseRuntime();
 
         var builds: usize = 0;

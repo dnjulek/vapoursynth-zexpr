@@ -78,6 +78,26 @@ pub fn emitLoadI32(b: *aj.Builder, dst: aj.Reg, mem: aj.Mem, fmt: ast.SampleForm
     }
 }
 
+/// `emitLoadI32` when `as_i32`, else `emitLoadF32`.
+pub fn emitLoad(b: *aj.Builder, dst: aj.Reg, mem: aj.Mem, fmt: ast.SampleFormat, as_i32: bool) void {
+    if (as_i32) emitLoadI32(b, dst, mem, fmt) else emitLoadF32(b, dst, mem, fmt);
+}
+
+/// `emitStoreI32` when `from_i32`, else `emitStoreF32`.
+pub fn emitStore(b: *aj.Builder, mem: aj.Mem, src: aj.Reg, fmt: ast.SampleFormat, from_i32: bool) void {
+    if (from_i32) emitStoreI32(b, mem, src, fmt) else emitStoreF32(b, mem, src, fmt);
+}
+
+/// Store two full vectors to `mem0` and `mem1`, as one paired store (NEON `stp`) from `mem0` when `use_pair_mem`.
+fn storeUVecPair(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, src1: aj.Reg, use_pair_mem: bool) void {
+    if (use_pair_mem) {
+        b.vecStoreUVecx2(mem0, src0, src1);
+    } else {
+        b.vecStore(.u_vec, mem0, src0);
+        b.vecStore(.u_vec, mem1, src1);
+    }
+}
+
 /// Store `f32_lanes` `f32` values to `mem`, using D4's zero-overhead `min(v, peak)`-first
 /// order so `NaN -> peak`, `+inf -> peak`, `-inf -> 0` identically on x86 and AArch64.
 pub fn emitStoreF32(b: *aj.Builder, mem: aj.Mem, src: aj.Reg, fmt: ast.SampleFormat) void {
@@ -155,12 +175,7 @@ pub fn emitStoreI32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, 
         return;
     }
     if (fmt.bits_per_sample == 32) {
-        if (use_pair_mem) {
-            b.vecStoreUVecx2(mem0, src0, src1);
-        } else {
-            b.vecStore(.u_vec, mem0, src0);
-            b.vecStore(.u_vec, mem1, src1);
-        }
+        storeUVecPair(b, mem0, mem1, src0, src1, use_pair_mem);
         return;
     }
     if (fmt.bits_per_sample == 16) {
@@ -198,11 +213,8 @@ pub fn emitStoreF32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, 
                 b.vecCvtF32ToF16(mem0, src0);
                 b.vecCvtF32ToF16(mem1, src1);
             }
-        } else if (use_pair_mem) {
-            b.vecStoreUVecx2(mem0, src0, src1);
         } else {
-            b.vecStore(.u_vec, mem0, src0);
-            b.vecStore(.u_vec, mem1, src1);
+            storeUVecPair(b, mem0, mem1, src0, src1, use_pair_mem);
         }
         return;
     }
@@ -223,10 +235,7 @@ pub fn emitStoreF32x2(b: *aj.Builder, mem0: aj.Mem, mem1: aj.Mem, src0: aj.Reg, 
         b.vecStoreU8FromI32x2(mem0, t0, t1);
     } else if (fmt.bits_per_sample <= 16) {
         b.vecStoreU16FromI32x2(mem0, t0, t1);
-    } else if (use_pair_mem) {
-        b.vecStoreUVecx2(mem0, t0, t1);
     } else {
-        b.vecStore(.u_vec, mem0, t0);
-        b.vecStore(.u_vec, mem1, t1);
+        storeUVecPair(b, mem0, mem1, t0, t1, use_pair_mem);
     }
 }

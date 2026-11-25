@@ -27,10 +27,6 @@ pub const LutPlaneFn = *const fn (
 
 pub const Reg = struct {
     raw: c.zj_reg_t,
-
-    pub fn isValid(self: Reg) bool {
-        return self.raw.sig != 0;
-    }
 };
 
 pub const Label = struct {
@@ -41,16 +37,9 @@ pub const Mem = struct {
     raw: c.zj_mem_t,
 
     pub fn ptr(base: Reg, disp: i32) Mem {
-        return .{ .raw = .{
-            .base = base.raw,
-            .index = .{ .id = 0, .sig = 0 },
-            .disp = disp,
-            .shift = 0,
-            .has_index = 0,
-            .is_label = 0,
-            .size = 0,
-            .label_id = 0,
-        } };
+        var m = indexed(base, .{ .raw = .{ .id = 0, .sig = 0 } }, 0, disp);
+        m.raw.has_index = 0;
+        return m;
     }
 
     pub fn indexed(base: Reg, index: Reg, shift: u8, disp: i32) Mem {
@@ -65,49 +54,21 @@ pub const Mem = struct {
             .label_id = 0,
         } };
     }
-
-    pub fn withDisp(self: Mem, delta: i32) Mem {
-        var copy = self;
-        copy.raw.disp += delta;
-        return copy;
-    }
 };
 
 pub const Cond = enum(u32) {
     eq = c.ZJ_COND_EQ,
-    ne = c.ZJ_COND_NE,
     slt = c.ZJ_COND_SLT,
-    sle = c.ZJ_COND_SLE,
-    sgt = c.ZJ_COND_SGT,
     sge = c.ZJ_COND_SGE,
     ult = c.ZJ_COND_ULT,
-    ule = c.ZJ_COND_ULE,
-    ugt = c.ZJ_COND_UGT,
-    uge = c.ZJ_COND_UGE,
-};
-
-pub const GpOp2 = enum(u32) {
-    neg = c.ZJ_GP_NEG,
-    not = c.ZJ_GP_NOT,
-    bswap = c.ZJ_GP_BSWAP,
-    clz = c.ZJ_GP_CLZ,
-    ctz = c.ZJ_GP_CTZ,
 };
 
 pub const GpOp3 = enum(u32) {
     add = c.ZJ_GP_ADD,
     sub = c.ZJ_GP_SUB,
     mul = c.ZJ_GP_MUL,
-    @"and" = c.ZJ_GP_AND,
-    @"or" = c.ZJ_GP_OR,
-    xor = c.ZJ_GP_XOR,
-    shl = c.ZJ_GP_SHL,
-    shr = c.ZJ_GP_SHR,
-    sar = c.ZJ_GP_SAR,
     smin = c.ZJ_GP_SMIN,
     smax = c.ZJ_GP_SMAX,
-    umin = c.ZJ_GP_UMIN,
-    umax = c.ZJ_GP_UMAX,
 };
 
 pub const VecOp2 = enum(u32) {
@@ -121,21 +82,14 @@ pub const VecOp2 = enum(u32) {
     round_even_f32 = c.ZJ_V2_ROUND_EVEN_F32,
     cvt_i32_to_f32 = c.ZJ_V2_CVT_I32_TO_F32,
     cvt_round_f32_to_i32 = c.ZJ_V2_CVT_ROUND_F32_TO_I32,
-    cvt_trunc_f32_to_i32 = c.ZJ_V2_CVT_TRUNC_F32_TO_I32,
     not_u32 = c.ZJ_V2_NOT_U32,
     abs_i16 = c.ZJ_V2_ABS_I16,
     abs_i32 = c.ZJ_V2_ABS_I32,
     neg_i16 = c.ZJ_V2_NEG_I16,
     neg_i32 = c.ZJ_V2_NEG_I32,
-    cvt_u8_lo_to_u16 = c.ZJ_V2_CVT_U8_LO_TO_U16,
-    cvt_u8_hi_to_u16 = c.ZJ_V2_CVT_U8_HI_TO_U16,
-    cvt_u16_lo_to_u32 = c.ZJ_V2_CVT_U16_LO_TO_U32,
-    cvt_u16_hi_to_u32 = c.ZJ_V2_CVT_U16_HI_TO_U32,
     cvt_u8_to_u32 = c.ZJ_V2_CVT_U8_TO_U32,
     cvt_i16_lo_to_i32 = c.ZJ_V2_CVT_I16_LO_TO_I32,
     cvt_i16_hi_to_i32 = c.ZJ_V2_CVT_I16_HI_TO_I32,
-    broadcast_u8 = c.ZJ_V2_BROADCAST_U8,
-    broadcast_u16 = c.ZJ_V2_BROADCAST_U16,
     broadcast_u32 = c.ZJ_V2_BROADCAST_U32,
     broadcast_u64 = c.ZJ_V2_BROADCAST_U64,
     rsqrt_f32 = c.ZJ_V2_RSQRT_F32,
@@ -149,7 +103,6 @@ pub const VecOp3 = enum(u32) {
     min_f32 = c.ZJ_V3_MIN_F32,
     max_f32 = c.ZJ_V3_MAX_F32,
     cmp_eq_f32 = c.ZJ_V3_CMP_EQ_F32,
-    cmp_ne_f32 = c.ZJ_V3_CMP_NE_F32,
     cmp_lt_f32 = c.ZJ_V3_CMP_LT_F32,
     cmp_le_f32 = c.ZJ_V3_CMP_LE_F32,
     cmp_gt_f32 = c.ZJ_V3_CMP_GT_F32,
@@ -158,7 +111,6 @@ pub const VecOp3 = enum(u32) {
     or_u32 = c.ZJ_V3_OR_U32,
     xor_u32 = c.ZJ_V3_XOR_U32,
     andn_u32 = c.ZJ_V3_ANDN_U32,
-    bic_u32 = c.ZJ_V3_BIC_U32,
     add_i32 = c.ZJ_V3_ADD_I32,
     sub_i32 = c.ZJ_V3_SUB_I32,
     mul_i32 = c.ZJ_V3_MUL_I32,
@@ -168,8 +120,6 @@ pub const VecOp3 = enum(u32) {
     cmp_gt_i32 = c.ZJ_V3_CMP_GT_I32,
     add_i16 = c.ZJ_V3_ADD_I16,
     sub_i16 = c.ZJ_V3_SUB_I16,
-    adds_i16 = c.ZJ_V3_ADDS_I16,
-    subs_i16 = c.ZJ_V3_SUBS_I16,
     adds_u16 = c.ZJ_V3_ADDS_U16,
     subs_u16 = c.ZJ_V3_SUBS_U16,
     mul_i16 = c.ZJ_V3_MUL_I16,
@@ -179,18 +129,6 @@ pub const VecOp3 = enum(u32) {
     max_u16 = c.ZJ_V3_MAX_U16,
     cmp_eq_i16 = c.ZJ_V3_CMP_EQ_I16,
     cmp_gt_i16 = c.ZJ_V3_CMP_GT_I16,
-    packs_i32_i16 = c.ZJ_V3_PACKS_I32_I16,
-    packs_i32_u16 = c.ZJ_V3_PACKS_I32_U16,
-    packs_i16_u8 = c.ZJ_V3_PACKS_I16_U8,
-    packs_i16_i8 = c.ZJ_V3_PACKS_I16_I8,
-    unpack_lo_u8 = c.ZJ_V3_UNPACK_LO_U8,
-    unpack_hi_u8 = c.ZJ_V3_UNPACK_HI_U8,
-    unpack_lo_u16 = c.ZJ_V3_UNPACK_LO_U16,
-    unpack_hi_u16 = c.ZJ_V3_UNPACK_HI_U16,
-    unpack_lo_u32 = c.ZJ_V3_UNPACK_LO_U32,
-    unpack_hi_u32 = c.ZJ_V3_UNPACK_HI_U32,
-    permute_u32 = c.ZJ_V3_PERMUTE_U32,
-    add_u8 = c.ZJ_V3_ADD_U8,
     sub_u8 = c.ZJ_V3_SUB_U8,
     adds_u8 = c.ZJ_V3_ADDS_U8,
     subs_u8 = c.ZJ_V3_SUBS_U8,
@@ -208,22 +146,15 @@ pub const VecOp4 = enum(u32) {
 
 pub const VecOp2i = enum(u32) {
     sll_u16 = c.ZJ_V2I_SLL_U16,
-    srl_u16 = c.ZJ_V2I_SRL_U16,
     sra_i16 = c.ZJ_V2I_SRA_I16,
     sll_u32 = c.ZJ_V2I_SLL_U32,
-    srl_u32 = c.ZJ_V2I_SRL_U32,
     sra_i32 = c.ZJ_V2I_SRA_I32,
-    swizzle_u32x4 = c.ZJ_V2I_SWIZZLE_U32X4,
 };
 
 pub const VecLoad = enum(u32) {
-    a_vec = c.ZJ_VLOAD_A_VEC,
     u_vec = c.ZJ_VLOAD_U_VEC,
-    u32 = c.ZJ_VLOAD_U_32,
-    u64 = c.ZJ_VLOAD_U_64,
     u128 = c.ZJ_VLOAD_U_128,
     u256 = c.ZJ_VLOAD_U_256,
-    a128 = c.ZJ_VLOAD_A_128,
     cvt_u8_to_u16 = c.ZJ_VLOAD_CVT_U8_TO_U16,
     cvt_u8_to_u32 = c.ZJ_VLOAD_CVT_U8_TO_U32,
     cvt_u16_to_u32 = c.ZJ_VLOAD_CVT_U16_TO_U32,
@@ -232,13 +163,9 @@ pub const VecLoad = enum(u32) {
 };
 
 pub const VecStore = enum(u32) {
-    a_vec = c.ZJ_VSTORE_A_VEC,
     u_vec = c.ZJ_VSTORE_U_VEC,
-    u32 = c.ZJ_VSTORE_U_32,
-    u64 = c.ZJ_VSTORE_U_64,
     u128 = c.ZJ_VSTORE_U_128,
     u256 = c.ZJ_VSTORE_U_256,
-    a128 = c.ZJ_VSTORE_A_128,
 };
 
 pub const JitError = error{
@@ -257,6 +184,13 @@ pub const LutKernel = struct {
     func: LutPlaneFn,
     code_size: usize,
 };
+
+/// Turns a shim finalize/compile result into a `CompiledKernel` or `LutKernel`.
+fn kernelFromC(comptime K: type, rc: i32, fn_ptr: ?*anyopaque, code_size: usize, execmem_denied: u8) JitError!K {
+    if (rc != 0) return if (execmem_denied != 0) error.ExecMemDenied else error.CompileFailed;
+    const ptr = fn_ptr orelse return error.CompileFailed;
+    return .{ .func = @ptrCast(@alignCast(ptr)), .code_size = code_size };
+}
 
 pub const Runtime = struct {
     raw: *c.zj_runtime,
@@ -333,35 +267,19 @@ pub const Builder = struct {
     }
 
     pub fn finalize(self: *Builder) JitError!CompiledKernel {
-        var fn_ptr: ?*anyopaque = null;
-        var code_size: usize = 0;
-        var execmem_denied: u8 = 0;
-        const rc = c.zj_ctx_finalize(self.raw, &fn_ptr, &code_size, &execmem_denied);
-        if (rc != 0) {
-            if (execmem_denied != 0) return error.ExecMemDenied;
-            return error.CompileFailed;
-        }
-        const ptr = fn_ptr orelse return error.CompileFailed;
-        return .{
-            .func = @ptrCast(@alignCast(ptr)),
-            .code_size = code_size,
-        };
+        return self.finalizeAs(CompiledKernel);
     }
 
     pub fn finalizeLut(self: *Builder) JitError!LutKernel {
+        return self.finalizeAs(LutKernel);
+    }
+
+    fn finalizeAs(self: *Builder, comptime K: type) JitError!K {
         var fn_ptr: ?*anyopaque = null;
         var code_size: usize = 0;
         var execmem_denied: u8 = 0;
         const rc = c.zj_ctx_finalize(self.raw, &fn_ptr, &code_size, &execmem_denied);
-        if (rc != 0) {
-            if (execmem_denied != 0) return error.ExecMemDenied;
-            return error.CompileFailed;
-        }
-        const ptr = fn_ptr orelse return error.CompileFailed;
-        return .{
-            .func = @ptrCast(@alignCast(ptr)),
-            .code_size = code_size,
-        };
+        return kernelFromC(K, rc, fn_ptr, code_size, execmem_denied);
     }
 
     pub fn disasm(self: *const Builder) []const u8 {
@@ -372,24 +290,12 @@ pub const Builder = struct {
         return ptr[0..len];
     }
 
-    pub fn lastError(self: *const Builder) u32 {
-        return c.zj_ctx_last_error(self.raw);
-    }
-
     pub fn newGp64(self: *Builder) Reg {
         return .{ .raw = c.zj_new_gp64(self.raw) };
     }
 
-    pub fn newGp32(self: *Builder) Reg {
-        return .{ .raw = c.zj_new_gp32(self.raw) };
-    }
-
     pub fn newVec(self: *Builder) Reg {
         return .{ .raw = c.zj_new_vec(self.raw) };
-    }
-
-    pub fn newVec128(self: *Builder) Reg {
-        return .{ .raw = c.zj_new_vec128(self.raw) };
     }
 
     pub fn newLabel(self: *Builder) Label {
@@ -432,14 +338,6 @@ pub const Builder = struct {
         c.zj_gp_load(self.raw, dst.raw, mem.raw, bytes, @intFromBool(sign_extend));
     }
 
-    pub fn gpStore(self: *Builder, mem: Mem, src: Reg, bytes: u32) void {
-        c.zj_gp_store(self.raw, mem.raw, src.raw, bytes);
-    }
-
-    pub fn gpOp2(self: *Builder, op: GpOp2, dst: Reg, src: Reg) void {
-        c.zj_gp_op2(self.raw, @backingInt(op), dst.raw, src.raw);
-    }
-
     pub fn gpOp3(self: *Builder, op: GpOp3, dst: Reg, a: Reg, b: Reg) void {
         c.zj_gp_op3(self.raw, @backingInt(op), dst.raw, a.raw, b.raw);
     }
@@ -450,14 +348,6 @@ pub const Builder = struct {
 
     pub fn gpCmov(self: *Builder, cond: Cond, dst: Reg, lhs: Reg, rhs: Reg, src: Reg) void {
         c.zj_gp_cmov(self.raw, @backingInt(cond), dst.raw, lhs.raw, rhs.raw, src.raw);
-    }
-
-    pub fn gpSelect(self: *Builder, cond: Cond, dst: Reg, lhs: Reg, rhs: Reg, true_val: Reg, false_val: Reg) void {
-        c.zj_gp_select(self.raw, @backingInt(cond), dst.raw, lhs.raw, rhs.raw, true_val.raw, false_val.raw);
-    }
-
-    pub fn jmp(self: *Builder, target: Label) void {
-        c.zj_jmp(self.raw, target.raw);
     }
 
     pub fn jcc(self: *Builder, cond: Cond, lhs: Reg, rhs: Reg, target: Label) void {
@@ -496,16 +386,8 @@ pub const Builder = struct {
         c.zj_vec_store(self.raw, @backingInt(op), mem.raw, src.raw);
     }
 
-    pub fn vecFromGp32(self: *Builder, dst: Reg, gp32: Reg) void {
-        c.zj_vec_from_gp32(self.raw, dst.raw, gp32.raw);
-    }
-
     pub fn vecBroadcastGp32(self: *Builder, dst: Reg, gp32: Reg) void {
         c.zj_vec_broadcast_gp32(self.raw, dst.raw, gp32.raw);
-    }
-
-    pub fn gp32FromVec(self: *Builder, gp32: Reg, vec: Reg) void {
-        c.zj_gp32_from_vec(self.raw, gp32.raw, vec.raw);
     }
 
     pub fn vecCvtF16ToF32(self: *Builder, dst: Reg, mem: Mem) void {
@@ -562,35 +444,35 @@ pub const Builder = struct {
     }
 
     pub fn vecUaddlU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
-        c.zj_vec_uaddl_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, 0, dst0.raw, dst1.raw, a.raw, a.raw, b.raw);
     }
 
     pub fn vecUsublU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
-        c.zj_vec_usubl_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, c.ZJ_WIDEN_SUB, dst0.raw, dst1.raw, a.raw, a.raw, b.raw);
     }
 
     pub fn vecUaddwU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
-        c.zj_vec_uaddw_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, c.ZJ_WIDEN_W, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
     }
 
     pub fn vecUsubwU8ToI16x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
-        c.zj_vec_usubw_u8_to_i16x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, c.ZJ_WIDEN_W | c.ZJ_WIDEN_SUB, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
     }
 
     pub fn vecUaddlU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
-        c.zj_vec_uaddl_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, c.ZJ_WIDEN_U16, dst0.raw, dst1.raw, a.raw, a.raw, b.raw);
     }
 
     pub fn vecUsublU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, a: Reg, b: Reg) void {
-        c.zj_vec_usubl_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, a.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, c.ZJ_WIDEN_U16 | c.ZJ_WIDEN_SUB, dst0.raw, dst1.raw, a.raw, a.raw, b.raw);
     }
 
     pub fn vecUaddwU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
-        c.zj_vec_uaddw_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, c.ZJ_WIDEN_U16 | c.ZJ_WIDEN_W, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
     }
 
     pub fn vecUsubwU16ToI32x2(self: *Builder, dst0: Reg, dst1: Reg, acc0: Reg, acc1: Reg, b: Reg) void {
-        c.zj_vec_usubw_u16_to_i32x2(self.raw, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
+        c.zj_vec_widen_x2(self.raw, c.ZJ_WIDEN_U16 | c.ZJ_WIDEN_W | c.ZJ_WIDEN_SUB, dst0.raw, dst1.raw, acc0.raw, acc1.raw, b.raw);
     }
 
     pub fn vecStoreUVecx2(self: *Builder, mem: Mem, src0: Reg, src1: Reg) void {
@@ -613,15 +495,7 @@ pub const Builder = struct {
             &code_size,
             &execmem_denied,
         );
-        if (rc != 0) {
-            if (execmem_denied != 0) return error.ExecMemDenied;
-            return error.CompileFailed;
-        }
-        const ptr = fn_ptr orelse return error.CompileFailed;
-        return .{
-            .func = @ptrCast(@alignCast(ptr)),
-            .code_size = code_size,
-        };
+        return kernelFromC(LutKernel, rc, fn_ptr, code_size, execmem_denied);
     }
 
     pub fn vecStoreU8FromI32(self: *Builder, mem: Mem, src_i32: Reg) void {

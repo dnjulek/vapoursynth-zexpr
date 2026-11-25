@@ -36,11 +36,6 @@ pub const TargetProfile = struct {
     pub fn fromCpu(cpu: cpu_mod.CpuInfo) TargetProfile {
         return fromCpuWithOracleFma(cpu, null);
     }
-
-    pub fn hostDefault() TargetProfile {
-        const cpu = cpu_mod.detectWithOverride(null);
-        return fromCpu(cpu);
-    }
 };
 
 /// True iff `v` is an IEEE-754 binary32 signaling NaN (quiet bit 22 == 0).

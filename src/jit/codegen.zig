@@ -173,13 +173,32 @@ const RpnStats = struct {
     has_transcendental: bool = false,
 };
 
+/// The operands of a node (`a, b, c` order; `.load_abs`: `x, y`); empty for leaves.
+const NodeChildren = struct {
+    buf: [3]ast.NodeIdx = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const NodeChildren) []const ast.NodeIdx {
+        return self.buf[0..self.len];
+    }
+};
+
+fn nodeChildren(node: ast.Node) NodeChildren {
+    return switch (node) {
+        .load_abs => |la| .{ .buf = .{ la.x, la.y, undefined }, .len = 2 },
+        .unary => |u| .{ .buf = .{ u.a, undefined, undefined }, .len = 1 },
+        .binary => |bin| .{ .buf = .{ bin.a, bin.b, undefined }, .len = 2 },
+        .ternary => |t| .{ .buf = .{ t.a, t.b, t.c }, .len = 3 },
+        else => .{},
+    };
+}
+
 /// Estimate peak simultaneous live `.pixel` values in RPN order (excluding hoisted/const nodes)
 /// to decide whether a long DAG should use Sethi-Ullman reordering (`peak_live > 10`) or
 /// lockstep 2x-interleaved evaluation (`peak_live <= 6` on 16-reg AVX2, `<= 8` on 32-reg ISAs).
 fn estimateRpnStats(
     allocator: std.mem.Allocator,
     prog: *const ast.Program,
-    info: *const analysis_mod.Analysis,
     node_inv: []const Invariance,
     const_f32_vals: []const ?f32,
 ) std.mem.Allocator.Error!RpnStats {
@@ -196,23 +215,8 @@ fn estimateRpnStats(
         ri -= 1;
         if (rem[ri] == 0) continue;
         if (node_inv[ri] != .pixel or const_f32_vals[ri] != null) continue;
-        switch (prog.nodes.items[ri]) {
-            .load_abs => |la| {
-                rem[la.x] += 1;
-                rem[la.y] += 1;
-            },
-            .unary => |u| rem[u.a] += 1,
-            .binary => |bin| {
-                rem[bin.a] += 1;
-                rem[bin.b] += 1;
-            },
-            .ternary => |t| {
-                rem[t.a] += 1;
-                rem[t.b] += 1;
-                rem[t.c] += 1;
-            },
-            else => {},
-        }
+        const children = nodeChildren(prog.nodes.items[ri]);
+        for (children.slice()) |c| rem[c] += 1;
     }
 
     var live_now: u32 = 0;
@@ -244,41 +248,14 @@ fn estimateRpnStats(
         }
         live_now += 1;
         if (live_now > peak) peak = live_now;
-        switch (node) {
-            .load_abs => |la| {
-                for ([_]ast.NodeIdx{ la.x, la.y }) |c| {
-                    if (isTracked(prog, node_inv, const_f32_vals, c) and rem[c] > 0) {
-                        rem[c] -= 1;
-                        if (rem[c] == 0 and live_now > 0) live_now -= 1;
-                    }
-                }
-            },
-            .unary => |u| {
-                if (isTracked(prog, node_inv, const_f32_vals, u.a) and rem[u.a] > 0) {
-                    rem[u.a] -= 1;
-                    if (rem[u.a] == 0 and live_now > 0) live_now -= 1;
-                }
-            },
-            .binary => |bin| {
-                for ([_]ast.NodeIdx{ bin.a, bin.b }) |c| {
-                    if (isTracked(prog, node_inv, const_f32_vals, c) and rem[c] > 0) {
-                        rem[c] -= 1;
-                        if (rem[c] == 0 and live_now > 0) live_now -= 1;
-                    }
-                }
-            },
-            .ternary => |t| {
-                for ([_]ast.NodeIdx{ t.a, t.b, t.c }) |c| {
-                    if (isTracked(prog, node_inv, const_f32_vals, c) and rem[c] > 0) {
-                        rem[c] -= 1;
-                        if (rem[c] == 0 and live_now > 0) live_now -= 1;
-                    }
-                }
-            },
-            else => {},
+        const children = nodeChildren(node);
+        for (children.slice()) |c| {
+            if (isTracked(prog, node_inv, const_f32_vals, c) and rem[c] > 0) {
+                rem[c] -= 1;
+                if (rem[c] == 0 and live_now > 0) live_now -= 1;
+            }
         }
     }
-    _ = info;
     return .{ .peak_live = peak, .has_transcendental = has_trans };
 }
 
@@ -443,7 +420,7 @@ pub fn compilePlane(
     var node_inv = try computeInvariance(allocator, prog, info, const_f32_vals, spec.width, if (has_2x_periodic) lanes * 2 else lanes);
     defer allocator.free(node_inv);
 
-    const rpn_stats = try estimateRpnStats(allocator, prog, info, node_inv, const_f32_vals);
+    const rpn_stats = try estimateRpnStats(allocator, prog, node_inv, const_f32_vals);
     const max_interleave_live: u32 = if (cpu.has_avx512 or cpu.isa == .neon) 8 else 6;
     const can_interleave_x2 = !use_u8_interior and !use_u16_interior and !use_int16_interior and !use_int32_interior and
         !info.uses_abs_access and !has_horiz_rel and !prog.opt_int and !rpn_stats.has_transcendental and
@@ -552,7 +529,6 @@ pub fn compilePlane(
             .v_y = null,
             .v_frame_n_f32 = v_frame_n_f32,
             .v_frame_n_i32 = v_frame_n_i32,
-            .node_inv = node_inv,
             .hoisted_slots = hoisted_slots,
             .hoisted_masks = hoisted_masks,
             .const_f32_vals = const_f32_vals,
@@ -608,13 +584,23 @@ pub fn compilePlane(
     const can_unroll_u16_x2 = use_u16_interior and info.live_node_count <= 40;
     const can_unroll_i16_x2 = use_int16_interior and (info.int16_plan.final_scale_op == .none or cpu.isa == .neon) and info.live_node_count <= 48;
     const can_unroll_i32_x2 = use_int32_interior and info.live_node_count <= 48;
+    const can_unroll_int_x2 = can_unroll_u8_x2 or can_unroll_u16_x2 or can_unroll_i16_x2 or can_unroll_i32_x2;
+    const int_kind: ?int_path.InteriorKind = if (use_u8_interior)
+        .u8
+    else if (use_u16_interior)
+        .u16
+    else if (use_int16_interior)
+        .i16
+    else if (use_int32_interior)
+        .i32
+    else
+        null;
     // Short transcendental chains (exp/log/pow polynomials) are latency-bound: interleave the two
     // unrolled vectors on AVX2 too, up to peak_live 8 even on 16 YMM registers (Zen 3 silicon:
     // guided_a +10%, adg_mask +10..18%, exp p16 +11%, fine_sharp p16 +10% despite 4 -> 19 spills),
     // and on NEON (Neoverse-N2 silicon: adg_mask +9..11%, sigmoid_inv +7%; Apple M1 within noise).
     const interleave_x2 = can_interleave_x2 or ((cpu.vec_bytes >= 32 or cpu.isa == .neon) and base_unroll_x2 and rpn_stats.has_transcendental and rpn_stats.peak_live <= 8 and !has_horiz_rel and !prog.opt_int);
     const want_running_ptrs = (cpu.isa == .neon) and (info.used_clips.items.len + rel_row_keys.items.len <= 8);
-    const want_pair_mem = want_running_ptrs;
 
     const run_src_ptrs = try allocator.alloc(?aj.Reg, n_clips);
     defer allocator.free(run_src_ptrs);
@@ -650,21 +636,18 @@ pub fn compilePlane(
 
     const need_v_x = need_x_vec_f32 or (info.uses_x and prog.opt_int);
 
-    var v_lane_offsets_f32: ?aj.Reg = null;
-    var v_lane_offsets_i32: ?aj.Reg = null;
-    var v_lane_step_f32: ?aj.Reg = null;
-    var v_lane_step_i32: ?aj.Reg = null;
+    var xl: XLanes = .{};
     if (need_x_vec_f32) {
         var lane_f: [16]f32 = @splat(0.0);
         for (0..lanes) |i| lane_f[i] = @floatFromInt(i);
-        v_lane_offsets_f32 = b.constBytes(std.mem.sliceAsBytes(lane_f[0..lanes]));
-        v_lane_step_f32 = b.constF32Splat(@floatFromInt(lanes));
+        xl.offsets_f32 = b.constBytes(std.mem.sliceAsBytes(lane_f[0..lanes]));
+        xl.step_f32 = b.constF32Splat(@floatFromInt(lanes));
     }
     if (need_x_vec_i32) {
         var lane_i: [16]i32 = @splat(0);
         for (0..lanes) |i| lane_i[i] = @intCast(i);
-        v_lane_offsets_i32 = b.constBytes(std.mem.sliceAsBytes(lane_i[0..lanes]));
-        v_lane_step_i32 = b.constI32Splat(@intCast(lanes));
+        xl.offsets_i32 = b.constBytes(std.mem.sliceAsBytes(lane_i[0..lanes]));
+        xl.step_i32 = b.constI32Splat(@intCast(lanes));
     }
 
     // Outer y loop: `for (y = 0; y < height; y += 1)`
@@ -733,7 +716,7 @@ pub fn compilePlane(
         rel_row_ptrs[ki] = row_ptr;
     }
 
-    var common_env = BodyEnv{
+    const common_env = BodyEnv{
         .dst_ptr = dst_ptr,
         .x_gp = undefined,
         .src_row_ptrs = src_row_ptrs,
@@ -747,7 +730,6 @@ pub fn compilePlane(
         .v_y = v_y,
         .v_frame_n_f32 = v_frame_n_f32,
         .v_frame_n_i32 = v_frame_n_i32,
-        .node_inv = node_inv,
         .hoisted_slots = hoisted_slots,
         .hoisted_slots_hi = hoisted_slots_hi,
         .hoisted_masks = hoisted_masks,
@@ -759,95 +741,20 @@ pub fn compilePlane(
 
     if (enable_licm) {
         try evalHoistedStage(allocator, &b, prog, info, spec, common_env, node_inv, hoisted_slots, hoisted_masks, need_hoisted_mask, .row, periodic_lanes, 0);
-        common_env.hoisted_slots = hoisted_slots;
-        common_env.hoisted_masks = hoisted_masks;
         if (has_2x_periodic) {
             var row_env_hi = common_env;
             row_env_hi.hoisted_slots = hoisted_slots_hi;
             row_env_hi.hoisted_masks = hoisted_masks_hi;
             try evalHoistedStage(allocator, &b, prog, info, spec, row_env_hi, node_inv, hoisted_slots_hi, hoisted_masks_hi, need_hoisted_mask, .row, periodic_lanes, lanes);
-            common_env.hoisted_slots_hi = hoisted_slots_hi;
-            common_env.hoisted_masks_hi = hoisted_masks_hi;
         }
     }
-
-    const dst_bps_row: usize = spec.dst_fmt.bytesPerSample();
-    const makeRunningEnv = struct {
-        fn init(
-            builder: *aj.Builder,
-            base_env: BodyEnv,
-            used_clips: []const ast.ClipId,
-            src_fmts: []const ast.SampleFormat,
-            dst_bps: usize,
-            out_src: []?aj.Reg,
-            out_rel: []aj.Reg,
-            start_col: usize,
-            pair_mem: bool,
-        ) BodyEnv {
-            var renv = base_env;
-            const cd = builder.newGp64();
-            if (start_col == 0) {
-                builder.gpMov(cd, base_env.dst_ptr);
-            } else {
-                builder.gpOp3Imm(.add, cd, base_env.dst_ptr, @intCast(start_col * dst_bps));
-            }
-            renv.dst_ptr = cd;
-            for (used_clips) |clip| {
-                const cs = builder.newGp64();
-                const bps = src_fmts[clip].bytesPerSample();
-                if (start_col == 0) {
-                    builder.gpMov(cs, base_env.src_row_ptrs[clip].?);
-                } else {
-                    builder.gpOp3Imm(.add, cs, base_env.src_row_ptrs[clip].?, @intCast(start_col * bps));
-                }
-                out_src[clip] = cs;
-            }
-            for (base_env.rel_row_keys, 0..) |rk, ki| {
-                const cr = builder.newGp64();
-                const bps = src_fmts[rk.clip].bytesPerSample();
-                if (start_col == 0) {
-                    builder.gpMov(cr, base_env.rel_row_ptrs[ki]);
-                } else {
-                    builder.gpOp3Imm(.add, cr, base_env.rel_row_ptrs[ki], @intCast(start_col * bps));
-                }
-                out_rel[ki] = cr;
-            }
-            renv.src_row_ptrs = out_src;
-            renv.rel_row_ptrs = out_rel;
-            renv.use_running_ptrs = true;
-            renv.use_pair_mem = pair_mem;
-            return renv;
-        }
-    }.init;
-
-    const stepRunningEnv = struct {
-        fn step(
-            builder: *aj.Builder,
-            renv: BodyEnv,
-            used_clips: []const ast.ClipId,
-            src_fmts: []const ast.SampleFormat,
-            dst_bps: usize,
-            step_px: usize,
-        ) void {
-            if (!renv.use_running_ptrs) return;
-            builder.gpOp3Imm(.add, renv.dst_ptr, renv.dst_ptr, @intCast(step_px * dst_bps));
-            for (used_clips) |clip| {
-                const bps = src_fmts[clip].bytesPerSample();
-                builder.gpOp3Imm(.add, renv.src_row_ptrs[clip].?, renv.src_row_ptrs[clip].?, @intCast(step_px * bps));
-            }
-            for (renv.rel_row_keys, 0..) |rk, ki| {
-                const bps = src_fmts[rk.clip].bytesPerSample();
-                builder.gpOp3Imm(.add, renv.rel_row_ptrs[ki], renv.rel_row_ptrs[ki], @intCast(step_px * bps));
-            }
-        }
-    }.step;
 
     if (!has_horiz_rel) {
         // Single runtime vector loop across the whole row (with u8 / u16 / 2x-unrolled i16 / 2x/4x-unrolled f32/opt1 fast paths).
         var env = common_env;
         if (need_v_x) {
             const vx = b.newVec();
-            b.vecOp2(.mov, vx, if (prog.opt_int) v_lane_offsets_i32.? else v_lane_offsets_f32.?);
+            b.vecOp2(.mov, vx, if (prog.opt_int) xl.offsets_i32.? else xl.offsets_f32.?);
             env.v_x = vx;
         }
 
@@ -890,11 +797,7 @@ pub fn compilePlane(
                     b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
                 }
             } else {
-                if (info.value_types.items[prog.root] == .i32) {
-                    pixel.emitStoreI32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-                } else {
-                    pixel.emitStoreF32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-                }
+                pixel.emitStore(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt, info.value_types.items[prog.root] == .i32);
                 if (lanes == 4) {
                     b.vecLoad(.broadcast_u32, packed_vec, aj.Mem.ptr(dst_ptr, 0));
                 } else if (lanes == 8) {
@@ -908,22 +811,7 @@ pub fn compilePlane(
                     b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
                 }
             }
-            if (want_running_ptrs) {
-                const cur_dst = b.newGp64();
-                b.gpMov(cur_dst, dst_ptr);
-                const x_loop = b.newLabel();
-                b.bind(x_loop);
-                b.vecStore(.u_vec, aj.Mem.ptr(cur_dst, 0), packed_vec);
-                b.gpOp3Imm(.add, cur_dst, cur_dst, @intCast(step_bytes));
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_bytes));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            } else {
-                const x_loop = b.newLabel();
-                b.bind(x_loop);
-                b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 0, 0), packed_vec);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_bytes));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            }
+            emitRowStream(&b, dst_ptr, x_gp, packed_vec, spec.width, step_bytes, 0, want_running_ptrs);
         } else if (root_hoisted_u16) {
             // Row/frame-invariant u9..u16 root: pack once per row via exact D4 store path,
             // widen to a full 16/32/64-byte vector (safe within 32B / AVX-512 64B stride), and stream raw stores.
@@ -937,11 +825,7 @@ pub fn compilePlane(
                 pixel.emitStoreF32x2(&b, aj.Mem.ptr(dst_ptr, 0), aj.Mem.ptr(dst_ptr, @intCast(lanes * 2)), root_reg, root_hi, spec.dst_fmt, false);
                 b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
             } else {
-                if (info.value_types.items[prog.root] == .i32) {
-                    pixel.emitStoreI32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-                } else {
-                    pixel.emitStoreF32(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt);
-                }
+                pixel.emitStore(&b, aj.Mem.ptr(dst_ptr, 0), root_reg, spec.dst_fmt, info.value_types.items[prog.root] == .i32);
                 if (lanes == 4) {
                     b.vecLoad(.broadcast_u64, packed_vec, aj.Mem.ptr(dst_ptr, 0));
                 } else if (lanes == 8) {
@@ -954,22 +838,7 @@ pub fn compilePlane(
                     b.vecLoad(.u_vec, packed_vec, aj.Mem.ptr(dst_ptr, 0));
                 }
             }
-            if (want_running_ptrs) {
-                const cur_dst = b.newGp64();
-                b.gpMov(cur_dst, dst_ptr);
-                const x_loop = b.newLabel();
-                b.bind(x_loop);
-                b.vecStore(.u_vec, aj.Mem.ptr(cur_dst, 0), packed_vec);
-                b.gpOp3Imm(.add, cur_dst, cur_dst, @intCast(step_px * 2));
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_px));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            } else {
-                const x_loop = b.newLabel();
-                b.bind(x_loop);
-                b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, 1, 0), packed_vec);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_px));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            }
+            emitRowStream(&b, dst_ptr, x_gp, packed_vec, spec.width, step_px, 1, want_running_ptrs);
         } else if (root_hoisted_f32) {
             const root_lo = hoisted_slots[prog.root].?.reg;
             const root_hi = hoisted_slots_hi[prog.root].?.reg;
@@ -992,166 +861,46 @@ pub fn compilePlane(
                     b.vecStore(.u_vec, aj.Mem.ptr(cur_dst, 0), root_lo);
                 }
             }
-        } else if (use_u8_interior) {
-            const renv = if (want_running_ptrs)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
-            else
-                env;
-            const step2 = interior_step * 2;
-            const unroll_end = if (can_unroll_u8_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
-            if (unroll_end > 0) {
-                const x_loop2 = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop2);
-                try int_path.emitU8InteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-            }
-            if (unroll_end < spec.width) {
-                const x_loop = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop);
-                try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            }
-        } else if (use_u16_interior) {
-            const renv = if (want_running_ptrs)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
-            else
-                env;
-            const step2 = interior_step * 2;
-            const unroll_end = if (can_unroll_u16_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
-            if (unroll_end > 0) {
-                const x_loop2 = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop2);
-                try int_path.emitU16InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-            }
-            if (unroll_end < spec.width) {
-                const x_loop = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop);
-                try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            }
-        } else if (use_int16_interior) {
-            const renv = if (want_running_ptrs)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
-            else
-                env;
-            const step2 = lanes * 4;
-            const unroll_end = if (can_unroll_i16_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
-            if (unroll_end > 0) {
-                const x_loop2 = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop2);
-                try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-            }
-            if (unroll_end < spec.width) {
-                const x_loop = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop);
-                try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            }
-        } else if (use_int32_interior) {
-            const renv = if (want_running_ptrs)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
-            else
-                env;
-            const step2 = lanes * 2;
-            const unroll_end = if (can_unroll_i32_x2 and spec.width >= step2) (spec.width / step2) * step2 else 0;
-            if (unroll_end > 0) {
-                const x_loop2 = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop2);
-                try int_path.emitI32InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-            }
-            if (unroll_end < spec.width) {
-                const x_loop = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop);
-                try int_path.emitI32InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
-            }
+        } else if (int_kind) |kind| {
+            const renv = if (want_running_ptrs) makeRunningEnv(&b, env, info, spec, run_src_ptrs, run_rel_ptrs, 0) else env;
+            try emitIntInteriorSpan(allocator, &b, prog, info, spec, renv, kind, can_unroll_int_x2, interior_step, 0, spec.width, false);
         } else if (can_interleave_x4 and spec.width >= lanes * 4) {
-            const renv = if (want_running_ptrs)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
-            else
-                env;
+            const renv = if (want_running_ptrs) makeRunningEnv(&b, env, info, spec, run_src_ptrs, run_rel_ptrs, 0) else env;
             const step4 = lanes * 4;
             const unroll_end = (spec.width / step4) * step4;
             if (unroll_end > 0) {
-                const x_loop4 = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop4);
-                try emitDagBodyX4(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32);
-                if (renv.v_x) |vx| {
-                    b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step4)));
-                }
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step4);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step4));
+                const x_loop4 = beginXLoop(&b);
+                try emitDagBodyX4(allocator, &b, prog, info, spec, renv, xl.step_f32);
+                advanceVxBy(&b, renv.v_x, prog.opt_int, step4);
+                advanceX(&b, renv, info, spec, step4);
                 b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop4);
             }
             if (unroll_end < spec.width) {
                 const rem = spec.width - unroll_end;
                 if (rem > lanes * 2) {
-                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, true);
-                    if (renv.v_x) |vx| {
-                        b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(lanes * 2)));
-                    }
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes * 2);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes * 2));
+                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, xl, true);
+                    advanceVxBy(&b, renv.v_x, prog.opt_int, lanes * 2);
+                    advanceX(&b, renv, info, spec, lanes * 2);
                     if (rem - lanes * 2 > lanes) {
-                        try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, true);
+                        try emitDagBodyX2(allocator, &b, prog, info, spec, renv, xl, true);
                     } else {
                         try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
                     }
                 } else if (rem > lanes) {
-                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, true);
+                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, xl, true);
                 } else {
                     try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
                 }
             }
         } else if ((can_unroll_x2 and spec.width >= lanes * 2) or has_2x_periodic) {
-            const renv = if (want_running_ptrs)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
-            else
-                env;
+            const renv = if (want_running_ptrs) makeRunningEnv(&b, env, info, spec, run_src_ptrs, run_rel_ptrs, 0) else env;
             const step2 = lanes * 2;
             const unroll_end = (spec.width / step2) * step2;
             if (unroll_end > 0) {
-                const x_loop2 = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop2);
-                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, interleave_x2);
-                if (renv.v_x) |vx| {
-                    if (prog.opt_int) {
-                        b.vecOp3(.add_i32, vx, vx, b.constI32Splat(@intCast(step2)));
-                    } else {
-                        b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step2)));
-                    }
-                }
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                const x_loop2 = beginXLoop(&b);
+                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, xl, interleave_x2);
+                advanceVxBy(&b, renv.v_x, prog.opt_int, step2);
+                advanceX(&b, renv, info, spec, step2);
                 b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
             }
 
@@ -1159,33 +908,18 @@ pub fn compilePlane(
                 if (spec.width - unroll_end > lanes) {
                     // Remainder spans both phase 0 and phase 1; `width > unroll_end + lanes` guarantees
                     // the 32B/64B-aligned stride accommodates all `2 * lanes` pixels of every src/dst format.
-                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, interleave_x2);
+                    try emitDagBodyX2(allocator, &b, prog, info, spec, renv, xl, interleave_x2);
                 } else {
                     try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
                 }
             }
         } else {
             std.debug.assert(!has_2x_periodic);
-            const renv = if (want_running_ptrs and !info.uses_abs_access)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, 0, want_pair_mem)
-            else
-                env;
-            const x_loop = b.newLabel();
-            b.alignCode(32);
-            b.bind(x_loop);
-
+            const renv = if (want_running_ptrs and !info.uses_abs_access) makeRunningEnv(&b, env, info, spec, run_src_ptrs, run_rel_ptrs, 0) else env;
+            const x_loop = beginXLoop(&b);
             try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
-
-            if (renv.v_x) |vx| {
-                if (prog.opt_int) {
-                    b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
-                } else {
-                    b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
-                }
-            }
-
-            stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
-            b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
+            advanceVxLane(&b, renv.v_x, prog.opt_int, xl);
+            advanceX(&b, renv, info, spec, lanes);
             b.jccImm(.ult, x_gp, @intCast(spec.width), x_loop);
         }
     } else {
@@ -1193,43 +927,7 @@ pub fn compilePlane(
 
         // 1. Left edge: unrolled B1 window loads when <= 8 vecs, else compact `.dynamic_left` loop.
         if (left_end > 0) {
-            if (left_use_dynamic) {
-                var env = common_env;
-                if (need_v_x) {
-                    const vx = b.newVec();
-                    b.vecOp2(.mov, vx, if (prog.opt_int) v_lane_offsets_i32.? else v_lane_offsets_f32.?);
-                    env.v_x = vx;
-                }
-                const vxi = b.newVec();
-                b.vecOp2(.mov, vxi, v_lane_offsets_i32.?);
-                env.v_x_i32 = vxi;
-                const x_gp = b.newGp64();
-                b.gpMovImm(x_gp, 0);
-                env.x_gp = x_gp;
-
-                const left_loop = b.newLabel();
-                b.bind(left_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .{ .dynamic_left = left_end });
-                if (env.v_x) |vx| {
-                    if (prog.opt_int) {
-                        b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
-                    } else {
-                        b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
-                    }
-                }
-                b.vecOp3(.add_i32, vxi, vxi, v_lane_step_i32.?);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
-                b.jccImm(.ult, x_gp, @intCast(left_end), left_loop);
-            } else {
-                var col: usize = 0;
-                while (col < left_end) : (col += lanes) {
-                    var env = common_env;
-                    if (need_v_x) {
-                        env.v_x = makeConstXVec(&b, col, lanes, prog.opt_int);
-                    }
-                    try emitDagBody(allocator, &b, prog, info, spec, env, .{ .const_col = col });
-                }
-            }
+            try emitEdgeStrip(allocator, &b, prog, info, spec, common_env, need_v_x, xl, .left, left_use_dynamic, 0, left_end);
         }
 
         // 2. Branchless interior vector loop (u8 / u16 / i16 2x-unrolled / f32/opt1 2x-unrolled).
@@ -1243,199 +941,41 @@ pub fn compilePlane(
             const x_gp = b.newGp64();
             b.gpMovImm(x_gp, @intCast(left_end));
             env.x_gp = x_gp;
-            const renv = if (want_running_ptrs and !info.uses_abs_access)
-                makeRunningEnv(&b, env, info.used_clips.items, spec.src_fmts, dst_bps_row, run_src_ptrs, run_rel_ptrs, left_end, want_pair_mem)
-            else
-                env;
+            const renv = if (want_running_ptrs and !info.uses_abs_access) makeRunningEnv(&b, env, info, spec, run_src_ptrs, run_rel_ptrs, left_end) else env;
 
             const span = right_start - left_end;
-            if (use_u8_interior) {
-                const step2 = interior_step * 2;
-                const unroll_end = if (can_unroll_u8_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
-                if (unroll_end > left_end) {
-                    const x_loop2 = b.newLabel();
-                    b.alignCode(32);
-                    b.bind(x_loop2);
-                    try int_path.emitU8InteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                    b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-                }
-                if (unroll_end < right_start) {
-                    if (unroll_end == left_end) {
-                        const x_loop = b.newLabel();
-                        b.alignCode(32);
-                        b.bind(x_loop);
-                        try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                        b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
-                    } else {
-                        try int_path.emitU8InteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                    }
-                }
-            } else if (use_u16_interior) {
-                const step2 = interior_step * 2;
-                const unroll_end = if (can_unroll_u16_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
-                if (unroll_end > left_end) {
-                    const x_loop2 = b.newLabel();
-                    b.alignCode(32);
-                    b.bind(x_loop2);
-                    try int_path.emitU16InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                    b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-                }
-                if (unroll_end < right_start) {
-                    if (unroll_end == left_end) {
-                        const x_loop = b.newLabel();
-                        b.alignCode(32);
-                        b.bind(x_loop);
-                        try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                        b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
-                    } else {
-                        try int_path.emitU16InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                        stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                        b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                    }
-                }
-            } else if (use_int16_interior) {
-                const step2 = lanes * 4;
-                const unroll_end = if (can_unroll_i16_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
-                if (unroll_end > left_end) {
-                    const x_loop2 = b.newLabel();
-                    b.alignCode(32);
-                    b.bind(x_loop2);
-                    try int_path.emitInteriorBodyX2(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                    b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-                }
-                if (unroll_end < right_start) {
-                    const x_loop = b.newLabel();
-                    b.alignCode(32);
-                    b.bind(x_loop);
-                    try int_path.emitInteriorBody(allocator, &b, prog, info, spec.width, renv.dst_ptr, x_gp, renv.src_row_ptrs, renv);
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
-                    b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
-                }
-            } else if (use_int32_interior) {
-                const step2 = lanes * 2;
-                const unroll_end = if (can_unroll_i32_x2 and span >= step2) left_end + (span / step2) * step2 else left_end;
-                if (unroll_end > left_end) {
-                    const x_loop2 = b.newLabel();
-                    b.alignCode(32);
-                    b.bind(x_loop2);
-                    try int_path.emitI32InteriorBodyX2(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
-                    b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
-                }
-                if (unroll_end < right_start) {
-                    const x_loop = b.newLabel();
-                    b.alignCode(32);
-                    b.bind(x_loop);
-                    try int_path.emitI32InteriorBody(allocator, &b, prog, info, spec.width, spec.dst_fmt, renv.dst_ptr, renv.src_row_ptrs, renv);
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
-                    b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
-                }
+            if (int_kind) |kind| {
+                // The span is a whole number of `interior_step`s, so after the unrolled loop u8/u16 have
+                // at most one step left and emit it straight-line.
+                try emitIntInteriorSpan(allocator, &b, prog, info, spec, renv, kind, can_unroll_int_x2, interior_step, left_end, right_start, kind == .u8 or kind == .u16);
             } else if (can_unroll_x2 and span >= lanes * 2) {
                 const step2 = lanes * 2;
                 const unroll_end = left_end + (span / step2) * step2;
-                const x_loop2 = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop2);
-                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, v_lane_step_f32, v_lane_step_i32, interleave_x2);
-                if (renv.v_x) |vx| {
-                    if (prog.opt_int) {
-                        b.vecOp3(.add_i32, vx, vx, b.constI32Splat(@intCast(step2)));
-                    } else {
-                        b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step2)));
-                    }
-                }
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, step2);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step2));
+                const x_loop2 = beginXLoop(&b);
+                try emitDagBodyX2(allocator, &b, prog, info, spec, renv, xl, interleave_x2);
+                advanceVxBy(&b, renv.v_x, prog.opt_int, step2);
+                advanceX(&b, renv, info, spec, step2);
                 b.jccImm(.ult, x_gp, @intCast(unroll_end), x_loop2);
 
                 if (unroll_end < right_start) {
-                    const x_loop = b.newLabel();
-                    b.alignCode(32);
-                    b.bind(x_loop);
+                    const x_loop = beginXLoop(&b);
                     try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
-                    if (renv.v_x) |vx| {
-                        if (prog.opt_int) {
-                            b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
-                        } else {
-                            b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
-                        }
-                    }
-                    stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, lanes);
-                    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
+                    advanceVxLane(&b, renv.v_x, prog.opt_int, xl);
+                    advanceX(&b, renv, info, spec, lanes);
                     b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
                 }
             } else {
-                const x_loop = b.newLabel();
-                b.alignCode(32);
-                b.bind(x_loop);
+                const x_loop = beginXLoop(&b);
                 try emitDagBody(allocator, &b, prog, info, spec, renv, .interior);
-                if (renv.v_x) |vx| {
-                    if (prog.opt_int) {
-                        b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
-                    } else {
-                        b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
-                    }
-                }
-                stepRunningEnv(&b, renv, info.used_clips.items, spec.src_fmts, dst_bps_row, interior_step);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(interior_step));
+                advanceVxLane(&b, renv.v_x, prog.opt_int, xl);
+                advanceX(&b, renv, info, spec, interior_step);
                 b.jccImm(.ult, x_gp, @intCast(right_start), x_loop);
             }
         }
 
         // 3. Right edge + tail: unrolled B1 window loads when <= 8 vecs, else compact `.dynamic_right` loop.
         if (right_start < spec.width) {
-            if (right_use_dynamic) {
-                var env = common_env;
-                if (need_v_x) {
-                    const vx = b.newVec();
-                    b.vecOp2(.mov, vx, makeConstXVec(&b, right_start, lanes, prog.opt_int));
-                    env.v_x = vx;
-                }
-                const vxi = b.newVec();
-                b.vecOp2(.mov, vxi, makeConstXVec(&b, right_start, lanes, true));
-                env.v_x_i32 = vxi;
-                const x_gp = b.newGp64();
-                b.gpMovImm(x_gp, @intCast(right_start));
-                env.x_gp = x_gp;
-
-                const right_loop = b.newLabel();
-                b.bind(right_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .{ .dynamic_right = right_start });
-                if (env.v_x) |vx| {
-                    if (prog.opt_int) {
-                        b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
-                    } else {
-                        b.vecOp3(.add_f32, vx, vx, v_lane_step_f32.?);
-                    }
-                }
-                b.vecOp3(.add_i32, vxi, vxi, v_lane_step_i32.?);
-                b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
-                b.jccImm(.ult, x_gp, @intCast(spec.width), right_loop);
-            } else {
-                var col = right_start;
-                while (col < spec.width) : (col += lanes) {
-                    var env = common_env;
-                    if (need_v_x) {
-                        env.v_x = makeConstXVec(&b, col, lanes, prog.opt_int);
-                    }
-                    try emitDagBody(allocator, &b, prog, info, spec, env, .{ .const_col = col });
-                }
-            }
+            try emitEdgeStrip(allocator, &b, prog, info, spec, common_env, need_v_x, xl, .right, right_use_dynamic, right_start, spec.width);
         }
     }
 
@@ -1453,6 +993,27 @@ pub fn compilePlane(
     return try finishCompile(allocator, rt, &b, spec.capture_disasm);
 }
 
+/// Address shift (`log2` of the sample size) for a 1/2/4-byte sample.
+fn bpsShift(bps: usize) u8 {
+    return switch (bps) {
+        1 => 0,
+        2 => 1,
+        else => 2,
+    };
+}
+
+/// The interior destination operand `lane_off` pixels past the current column.
+fn dstInteriorMem(env: BodyEnv, spec: CompileSpec, lane_off: usize) aj.Mem {
+    const dst_bps: usize = spec.dst_fmt.bytesPerSample();
+    return env.rowMem(env.dst_ptr, bpsShift(dst_bps), @intCast(lane_off * dst_bps));
+}
+
+/// Whether every f32 plane byte offset fits the signed 32-bit hardware gather index.
+fn canHwGatherF32(spec: CompileSpec) bool {
+    const max_plane_bytes_f32: u64 = @as(u64, spec.height) * std.mem.alignForward(u64, @as(u64, spec.width) * 4 + 64, 64);
+    return max_plane_bytes_f32 <= 0x7FFF_0000;
+}
+
 fn makeConstXVec(b: *aj.Builder, col: usize, lanes: usize, opt_int: bool) aj.Reg {
     if (opt_int) {
         var vals: [16]i32 = @splat(0);
@@ -1463,6 +1024,209 @@ fn makeConstXVec(b: *aj.Builder, col: usize, lanes: usize, opt_int: bool) aj.Reg
         for (0..lanes) |i| vals[i] = @floatFromInt(col + i);
         return b.constBytes(std.mem.sliceAsBytes(vals[0..lanes]));
     }
+}
+
+/// Store the full vector `v` across the row, `step_px` pixels (`step_px << shift` bytes) per
+/// iteration, through a running dst pointer when `running`.
+fn emitRowStream(b: *aj.Builder, dst_ptr: aj.Reg, x_gp: aj.Reg, v: aj.Reg, width: usize, step_px: usize, shift: u8, running: bool) void {
+    const cur_dst = if (running) b.newGp64() else dst_ptr;
+    if (running) b.gpMov(cur_dst, dst_ptr);
+    const x_loop = b.newLabel();
+    b.bind(x_loop);
+    if (running) {
+        b.vecStore(.u_vec, aj.Mem.ptr(cur_dst, 0), v);
+        b.gpOp3Imm(.add, cur_dst, cur_dst, @intCast(step_px << @intCast(shift)));
+    } else {
+        b.vecStore(.u_vec, aj.Mem.indexed(dst_ptr, x_gp, shift, 0), v);
+    }
+    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(step_px));
+    b.jccImm(.ult, x_gp, @intCast(width), x_loop);
+}
+
+/// Per-lane x offsets (`0..lanes`) and one-vector x steps, materialized once per kernel when needed.
+const XLanes = struct {
+    offsets_f32: ?aj.Reg = null,
+    offsets_i32: ?aj.Reg = null,
+    step_f32: ?aj.Reg = null,
+    step_i32: ?aj.Reg = null,
+};
+
+/// Bind a new 32-byte-aligned x-loop head.
+fn beginXLoop(b: *aj.Builder) aj.Label {
+    const label = b.newLabel();
+    b.alignCode(32);
+    b.bind(label);
+    return label;
+}
+
+/// Advance `v_x` (when materialized) by `step` pixels with a splat constant created here.
+fn advanceVxBy(b: *aj.Builder, v_x: ?aj.Reg, opt_int: bool, step: usize) void {
+    const vx = v_x orelse return;
+    if (opt_int) {
+        b.vecOp3(.add_i32, vx, vx, b.constI32Splat(@intCast(step)));
+    } else {
+        b.vecOp3(.add_f32, vx, vx, b.constF32Splat(@floatFromInt(step)));
+    }
+}
+
+/// Advance `v_x` (when materialized) by one vector with the prologue's lane-step splats.
+fn advanceVxLane(b: *aj.Builder, v_x: ?aj.Reg, opt_int: bool, xl: XLanes) void {
+    const vx = v_x orelse return;
+    if (opt_int) {
+        b.vecOp3(.add_i32, vx, vx, xl.step_i32.?);
+    } else {
+        b.vecOp3(.add_f32, vx, vx, xl.step_f32.?);
+    }
+}
+
+/// Advance `renv`'s running dst/src/relative-row pointers (when used) and `x_gp` by `step_px` pixels.
+fn advanceX(b: *aj.Builder, renv: BodyEnv, info: *const analysis_mod.Analysis, spec: CompileSpec, step_px: usize) void {
+    if (renv.use_running_ptrs) {
+        b.gpOp3Imm(.add, renv.dst_ptr, renv.dst_ptr, @intCast(step_px * spec.dst_fmt.bytesPerSample()));
+        for (info.used_clips.items) |clip| {
+            const bps = spec.src_fmts[clip].bytesPerSample();
+            b.gpOp3Imm(.add, renv.src_row_ptrs[clip].?, renv.src_row_ptrs[clip].?, @intCast(step_px * bps));
+        }
+        for (renv.rel_row_keys, 0..) |rk, ki| {
+            const bps = spec.src_fmts[rk.clip].bytesPerSample();
+            b.gpOp3Imm(.add, renv.rel_row_ptrs[ki], renv.rel_row_ptrs[ki], @intCast(step_px * bps));
+        }
+    }
+    b.gpOp3Imm(.add, renv.x_gp, renv.x_gp, @intCast(step_px));
+}
+
+/// A new GP register holding `base + bytes`.
+fn offsetPtr(b: *aj.Builder, base: aj.Reg, bytes: usize) aj.Reg {
+    const reg = b.newGp64();
+    if (bytes == 0) {
+        b.gpMov(reg, base);
+    } else {
+        b.gpOp3Imm(.add, reg, base, @intCast(bytes));
+    }
+    return reg;
+}
+
+/// `base_env` with running dst/src/relative-row pointers (kept in `out_src`/`out_rel`) starting at
+/// column `start_col`, so loads and stores address `[ptr, #disp]` and `advanceX` bumps the pointers.
+fn makeRunningEnv(
+    b: *aj.Builder,
+    base_env: BodyEnv,
+    info: *const analysis_mod.Analysis,
+    spec: CompileSpec,
+    out_src: []?aj.Reg,
+    out_rel: []aj.Reg,
+    start_col: usize,
+) BodyEnv {
+    var renv = base_env;
+    renv.dst_ptr = offsetPtr(b, base_env.dst_ptr, start_col * spec.dst_fmt.bytesPerSample());
+    for (info.used_clips.items) |clip| {
+        out_src[clip] = offsetPtr(b, base_env.src_row_ptrs[clip].?, start_col * spec.src_fmts[clip].bytesPerSample());
+    }
+    for (base_env.rel_row_keys, 0..) |rk, ki| {
+        out_rel[ki] = offsetPtr(b, base_env.rel_row_ptrs[ki], start_col * spec.src_fmts[rk.clip].bytesPerSample());
+    }
+    renv.src_row_ptrs = out_src;
+    renv.rel_row_ptrs = out_rel;
+    renv.use_running_ptrs = true;
+    return renv;
+}
+
+/// Emit the native integer interior over `[start, end)`: a 2x-unrolled loop over whole `2 * step`
+/// chunks (when `can_unroll`), then a `step` loop up to `end`, or one straight-line step when
+/// `single_tail` and the unrolled loop ran.
+fn emitIntInteriorSpan(
+    allocator: std.mem.Allocator,
+    b: *aj.Builder,
+    prog: *const ast.Program,
+    info: *const analysis_mod.Analysis,
+    spec: CompileSpec,
+    renv: BodyEnv,
+    kind: int_path.InteriorKind,
+    can_unroll: bool,
+    step: usize,
+    start: usize,
+    end: usize,
+    single_tail: bool,
+) std.mem.Allocator.Error!void {
+    const step2 = step * 2;
+    const span = end - start;
+    const unroll_end = if (can_unroll and span >= step2) start + (span / step2) * step2 else start;
+    if (unroll_end > start) {
+        const x_loop2 = beginXLoop(b);
+        try int_path.emitInteriorBody(kind, true, allocator, b, prog, info, spec.width, spec.dst_fmt, renv);
+        advanceX(b, renv, info, spec, step2);
+        b.jccImm(.ult, renv.x_gp, @intCast(unroll_end), x_loop2);
+    }
+    if (unroll_end < end) {
+        const single = single_tail and unroll_end != start;
+        const x_loop = if (single) null else beginXLoop(b);
+        try int_path.emitInteriorBody(kind, false, allocator, b, prog, info, spec.width, spec.dst_fmt, renv);
+        advanceX(b, renv, info, spec, step);
+        if (x_loop) |head| b.jccImm(.ult, renv.x_gp, @intCast(end), head);
+    }
+}
+
+const EdgeSide = enum { left, right };
+
+/// Emit an edge strip `[start, end)`: a compact `.dynamic_left`/`.dynamic_right` loop when
+/// `dynamic` (oversized strips), else unrolled B1 `.const_col` window loads.
+fn emitEdgeStrip(
+    allocator: std.mem.Allocator,
+    b: *aj.Builder,
+    prog: *const ast.Program,
+    info: *const analysis_mod.Analysis,
+    spec: CompileSpec,
+    common_env: BodyEnv,
+    need_v_x: bool,
+    xl: XLanes,
+    side: EdgeSide,
+    dynamic: bool,
+    start: usize,
+    end: usize,
+) std.mem.Allocator.Error!void {
+    const lanes: usize = b.cpu.f32_lanes;
+    if (!dynamic) {
+        var col = start;
+        while (col < end) : (col += lanes) {
+            var env = common_env;
+            if (need_v_x) {
+                env.v_x = makeConstXVec(b, col, lanes, prog.opt_int);
+            }
+            try emitDagBody(allocator, b, prog, info, spec, env, .{ .const_col = col });
+        }
+        return;
+    }
+    // The left strip starts at column 0, so it reuses the prologue's lane offsets.
+    var env = common_env;
+    if (need_v_x) {
+        const vx = b.newVec();
+        b.vecOp2(.mov, vx, switch (side) {
+            .left => if (prog.opt_int) xl.offsets_i32.? else xl.offsets_f32.?,
+            .right => makeConstXVec(b, start, lanes, prog.opt_int),
+        });
+        env.v_x = vx;
+    }
+    const vxi = b.newVec();
+    b.vecOp2(.mov, vxi, switch (side) {
+        .left => xl.offsets_i32.?,
+        .right => makeConstXVec(b, start, lanes, true),
+    });
+    env.v_x_i32 = vxi;
+    const x_gp = b.newGp64();
+    b.gpMovImm(x_gp, @intCast(start));
+    env.x_gp = x_gp;
+
+    const edge_loop = b.newLabel();
+    b.bind(edge_loop);
+    const x_mode: XMode = switch (side) {
+        .left => .{ .dynamic_left = end },
+        .right => .{ .dynamic_right = start },
+    };
+    try emitDagBody(allocator, b, prog, info, spec, env, x_mode);
+    advanceVxLane(b, env.v_x, prog.opt_int, xl);
+    b.vecOp3(.add_i32, vxi, vxi, xl.step_i32.?);
+    b.gpOp3Imm(.add, x_gp, x_gp, @intCast(lanes));
+    b.jccImm(.ult, x_gp, @intCast(end), edge_loop);
 }
 
 fn finishCompile(allocator: std.mem.Allocator, rt: *aj.Runtime, b: *aj.Builder, capture_disasm: bool) CompileError!CompileResult {
@@ -1489,7 +1253,6 @@ const BodyEnv = struct {
     v_y: ?aj.Reg,
     v_frame_n_f32: ?aj.Reg,
     v_frame_n_i32: ?aj.Reg,
-    node_inv: []const Invariance = &.{},
     hoisted_slots: []const ?RegSlot = &.{},
     hoisted_slots_hi: []const ?RegSlot = &.{},
     hoisted_masks: []const ?aj.Reg = &.{},
@@ -1498,7 +1261,6 @@ const BodyEnv = struct {
     abs_row_ptrs: []const ?aj.Reg = &.{},
     rpn_peak_live: u32 = 0,
     use_running_ptrs: bool = false,
-    use_pair_mem: bool = false,
 
     pub fn rowPtrFor(self: BodyEnv, clip: ast.ClipId, dy: i32, mode: ast.BoundaryMode) aj.Reg {
         if (dy == 0) return self.src_row_ptrs[clip].?;
@@ -1538,11 +1300,7 @@ fn emitRelLoad(
 ) void {
     const fmt = spec.src_fmts[clip];
     const bps: usize = fmt.bytesPerSample();
-    const shift: u8 = switch (bps) {
-        1 => 0,
-        2 => 1,
-        else => 2,
-    };
+    const shift: u8 = bpsShift(bps);
     const row_ptr = env.rowPtrFor(clip, dy, mode);
     const w_i32: i32 = @intCast(spec.width);
     const eff_dx: i32 = interp.clampRelOffset(dx, w_i32);
@@ -1551,11 +1309,7 @@ fn emitRelLoad(
         .interior => {
             const disp: i32 = (eff_dx + @as(i32, @intCast(col_disp))) * @as(i32, @intCast(bps));
             const mem = env.rowMem(row_ptr, shift, disp);
-            if (out_ty == .i32) {
-                pixel.emitLoadI32(b, dst, mem, fmt);
-            } else {
-                pixel.emitLoadF32(b, dst, mem, fmt);
-            }
+            pixel.emitLoad(b, dst, mem, fmt, out_ty == .i32);
         },
         .const_col => |col| {
             // B1 corrected single-window edge load + compile-time lane permutation!
@@ -1589,11 +1343,7 @@ fn emitRelLoad(
 
             const disp: i32 = @intCast(load_x * bps);
             const mem = aj.Mem.ptr(row_ptr, disp);
-            if (out_ty == .i32) {
-                pixel.emitLoadI32(b, dst, mem, fmt);
-            } else {
-                pixel.emitLoadF32(b, dst, mem, fmt);
-            }
+            pixel.emitLoad(b, dst, mem, fmt, out_ty == .i32);
             if (!is_identity) {
                 b.vecPermuteF32(dst, dst, perm[0..lanes]);
             }
@@ -1607,11 +1357,7 @@ fn emitRelLoad(
             };
             if (eff_dx == 0 or in_bounds) {
                 const mem = aj.Mem.indexed(row_ptr, env.x_gp, shift, eff_dx * @as(i32, @intCast(bps)));
-                if (out_ty == .i32) {
-                    pixel.emitLoadI32(b, dst, mem, fmt);
-                } else {
-                    pixel.emitLoadF32(b, dst, mem, fmt);
-                }
+                pixel.emitLoad(b, dst, mem, fmt, out_ty == .i32);
                 return;
             }
             const ix = b.newVec();
@@ -1786,6 +1532,19 @@ fn markFusableBoolTreeF32(
     }
 }
 
+/// Consume one use of `idx`; its last use frees an owned slot.
+fn releaseUse(rem: []u32, slot_arr: []?RegSlot, idx: ast.NodeIdx) void {
+    if (rem[idx] == 0) return;
+    rem[idx] -= 1;
+    if (rem[idx] == 0) {
+        if (slot_arr[idx]) |s| {
+            if (s.owned) {
+                slot_arr[idx] = null;
+            }
+        }
+    }
+}
+
 fn emitBoolMaskF32(
     b: *aj.Builder,
     prog: *const ast.Program,
@@ -1807,14 +1566,7 @@ fn emitBoolMaskF32(
         const mask = b.newVec();
         const reg = resolveSlotReg(b, prog, info, env, slots, idx);
         b.vecOp3(.cmp_gt_f32, mask, reg, b.vecZero());
-        if (rem_uses[idx] > 0) {
-            rem_uses[idx] -= 1;
-            if (rem_uses[idx] == 0) {
-                if (slots[idx]) |s| {
-                    if (s.owned) slots[idx] = null;
-                }
-            }
-        }
+        releaseUse(rem_uses, slots, idx);
         return mask;
     }
     const mask = b.newVec();
@@ -1823,14 +1575,7 @@ fn emitBoolMaskF32(
             // `.not`: `a <= 0.0` (matches `emitUnaryF32(.not)` bit-for-bit incl. NaN).
             const a_reg = resolveSlotReg(b, prog, info, env, slots, u.a);
             b.vecOp3(.cmp_le_f32, mask, a_reg, b.vecZero());
-            if (rem_uses[u.a] > 0) {
-                rem_uses[u.a] -= 1;
-                if (rem_uses[u.a] == 0) {
-                    if (slots[u.a]) |s| {
-                        if (s.owned) slots[u.a] = null;
-                    }
-                }
-            }
+            releaseUse(rem_uses, slots, u.a);
             return mask;
         },
         .binary => |bin| {
@@ -1845,26 +1590,13 @@ fn emitBoolMaskF32(
                 } else {
                     b.vecOp3(cmp_op, mask, lhs_reg, resolveSlotReg(b, prog, info, env, slots, bin.b));
                 }
-                for ([_]ast.NodeIdx{ bin.a, bin.b }) |child| {
-                    if (rem_uses[child] > 0) {
-                        rem_uses[child] -= 1;
-                        if (rem_uses[child] == 0) {
-                            if (slots[child]) |s| {
-                                if (s.owned) slots[child] = null;
-                            }
-                        }
-                    }
-                }
+                releaseUse(rem_uses, slots, bin.a);
+                releaseUse(rem_uses, slots, bin.b);
                 return mask;
             }
             const ma = emitBoolMaskF32(b, prog, info, env, slots, rem_uses, fused_cmp, use_const_mem, bin.a);
             const mb = emitBoolMaskF32(b, prog, info, env, slots, rem_uses, fused_cmp, use_const_mem, bin.b);
-            switch (bin.op) {
-                .and_op => b.vecOp3(.and_u32, mask, ma, mb),
-                .or_op => b.vecOp3(.or_u32, mask, ma, mb),
-                .xor_op => b.vecOp3(.xor_u32, mask, ma, mb),
-                else => unreachable,
-            }
+            b.vecOp3(bitwiseVecOp(bin.op), mask, ma, mb);
             return mask;
         },
         else => unreachable,
@@ -1904,6 +1636,103 @@ fn emitGatherFromBase(
 /// recording their registers in `hoisted_slots` as non-owned (`owned = false`) for deeper loops.
 /// G2: hoist all invariant nodes without a frontier cap; spilling a row/frame value and folding
 /// its stack reload into the consumer is faster than recomputing invariant arithmetic per pixel.
+fn ensureF32(b: *aj.Builder, reg: aj.Reg, ty: analysis_mod.ValueType) aj.Reg {
+    if (ty == .f32) return reg;
+    const dst = b.newVec();
+    b.vecOp2(.cvt_i32_to_f32, dst, reg);
+    return dst;
+}
+
+/// The register of a leaf read from the environment or a splat constant, or null for any other
+/// node (an `.f32`-typed `.const_i32` stays unslotted).
+fn leafReg(b: *aj.Builder, env: BodyEnv, spec: CompileSpec, node: ast.Node, out_ty: analysis_mod.ValueType) ?aj.Reg {
+    return switch (node) {
+        .const_i32 => |v| if (out_ty == .i32) b.constI32Splat(v) else null,
+        .load_prop => |pid| env.prop_regs[pid],
+        .coord_x => env.v_x.?,
+        .coord_y => env.v_y.?,
+        .frame_n => if (out_ty == .i32) env.v_frame_n_i32.? else env.v_frame_n_f32.?,
+        .plane_width => if (out_ty == .i32) b.constI32Splat(@intCast(spec.width)) else b.constF32Splat(@floatFromInt(spec.width)),
+        .plane_height => if (out_ty == .i32) b.constI32Splat(@intCast(spec.height)) else b.constF32Splat(@floatFromInt(spec.height)),
+        else => null,
+    };
+}
+
+/// Unary `op` of `src_reg` (node `src`, type `src_ty`) into `dst` of type `out_ty`; sin and cos of
+/// one operand share its range reduction through `trig_cache`.
+fn emitUnaryNode(
+    b: *aj.Builder,
+    op: ast.UnaryOp,
+    dst: aj.Reg,
+    src_reg: aj.Reg,
+    src_ty: analysis_mod.ValueType,
+    out_ty: analysis_mod.ValueType,
+    trig_cache: []?math_jit.TrigState,
+    src: ast.NodeIdx,
+    use_const_mem: bool,
+) void {
+    if (op == .to_f32) {
+        if (src_ty == .i32) b.vecOp2(.cvt_i32_to_f32, dst, src_reg) else b.vecOp2(.mov, dst, src_reg);
+    } else if (out_ty == .i32 and src_ty == .i32) {
+        emitUnaryI32(b, op, dst, src_reg);
+    } else if (out_ty == .i32) {
+        // V7: `not` / `bitnot` on `.f32` operand producing `.i32` under `opt=1`.
+        emitUnaryF32ToI32(b, op, dst, src_reg);
+    } else {
+        const a_f = ensureF32(b, src_reg, src_ty);
+        switch (op) {
+            .sin, .cos => {
+                const st = trig_cache[src] orelse blk: {
+                    const prepared = math_jit.emitTrigPrepare(b, a_f);
+                    trig_cache[src] = prepared;
+                    break :blk prepared;
+                };
+                if (op == .sin) math_jit.emitSinFromState(b, dst, st) else math_jit.emitCosFromState(b, dst, st);
+            },
+            else => emitUnaryF32(b, op, dst, a_f, use_const_mem),
+        }
+    }
+}
+
+/// Absolute x coordinate `raw` (type `ty`), clamped/mirrored into the row, as an i32 byte offset.
+fn emitAbsXOffset(b: *aj.Builder, raw: aj.Reg, ty: analysis_mod.ValueType, width: usize, mode: ast.BoundaryMode, shift: u8) aj.Reg {
+    const fx = ensureF32(b, raw, ty);
+    const ix = b.newVec();
+    emitAbsCoordToI32(b, ix, fx, @intCast(width), mode);
+    if (shift != 0) b.vecOp2i(.sll_u32, ix, ix, shift);
+    return ix;
+}
+
+/// Absolute y coordinate `raw` (type `ty`), clamped/mirrored into the plane, as an i32 row byte offset.
+fn emitAbsYOffset(b: *aj.Builder, raw: aj.Reg, ty: analysis_mod.ValueType, height: usize, mode: ast.BoundaryMode, stride_vec: aj.Reg) aj.Reg {
+    const fy = ensureF32(b, raw, ty);
+    const iy = b.newVec();
+    emitAbsCoordToI32(b, iy, fy, @intCast(height), mode);
+    b.vecOp3(.mul_i32, iy, iy, stride_vec);
+    return iy;
+}
+
+/// `a op c` with `c` an f32 constant operand (`add`/`sub`/`mul`/`min`/`max`).
+fn emitBinaryCF32(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, c: f32) void {
+    switch (op) {
+        .add => b.vecAddCF32(dst, a, c),
+        .sub => b.vecSubCF32(dst, a, c),
+        .mul => b.vecMulCF32(dst, a, c),
+        .min => b.vecMinCF32(dst, a, c),
+        .max => b.vecMaxCF32(dst, a, c),
+        else => unreachable,
+    }
+}
+
+/// `x * c` as a move, `x + x` or a left shift when `c > 0` is a power of two; false otherwise.
+fn emitMulPow2I32(b: *aj.Builder, dst: aj.Reg, x: aj.Reg, c: i32) bool {
+    const iv: u32 = @intCast(c);
+    if (!std.math.isPowerOfTwo(iv)) return false;
+    const sh: u5 = @intCast(@ctz(iv));
+    if (sh == 0) b.vecOp2(.mov, dst, x) else if (sh == 1) b.vecOp3(.add_i32, dst, x, x) else b.vecOp2i(.sll_u32, dst, x, sh);
+    return true;
+}
+
 fn evalHoistedStage(
     allocator: std.mem.Allocator,
     b: *aj.Builder,
@@ -1925,17 +1754,7 @@ fn evalHoistedStage(
     defer allocator.free(trig_cache);
     @memset(trig_cache, null);
 
-    const max_plane_bytes_f32: u64 = @as(u64, spec.height) * std.mem.alignForward(u64, @as(u64, spec.width) * 4 + 64, 64);
-    const can_hw_gather_f32 = max_plane_bytes_f32 <= 0x7FFF_0000;
-
-    const ensureF32 = struct {
-        fn run(builder: *aj.Builder, reg: aj.Reg, ty: analysis_mod.ValueType) aj.Reg {
-            if (ty == .f32) return reg;
-            const dst = builder.newVec();
-            builder.vecOp2(.cvt_i32_to_f32, dst, reg);
-            return dst;
-        }
-    }.run;
+    const can_hw_gather_f32 = canHwGatherF32(spec);
 
     for (prog.nodes.items, 0..) |node, idx| {
         if (idx != prog.root and info.use_counts.items[idx] == 0) continue;
@@ -1946,85 +1765,23 @@ fn evalHoistedStage(
         const out_ty = info.value_types.items[idx];
         switch (node) {
             .const_f32 => {},
-            .const_i32 => |v| {
-                if (out_ty == .i32) {
-                    hoisted_slots[idx] = .{ .reg = b.constI32Splat(v), .owned = false };
-                }
+            .const_i32, .load_prop, .coord_y, .frame_n, .plane_width, .plane_height => {
+                if (leafReg(b, env, spec, node, out_ty)) |reg| hoisted_slots[idx] = .{ .reg = reg, .owned = false };
             },
             .load_abs => |la| {
                 const fmt = spec.src_fmts[la.clip];
-                const shift: u8 = switch (fmt.bytesPerSample()) {
-                    1 => 0,
-                    2 => 1,
-                    else => 2,
-                };
-                const vx_raw = resolveSlotReg(b, prog, info, env, hoisted_slots, la.x);
-                const fx = ensureF32(b, vx_raw, info.value_types.items[la.x]);
-                const ix = b.newVec();
-                emitAbsCoordToI32(b, ix, fx, @intCast(spec.width), la.mode);
-                if (shift != 0) b.vecOp2i(.sll_u32, ix, ix, shift);
-
-                const vy_raw = resolveSlotReg(b, prog, info, env, hoisted_slots, la.y);
-                const fy = ensureF32(b, vy_raw, info.value_types.items[la.y]);
-                const iy = b.newVec();
-                emitAbsCoordToI32(b, iy, fy, @intCast(spec.height), la.mode);
-                b.vecOp3(.mul_i32, iy, iy, env.src_stride_vecs[la.clip].?);
-
+                const ix = emitAbsXOffset(b, resolveSlotReg(b, prog, info, env, hoisted_slots, la.x), info.value_types.items[la.x], spec.width, la.mode, bpsShift(fmt.bytesPerSample()));
+                const iy = emitAbsYOffset(b, resolveSlotReg(b, prog, info, env, hoisted_slots, la.y), info.value_types.items[la.y], spec.height, la.mode, env.src_stride_vecs[la.clip].?);
                 const byte_off = b.newVec();
                 b.vecOp3(.add_i32, byte_off, iy, ix);
                 const dst = b.newVec();
                 emitGatherFromBase(b, dst, out_ty, env.base_src_ptrs[la.clip].?, byte_off, fmt, can_hw_gather_f32);
                 hoisted_slots[idx] = .{ .reg = dst, .owned = false };
             },
-            .load_prop => |pid| {
-                hoisted_slots[idx] = .{ .reg = env.prop_regs[pid], .owned = false };
-            },
-            .coord_y => {
-                hoisted_slots[idx] = .{ .reg = env.v_y.?, .owned = false };
-            },
-            .frame_n => {
-                hoisted_slots[idx] = .{ .reg = if (out_ty == .i32) env.v_frame_n_i32.? else env.v_frame_n_f32.?, .owned = false };
-            },
-            .plane_width => {
-                hoisted_slots[idx] = .{
-                    .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.width)) else b.constF32Splat(@floatFromInt(spec.width)),
-                    .owned = false,
-                };
-            },
-            .plane_height => {
-                hoisted_slots[idx] = .{
-                    .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.height)) else b.constF32Splat(@floatFromInt(spec.height)),
-                    .owned = false,
-                };
-            },
             .unary => |u| {
                 const src_reg = resolveSlotReg(b, prog, info, env, hoisted_slots, u.a);
-                const src_ty = info.value_types.items[u.a];
                 const dst = b.newVec();
-                if (u.op == .to_f32) {
-                    if (src_ty == .i32) b.vecOp2(.cvt_i32_to_f32, dst, src_reg) else b.vecOp2(.mov, dst, src_reg);
-                } else if (out_ty == .i32 and src_ty == .i32) {
-                    emitUnaryI32(b, u.op, dst, src_reg);
-                } else if (out_ty == .i32) {
-                    emitUnaryF32ToI32(b, u.op, dst, src_reg);
-                } else {
-                    const a_f = ensureF32(b, src_reg, src_ty);
-                    switch (u.op) {
-                        .sin, .cos => {
-                            const st = trig_cache[u.a] orelse blk: {
-                                const prepared = math_jit.emitTrigPrepare(b, a_f);
-                                trig_cache[u.a] = prepared;
-                                break :blk prepared;
-                            };
-                            switch (u.op) {
-                                .sin => math_jit.emitSinFromState(b, dst, st),
-                                .cos => math_jit.emitCosFromState(b, dst, st),
-                                else => unreachable,
-                            }
-                        },
-                        else => emitUnaryF32(b, u.op, dst, a_f, true),
-                    }
-                }
+                emitUnaryNode(b, u.op, dst, src_reg, info.value_types.items[u.a], out_ty, trig_cache, u.a, true);
                 hoisted_slots[idx] = .{ .reg = dst, .owned = false };
             },
             .binary => |bin| {
@@ -2184,23 +1941,8 @@ fn evalDagVectors(
         ri -= 1;
         if (rem_uses0[ri] == 0) continue;
         if (slots_arr[0][ri] != null or nodeConstF32(prog, env0, @intCast(ri)) != null) continue;
-        switch (prog.nodes.items[ri]) {
-            .load_abs => |la| {
-                rem_uses0[la.x] += 1;
-                rem_uses0[la.y] += 1;
-            },
-            .unary => |u| rem_uses0[u.a] += 1,
-            .binary => |bin| {
-                rem_uses0[bin.a] += 1;
-                rem_uses0[bin.b] += 1;
-            },
-            .ternary => |t| {
-                rem_uses0[t.a] += 1;
-                rem_uses0[t.b] += 1;
-                rem_uses0[t.c] += 1;
-            },
-            else => {},
-        }
+        const children = nodeChildren(prog.nodes.items[ri]);
+        for (children.slice()) |c| rem_uses0[c] += 1;
     }
     inline for (1..count) |s| {
         const r = try allocator.alloc(u32, n_nodes);
@@ -2246,9 +1988,10 @@ fn evalDagVectors(
     const folded_load = try allocator.alloc(bool, n_nodes);
     defer allocator.free(folded_load);
     @memset(folded_load, false);
+    // A live, unslotted, unfused native f32 `.load_clip`/`.load_rel` (`single_use`: exactly one use left).
     const isNativeF32Load = struct {
-        fn run(nodes: []const ast.Node, fmts: []const ast.SampleFormat, types: []const analysis_mod.ValueType, slot_arr: []const ?RegSlot, rem: []const u32, fused: []const bool, idx: ast.NodeIdx) bool {
-            if (rem[idx] != 1 or slot_arr[idx] != null or fused[idx] or types[idx] != .f32) return false;
+        fn run(nodes: []const ast.Node, fmts: []const ast.SampleFormat, types: []const analysis_mod.ValueType, slot_arr: []const ?RegSlot, rem: []const u32, fused: []const bool, idx: ast.NodeIdx, single_use: bool) bool {
+            if ((if (single_use) rem[idx] != 1 else rem[idx] == 0) or slot_arr[idx] != null or fused[idx] or types[idx] != .f32) return false;
             return switch (nodes[idx]) {
                 .load_clip => |clip| fmts[clip].is_float and fmts[clip].bits_per_sample == 32,
                 .load_rel => |rel| fmts[rel.clip].is_float and fmts[rel.clip].bits_per_sample == 32,
@@ -2277,9 +2020,9 @@ fn evalDagVectors(
                 .sub, .min, .max => false,
                 else => continue,
             };
-            if (!folded_load[bin.b] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, bin.b)) {
+            if (!folded_load[bin.b] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, bin.b, true)) {
                 folded_load[bin.b] = true;
-            } else if (is_comm and !folded_load[bin.a] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, bin.a)) {
+            } else if (is_comm and !folded_load[bin.a] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, bin.a, true)) {
                 folded_load[bin.a] = true;
             }
         }
@@ -2289,20 +2032,9 @@ fn evalDagVectors(
     //    on AVX2/AVX-512 folds each L1D load into VEX/EVEX mem-operand ALU; on AArch64 NEON
     //    rematerializes fresh `ldr q` from L1D at each use instead of spilling 24 loads to `[sp]`.
     if ((b.cpu.vec_bytes >= 32 or b.cpu.isa == .neon) and x_mode == .interior and b.cpu.has_fma and info.live_node_count > 48) {
-        const isAnyNativeF32Load = struct {
-            fn run(nodes: []const ast.Node, fmts: []const ast.SampleFormat, types: []const analysis_mod.ValueType, slot_arr: []const ?RegSlot, rem: []const u32, fused: []const bool, idx: ast.NodeIdx) bool {
-                if (rem[idx] == 0 or slot_arr[idx] != null or fused[idx] or types[idx] != .f32) return false;
-                return switch (nodes[idx]) {
-                    .load_clip => |clip| fmts[clip].is_float and fmts[clip].bits_per_sample == 32,
-                    .load_rel => |rel| fmts[rel.clip].is_float and fmts[rel.clip].bits_per_sample == 32,
-                    else => false,
-                };
-            }
-        }.run;
-
         var live_f32_loads: usize = 0;
         for (0..prog.root + 1) |idx| {
-            if (!folded_load[idx] and isAnyNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, @intCast(idx))) {
+            if (!folded_load[idx] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, @intCast(idx), false)) {
                 live_f32_loads += 1;
             }
         }
@@ -2311,7 +2043,7 @@ fn evalDagVectors(
             defer allocator.free(can_remat);
             @memset(can_remat, false);
             for (0..prog.root + 1) |idx| {
-                if (!folded_load[idx] and isAnyNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, @intCast(idx))) {
+                if (!folded_load[idx] and isNativeF32Load(prog.nodes.items, spec.src_fmts, info.value_types.items, slots0, rem_uses0, fused_cmp, @intCast(idx), false)) {
                     can_remat[idx] = true;
                 }
             }
@@ -2513,29 +2245,6 @@ fn evalDagVectors(
         }
     }
 
-    const releaseUse = struct {
-        fn run(rem: []u32, slot_arr: []?RegSlot, idx: ast.NodeIdx) void {
-            if (rem[idx] == 0) return;
-            rem[idx] -= 1;
-            if (rem[idx] == 0) {
-                if (slot_arr[idx]) |s| {
-                    if (s.owned) {
-                        slot_arr[idx] = null;
-                    }
-                }
-            }
-        }
-    }.run;
-
-    const ensureF32 = struct {
-        fn run(builder: *aj.Builder, reg: aj.Reg, ty: analysis_mod.ValueType) aj.Reg {
-            if (ty == .f32) return reg;
-            const dst = builder.newVec();
-            builder.vecOp2(.cvt_i32_to_f32, dst, reg);
-            return dst;
-        }
-    }.run;
-
     const loadMemF32Interior = struct {
         fn run(node: ast.Node, w: i32, disp_px: usize, e: BodyEnv) aj.Mem {
             return switch (node) {
@@ -2551,8 +2260,7 @@ fn evalDagVectors(
         }
     }.run;
 
-    const max_plane_bytes_f32: u64 = @as(u64, spec.height) * std.mem.alignForward(u64, @as(u64, spec.width) * 4 + 64, 64);
-    const can_hw_gather_f32 = max_plane_bytes_f32 <= 0x7FFF_0000;
+    const can_hw_gather_f32 = canHwGatherF32(spec);
     const w_i32_spec: i32 = @intCast(spec.width);
 
     for (schedule.items) |idx| {
@@ -2570,11 +2278,7 @@ fn evalDagVectors(
             const clip: ast.ClipId = if (node == .load_clip) node.load_clip else node.load_rel.clip;
             const fmt = spec.src_fmts[clip];
             const bps: usize = fmt.bytesPerSample();
-            const shift: u8 = switch (bps) {
-                1 => 0,
-                2 => 1,
-                else => 2,
-            };
+            const shift: u8 = bpsShift(bps);
             const mem0 = switch (node) {
                 .load_clip => envs[0].rowMem(envs[0].src_row_ptrs[clip].?, shift, @intCast(col_disps[0] * bps)),
                 .load_rel => |rel| blk: {
@@ -2586,27 +2290,7 @@ fn evalDagVectors(
             };
             const r0 = b.newVec();
             const r1 = b.newVec();
-            if (fmt.is_float) {
-                if (fmt.bits_per_sample == 16) {
-                    b.vecCvtF16ToF32x2(r0, r1, mem0);
-                } else {
-                    b.vecLoadUVecx2(r0, r1, mem0);
-                }
-            } else if (fmt.bits_per_sample <= 16 and out_ty == .f32) {
-                b.vecLoadUintToF32x2(r0, r1, mem0, fmt.bytesPerSample());
-            } else {
-                if (fmt.bits_per_sample <= 8) {
-                    b.vecLoadU8ToU32x2(r0, r1, mem0);
-                } else if (fmt.bits_per_sample <= 16) {
-                    b.vecLoadU16ToU32x2(r0, r1, mem0);
-                } else {
-                    b.vecLoadUVecx2(r0, r1, mem0);
-                }
-                if (out_ty == .f32) {
-                    b.vecOp2(.cvt_i32_to_f32, r0, r0);
-                    b.vecOp2(.cvt_i32_to_f32, r1, r1);
-                }
-            }
+            emitPairLoad(b, r0, r1, mem0, fmt, out_ty);
             slots_arr[0][idx] = .{ .reg = r0, .owned = true };
             slots_arr[1][idx] = .{ .reg = r1, .owned = true };
             continue;
@@ -2627,30 +2311,20 @@ fn evalDagVectors(
 
             switch (node) {
                 .const_f32 => {},
-                .const_i32 => |v| {
-                    if (out_ty == .i32) {
-                        slots[idx] = .{ .reg = b.constI32Splat(v), .owned = false };
-                    }
+                .const_i32, .load_prop, .coord_x, .coord_y, .frame_n, .plane_width, .plane_height => {
+                    if (leafReg(b, env, spec, node, out_ty)) |reg| slots[idx] = .{ .reg = reg, .owned = false };
                 },
                 .load_clip => |clip| {
                     const dst = b.newVec();
                     const fmt = spec.src_fmts[clip];
                     const bps: usize = fmt.bytesPerSample();
-                    const shift: u8 = switch (bps) {
-                        1 => 0,
-                        2 => 1,
-                        else => 2,
-                    };
+                    const shift: u8 = bpsShift(bps);
                     const mem = switch (x_mode) {
                         .const_col => |col| aj.Mem.ptr(env.src_row_ptrs[clip].?, @intCast((col + col_disp) * bps)),
                         .interior => env.rowMem(env.src_row_ptrs[clip].?, shift, @intCast(col_disp * bps)),
                         .dynamic_left, .dynamic_right => aj.Mem.indexed(env.src_row_ptrs[clip].?, env.x_gp, shift, @intCast(col_disp * bps)),
                     };
-                    if (out_ty == .i32) {
-                        pixel.emitLoadI32(b, dst, mem, fmt);
-                    } else {
-                        pixel.emitLoadF32(b, dst, mem, fmt);
-                    }
+                    pixel.emitLoad(b, dst, mem, fmt, out_ty == .i32);
                     slots[idx] = .{ .reg = dst, .owned = true };
                 },
                 .load_rel => |rel| {
@@ -2661,11 +2335,7 @@ fn evalDagVectors(
                 .load_abs => |la| {
                     const fmt = spec.src_fmts[la.clip];
                     const bps: usize = fmt.bytesPerSample();
-                    const shift: u8 = switch (bps) {
-                        1 => 0,
-                        2 => 1,
-                        else => 2,
-                    };
+                    const shift: u8 = bpsShift(bps);
 
                     // Fast contiguous vector load for `X const_y x[]` and `X Y x[]` (zero gather).
                     const direct_row: ?aj.Reg = if (x_mode == .interior or x_mode == .const_col) blk: {
@@ -2689,11 +2359,7 @@ fn evalDagVectors(
                             .dynamic_left, .dynamic_right => unreachable,
                         };
                         const dst = b.newVec();
-                        if (out_ty == .i32) {
-                            pixel.emitLoadI32(b, dst, mem, fmt);
-                        } else {
-                            pixel.emitLoadF32(b, dst, mem, fmt);
-                        }
+                        pixel.emitLoad(b, dst, mem, fmt, out_ty == .i32);
                         slots[idx] = .{ .reg = dst, .owned = true };
                         continue;
                     }
@@ -2706,12 +2372,7 @@ fn evalDagVectors(
                         }
                     }
                     if (ix_reg == null) {
-                        const vx_raw = resolveSlotReg(b, prog, info, env, slots, la.x);
-                        const tx = info.value_types.items[la.x];
-                        const fx = ensureF32(b, vx_raw, tx);
-                        const ix = b.newVec();
-                        emitAbsCoordToI32(b, ix, fx, @intCast(spec.width), la.mode);
-                        if (shift != 0) b.vecOp2i(.sll_u32, ix, ix, shift);
+                        const ix = emitAbsXOffset(b, resolveSlotReg(b, prog, info, env, slots, la.x), info.value_types.items[la.x], spec.width, la.mode, shift);
                         try abs_x_cache.append(allocator, .{ .node = la.x, .mode = la.mode, .shift = shift, .reg = ix });
                         ix_reg = ix;
                     }
@@ -2724,12 +2385,7 @@ fn evalDagVectors(
                         }
                     }
                     if (iy_reg == null) {
-                        const vy_raw = resolveSlotReg(b, prog, info, env, slots, la.y);
-                        const ty = info.value_types.items[la.y];
-                        const fy = ensureF32(b, vy_raw, ty);
-                        const iy = b.newVec();
-                        emitAbsCoordToI32(b, iy, fy, @intCast(spec.height), la.mode);
-                        b.vecOp3(.mul_i32, iy, iy, env.src_stride_vecs[la.clip].?);
+                        const iy = emitAbsYOffset(b, resolveSlotReg(b, prog, info, env, slots, la.y), info.value_types.items[la.y], spec.height, la.mode, env.src_stride_vecs[la.clip].?);
                         try abs_y_cache.append(allocator, .{ .node = la.y, .mode = la.mode, .clip = la.clip, .reg = iy });
                         iy_reg = iy;
                     }
@@ -2744,64 +2400,10 @@ fn evalDagVectors(
                     emitGatherFromBase(b, dst, out_ty, env.base_src_ptrs[la.clip].?, byte_off, fmt, can_hw_gather_f32);
                     slots[idx] = .{ .reg = dst, .owned = true };
                 },
-                .load_prop => |pid| {
-                    slots[idx] = .{ .reg = env.prop_regs[pid], .owned = false };
-                },
-                .coord_x => {
-                    slots[idx] = .{ .reg = env.v_x.?, .owned = false };
-                },
-                .coord_y => {
-                    slots[idx] = .{ .reg = env.v_y.?, .owned = false };
-                },
-                .frame_n => {
-                    slots[idx] = .{ .reg = if (out_ty == .i32) env.v_frame_n_i32.? else env.v_frame_n_f32.?, .owned = false };
-                },
-                .plane_width => {
-                    slots[idx] = .{
-                        .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.width)) else b.constF32Splat(@floatFromInt(spec.width)),
-                        .owned = false,
-                    };
-                },
-                .plane_height => {
-                    slots[idx] = .{
-                        .reg = if (out_ty == .i32) b.constI32Splat(@intCast(spec.height)) else b.constF32Splat(@floatFromInt(spec.height)),
-                        .owned = false,
-                    };
-                },
                 .unary => |u| {
                     const src_reg = resolveSlotReg(b, prog, info, env, slots, u.a);
-                    const src_ty = info.value_types.items[u.a];
                     const dst = b.newVec();
-
-                    if (u.op == .to_f32) {
-                        if (src_ty == .i32) {
-                            b.vecOp2(.cvt_i32_to_f32, dst, src_reg);
-                        } else {
-                            b.vecOp2(.mov, dst, src_reg);
-                        }
-                    } else if (out_ty == .i32 and src_ty == .i32) {
-                        emitUnaryI32(b, u.op, dst, src_reg);
-                    } else if (out_ty == .i32) {
-                        // V7: `not` / `bitnot` on `.f32` operand producing `.i32` under `opt=1`.
-                        emitUnaryF32ToI32(b, u.op, dst, src_reg);
-                    } else {
-                        const a_f = ensureF32(b, src_reg, src_ty);
-                        switch (u.op) {
-                            .sin, .cos => {
-                                const st = trig_cache[u.a] orelse blk: {
-                                    const prepared = math_jit.emitTrigPrepare(b, a_f);
-                                    trig_cache[u.a] = prepared;
-                                    break :blk prepared;
-                                };
-                                switch (u.op) {
-                                    .sin => math_jit.emitSinFromState(b, dst, st),
-                                    .cos => math_jit.emitCosFromState(b, dst, st),
-                                    else => unreachable,
-                                }
-                            },
-                            else => emitUnaryF32(b, u.op, dst, a_f, use_const_mem),
-                        }
-                    }
+                    emitUnaryNode(b, u.op, dst, src_reg, info.value_types.items[u.a], out_ty, trig_cache, u.a, use_const_mem);
                     releaseUse(rem_uses, slots, u.a);
                     slots[idx] = .{ .reg = dst, .owned = true };
                 },
@@ -2814,25 +2416,14 @@ fn evalDagVectors(
                         const a_reg = resolveSlotReg(b, prog, info, env, slots, bin.a);
                         const b_reg = resolveSlotReg(b, prog, info, env, slots, bin.b);
                         if (bin.op == .mul) {
-                            if (prog.nodes.items[bin.b] == .const_i32 and prog.nodes.items[bin.b].const_i32 > 0) {
-                                const iv: u32 = @intCast(prog.nodes.items[bin.b].const_i32);
-                                if (std.math.isPowerOfTwo(iv)) {
-                                    const sh: u5 = @intCast(@ctz(iv));
-                                    if (sh == 0) b.vecOp2(.mov, dst, a_reg) else if (sh == 1) b.vecOp3(.add_i32, dst, a_reg, a_reg) else b.vecOp2i(.sll_u32, dst, a_reg, sh);
-                                } else {
-                                    b.vecOp3(.mul_i32, dst, a_reg, b_reg);
-                                }
-                            } else if (prog.nodes.items[bin.a] == .const_i32 and prog.nodes.items[bin.a].const_i32 > 0) {
-                                const iv: u32 = @intCast(prog.nodes.items[bin.a].const_i32);
-                                if (std.math.isPowerOfTwo(iv)) {
-                                    const sh: u5 = @intCast(@ctz(iv));
-                                    if (sh == 0) b.vecOp2(.mov, dst, b_reg) else if (sh == 1) b.vecOp3(.add_i32, dst, b_reg, b_reg) else b.vecOp2i(.sll_u32, dst, b_reg, sh);
-                                } else {
-                                    b.vecOp3(.mul_i32, dst, a_reg, b_reg);
-                                }
-                            } else {
-                                b.vecOp3(.mul_i32, dst, a_reg, b_reg);
-                            }
+                            const nodes = prog.nodes.items;
+                            const shifted = if (nodes[bin.b] == .const_i32 and nodes[bin.b].const_i32 > 0)
+                                emitMulPow2I32(b, dst, a_reg, nodes[bin.b].const_i32)
+                            else if (nodes[bin.a] == .const_i32 and nodes[bin.a].const_i32 > 0)
+                                emitMulPow2I32(b, dst, b_reg, nodes[bin.a].const_i32)
+                            else
+                                false;
+                            if (!shifted) b.vecOp3(.mul_i32, dst, a_reg, b_reg);
                         } else {
                             emitBinaryI32(b, bin.op, dst, a_reg, b_reg);
                         }
@@ -2862,45 +2453,21 @@ fn evalDagVectors(
                         // vector register on low-pressure chains instead of reloading `[rip+off]` repeatedly.
                         const ca = if (!handled and use_const_mem and !folded_load[bin.b] and (!pin_hot_const or info.use_counts.items[bin.a] < 6)) nodeConstF32(prog, env, bin.a) else null;
                         const cb = if (!handled and use_const_mem and !folded_load[bin.a] and (!pin_hot_const or info.use_counts.items[bin.b] < 6)) nodeConstF32(prog, env, bin.b) else null;
-                        if (cb) |cv| {
-                            switch (bin.op) {
-                                .add => {
-                                    b.vecAddCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                    handled = true;
-                                },
-                                .sub => {
-                                    b.vecSubCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                    handled = true;
-                                },
-                                .mul => {
-                                    b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                    handled = true;
-                                },
-                                .min => {
-                                    b.vecMinCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                    handled = true;
-                                },
-                                .max => {
-                                    b.vecMaxCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
-                                    handled = true;
-                                },
-                                else => {},
-                            }
-                        }
-                        if (!handled and ca != null) {
-                            const cv = ca.?;
-                            switch (bin.op) {
-                                .add => {
-                                    b.vecAddCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb), cv);
-                                    handled = true;
-                                },
-                                .mul => {
-                                    b.vecMulCF32(dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb), cv);
-                                    handled = true;
-                                },
-                                else => {},
-                            }
-                        }
+                        if (cb) |cv| switch (bin.op) {
+                            .add, .sub, .mul, .min, .max => {
+                                emitBinaryCF32(b, bin.op, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.a), ta), cv);
+                                handled = true;
+                            },
+                            else => {},
+                        };
+                        // Only the commutative ops take the constant on the left.
+                        if (!handled and ca != null) switch (bin.op) {
+                            .add, .mul => {
+                                emitBinaryCF32(b, bin.op, dst, ensureF32(b, resolveSlotReg(b, prog, info, env, slots, bin.b), tb), ca.?);
+                                handled = true;
+                            },
+                            else => {},
+                        };
                         if (!handled and bin.op == .mod) {
                             if (nodeConstF32(prog, env, bin.b)) |mod_c| {
                                 if (isExactPow2Divisor(mod_c)) {
@@ -3160,6 +2727,32 @@ fn evalDagVectors(
     return results;
 }
 
+/// NEON paired load of `2 * f32_lanes` contiguous pixels at `mem` into `r0`/`r1` as `out_ty`
+/// (`ldr d/q + ushll/ushll2`, `fcvtl/fcvtl2`, or `ldp`).
+fn emitPairLoad(b: *aj.Builder, r0: aj.Reg, r1: aj.Reg, mem: aj.Mem, fmt: ast.SampleFormat, out_ty: analysis_mod.ValueType) void {
+    if (fmt.is_float) {
+        if (fmt.bits_per_sample == 16) {
+            b.vecCvtF16ToF32x2(r0, r1, mem);
+        } else {
+            b.vecLoadUVecx2(r0, r1, mem);
+        }
+    } else if (fmt.bits_per_sample <= 16 and out_ty == .f32) {
+        b.vecLoadUintToF32x2(r0, r1, mem, fmt.bytesPerSample());
+    } else {
+        if (fmt.bits_per_sample <= 8) {
+            b.vecLoadU8ToU32x2(r0, r1, mem);
+        } else if (fmt.bits_per_sample <= 16) {
+            b.vecLoadU16ToU32x2(r0, r1, mem);
+        } else {
+            b.vecLoadUVecx2(r0, r1, mem);
+        }
+        if (out_ty == .f32) {
+            b.vecOp2(.cvt_i32_to_f32, r0, r0);
+            b.vecOp2(.cvt_i32_to_f32, r1, r1);
+        }
+    }
+}
+
 fn emitDagBody(
     allocator: std.mem.Allocator,
     b: *aj.Builder,
@@ -3176,29 +2769,20 @@ fn emitDagBody(
     const use_const_mem = info.live_node_count > const_mem_thresh or info.uses_abs_access;
     const root_reg = try evalDagVector(allocator, b, prog, info, spec, env, x_mode, 0, use_const_mem, null);
     const dst_bps: usize = spec.dst_fmt.bytesPerSample();
-    const dst_shift: u8 = switch (dst_bps) {
-        1 => 0,
-        2 => 1,
-        else => 2,
-    };
     const dst_mem = switch (x_mode) {
         .const_col => |col| aj.Mem.ptr(env.dst_ptr, @intCast(col * dst_bps)),
-        .interior => env.rowMem(env.dst_ptr, dst_shift, 0),
-        .dynamic_left, .dynamic_right => aj.Mem.indexed(env.dst_ptr, env.x_gp, dst_shift, 0),
+        .interior => dstInteriorMem(env, spec, 0),
+        .dynamic_left, .dynamic_right => aj.Mem.indexed(env.dst_ptr, env.x_gp, bpsShift(dst_bps), 0),
     };
-    if (info.value_types.items[prog.root] == .i32) {
-        pixel.emitStoreI32(b, dst_mem, root_reg, spec.dst_fmt);
-    } else {
-        pixel.emitStoreF32(b, dst_mem, root_reg, spec.dst_fmt);
-    }
+    pixel.emitStore(b, dst_mem, root_reg, spec.dst_fmt, info.value_types.items[prog.root] == .i32);
 }
 
-/// 2x unrolled interior body evaluating `x` and `x + f32_lanes`,
-/// pairing `f16`/`f32`/`u32` NEON loads and `u8`/`u16`/`f16`/`f32`/`u32` stores.
 /// Largest body (`live_node_count`) that converts NEON u8/u16 loads with the 2^23 bias
 /// sequence; past it, the two extra pinned constants cost spills (kirsch p8: 14 -> 21 stores).
 const neon_bias_load_max_nodes = 48;
 
+/// 2x unrolled interior body evaluating `x` and `x + f32_lanes`,
+/// pairing `f16`/`f32`/`u32` NEON loads and `u8`/`u16`/`f16`/`f32`/`u32` stores.
 fn emitDagBodyX2(
     allocator: std.mem.Allocator,
     b: *aj.Builder,
@@ -3206,8 +2790,7 @@ fn emitDagBodyX2(
     info: *const analysis_mod.Analysis,
     spec: CompileSpec,
     env: BodyEnv,
-    v_lane_step_f32: ?aj.Reg,
-    v_lane_step_i32: ?aj.Reg,
+    xl: XLanes,
     interleave: bool,
 ) std.mem.Allocator.Error!void {
     const lanes: usize = b.cpu.f32_lanes;
@@ -3233,7 +2816,7 @@ fn emitDagBodyX2(
             const is_u8_pair = !fmt.is_float and fmt.bits_per_sample <= 8;
             const is_u16_pair = !fmt.is_float and fmt.bits_per_sample > 8 and fmt.bits_per_sample <= 16;
             const is_f16_pair = fmt.is_float and fmt.bits_per_sample == 16;
-            const is_32_pair = env.use_pair_mem and fmt.bits_per_sample == 32;
+            const is_32_pair = env.use_running_ptrs and fmt.bits_per_sample == 32;
             if (!is_u8_pair and !is_u16_pair and !is_f16_pair and !is_32_pair) continue;
 
             if (!any_pair) {
@@ -3245,29 +2828,11 @@ fn emitDagBodyX2(
             }
             const clip = node.load_clip;
             const bps = fmt.bytesPerSample();
-            const shift: u8 = switch (bps) {
-                1 => 0,
-                2 => 1,
-                else => 2,
-            };
+            const shift: u8 = bpsShift(bps);
             const mem0 = env.rowMem(env.src_row_ptrs[clip].?, shift, 0);
             const r0 = b.newVec();
             const r1 = b.newVec();
-            if ((is_u8_pair or is_u16_pair) and info.value_types.items[idx] == .f32) {
-                b.vecLoadUintToF32x2(r0, r1, mem0, bps);
-            } else if (is_u8_pair) {
-                b.vecLoadU8ToU32x2(r0, r1, mem0);
-            } else if (is_u16_pair) {
-                b.vecLoadU16ToU32x2(r0, r1, mem0);
-            } else if (is_f16_pair) {
-                b.vecCvtF16ToF32x2(r0, r1, mem0);
-            } else {
-                b.vecLoadUVecx2(r0, r1, mem0);
-                if (!fmt.is_float and info.value_types.items[idx] == .f32) {
-                    b.vecOp2(.cvt_i32_to_f32, r0, r0);
-                    b.vecOp2(.cvt_i32_to_f32, r1, r1);
-                }
-            }
+            emitPairLoad(b, r0, r1, mem0, fmt, info.value_types.items[idx]);
             pre0.?[idx] = r0;
             pre1.?[idx] = r1;
         }
@@ -3283,9 +2848,9 @@ fn emitDagBodyX2(
     if (env.v_x) |vx0| {
         const vx1 = b.newVec();
         if (prog.opt_int) {
-            b.vecOp3(.add_i32, vx1, vx0, v_lane_step_i32.?);
+            b.vecOp3(.add_i32, vx1, vx0, xl.step_i32.?);
         } else {
-            b.vecOp3(.add_f32, vx1, vx0, v_lane_step_f32.?);
+            b.vecOp3(.add_f32, vx1, vx0, xl.step_f32.?);
         }
         env1.v_x = vx1;
     }
@@ -3301,23 +2866,17 @@ fn emitDagBodyX2(
         res1 = try evalDagVector(allocator, b, prog, info, spec, env1, .interior, lanes, use_const_mem, pre1);
     }
 
-    const dst_bps: usize = spec.dst_fmt.bytesPerSample();
-    const dst_shift: u8 = switch (dst_bps) {
-        1 => 0,
-        2 => 1,
-        else => 2,
-    };
-    const dst_mem0 = env.rowMem(env.dst_ptr, dst_shift, 0);
-    const dst_mem1 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * dst_bps));
+    const dst_mem0 = dstInteriorMem(env, spec, 0);
+    const dst_mem1 = dstInteriorMem(env, spec, lanes);
     if (info.value_types.items[prog.root] == .i32) {
-        pixel.emitStoreI32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt, env.use_pair_mem);
+        pixel.emitStoreI32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt, env.use_running_ptrs);
     } else {
-        pixel.emitStoreF32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt, env.use_pair_mem);
+        pixel.emitStoreF32x2(b, dst_mem0, dst_mem1, res0, res1, spec.dst_fmt, env.use_running_ptrs);
     }
 }
 
-/// 4x interleaved interior body for narrow serial FP chains on 32-register AArch64 NEON
-/// (16 pixels/iteration lockstep, zero spills).
+/// 4x interleaved interior body for narrow serial FP chains on 32-register ISAs (AArch64 NEON,
+/// AVX-512): `4 * f32_lanes` pixels per iteration in lockstep, zero spills.
 fn emitDagBodyX4(
     allocator: std.mem.Allocator,
     b: *aj.Builder,
@@ -3326,9 +2885,7 @@ fn emitDagBodyX4(
     spec: CompileSpec,
     env: BodyEnv,
     v_lane_step_f32: ?aj.Reg,
-    v_lane_step_i32: ?aj.Reg,
 ) std.mem.Allocator.Error!void {
-    _ = v_lane_step_i32;
     const lanes: usize = b.cpu.f32_lanes;
     const use_const_mem = info.live_node_count > 24;
 
@@ -3359,18 +2916,8 @@ fn emitDagBodyX4(
         .{ null, null, null, null },
     );
 
-    const dst_bps: usize = spec.dst_fmt.bytesPerSample();
-    const dst_shift: u8 = switch (dst_bps) {
-        1 => 0,
-        2 => 1,
-        else => 2,
-    };
-    const m0 = env.rowMem(env.dst_ptr, dst_shift, 0);
-    const m1 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * dst_bps));
-    const m2 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * 2 * dst_bps));
-    const m3 = env.rowMem(env.dst_ptr, dst_shift, @intCast(lanes * 3 * dst_bps));
-    pixel.emitStoreF32x2(b, m0, m1, res[0], res[1], spec.dst_fmt, env.use_pair_mem);
-    pixel.emitStoreF32x2(b, m2, m3, res[2], res[3], spec.dst_fmt, env.use_pair_mem);
+    pixel.emitStoreF32x2(b, dstInteriorMem(env, spec, 0), dstInteriorMem(env, spec, lanes), res[0], res[1], spec.dst_fmt, env.use_running_ptrs);
+    pixel.emitStoreF32x2(b, dstInteriorMem(env, spec, lanes * 2), dstInteriorMem(env, spec, lanes * 3), res[2], res[3], spec.dst_fmt, env.use_running_ptrs);
 }
 
 fn emitUnaryF32(b: *aj.Builder, op: ast.UnaryOp, dst: aj.Reg, a: aj.Reg, use_const_mem: bool) void {
@@ -3469,76 +3016,51 @@ fn emitUnaryI32(b: *aj.Builder, op: ast.UnaryOp, dst: aj.Reg, a: aj.Reg) void {
     }
 }
 
+/// The `u32` vector op of a logical (`and_op`/`or_op`/`xor_op`) or bitwise (`bitand`/`bitor`/`bitxor`) op.
+fn bitwiseVecOp(op: ast.BinaryOp) aj.VecOp3 {
+    return switch (op) {
+        .and_op, .bitand => .and_u32,
+        .or_op, .bitor => .or_u32,
+        .xor_op, .bitxor => .xor_u32,
+        else => unreachable,
+    };
+}
+
+/// Lane mask of a logical op: combine `a > 0` and `rhs > 0` (compared with `cmp_gt`).
+fn emitLogicMask(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, rhs: aj.Reg, cmp_gt: aj.VecOp3) void {
+    const zero = b.vecZero();
+    const ma = b.newVec();
+    const mb = b.newVec();
+    b.vecOp3(cmp_gt, ma, a, zero);
+    b.vecOp3(cmp_gt, mb, rhs, zero);
+    b.vecOp3(bitwiseVecOp(op), dst, ma, mb);
+}
+
+/// Lane mask of an f32 comparison or logical op.
+fn emitMaskF32(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, rhs: aj.Reg) void {
+    if (cmpBinOpToVecOp(op)) |cmp_op| {
+        b.vecOp3(cmp_op, dst, a, rhs);
+    } else {
+        emitLogicMask(b, op, dst, a, rhs, .cmp_gt_f32);
+    }
+}
+
+/// Bitwise op on f32 operands rounded to i32 (i32 result).
+fn emitRoundedBitwise(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, rhs: aj.Reg) void {
+    const ia = b.newVec();
+    const ib = b.newVec();
+    b.vecOp2(.cvt_round_f32_to_i32, ia, a);
+    b.vecOp2(.cvt_round_f32_to_i32, ib, rhs);
+    b.vecOp3(bitwiseVecOp(op), dst, ia, ib);
+}
+
 fn emitBinaryF32ToI32(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, rhs: aj.Reg) void {
     switch (op) {
-        .lt => {
-            b.vecOp3(.cmp_lt_f32, dst, a, rhs);
+        .lt, .le, .gt, .ge, .eq, .and_op, .or_op, .xor_op => {
+            emitMaskF32(b, op, dst, a, rhs);
             b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
         },
-        .le => {
-            b.vecOp3(.cmp_le_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .gt => {
-            b.vecOp3(.cmp_gt_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .ge => {
-            b.vecOp3(.cmp_ge_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .eq => {
-            b.vecOp3(.cmp_eq_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .and_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_f32, ma, a, zero);
-            b.vecOp3(.cmp_gt_f32, mb, rhs, zero);
-            b.vecOp3(.and_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .or_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_f32, ma, a, zero);
-            b.vecOp3(.cmp_gt_f32, mb, rhs, zero);
-            b.vecOp3(.or_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .xor_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_f32, ma, a, zero);
-            b.vecOp3(.cmp_gt_f32, mb, rhs, zero);
-            b.vecOp3(.xor_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .bitand => {
-            const ia = b.newVec();
-            const ib = b.newVec();
-            b.vecOp2(.cvt_round_f32_to_i32, ia, a);
-            b.vecOp2(.cvt_round_f32_to_i32, ib, rhs);
-            b.vecOp3(.and_u32, dst, ia, ib);
-        },
-        .bitor => {
-            const ia = b.newVec();
-            const ib = b.newVec();
-            b.vecOp2(.cvt_round_f32_to_i32, ia, a);
-            b.vecOp2(.cvt_round_f32_to_i32, ib, rhs);
-            b.vecOp3(.or_u32, dst, ia, ib);
-        },
-        .bitxor => {
-            const ia = b.newVec();
-            const ib = b.newVec();
-            b.vecOp2(.cvt_round_f32_to_i32, ia, a);
-            b.vecOp2(.cvt_round_f32_to_i32, ib, rhs);
-            b.vecOp3(.xor_u32, dst, ia, ib);
-        },
+        .bitand, .bitor, .bitxor => emitRoundedBitwise(b, op, dst, a, rhs),
         else => unreachable,
     }
 }
@@ -3572,75 +3094,12 @@ fn emitBinaryF32(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, rhs: 
             b.vecOp3(.and_u32, sgn, rhs, b.constI32Splat(@bitCast(@as(u32, 0x8000_0000))));
             b.vecOp3(.or_u32, dst, mag, sgn);
         },
-        .lt => {
-            b.vecOp3(.cmp_lt_f32, dst, a, rhs);
+        .lt, .le, .gt, .ge, .eq, .and_op, .or_op, .xor_op => {
+            emitMaskF32(b, op, dst, a, rhs);
             b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
         },
-        .le => {
-            b.vecOp3(.cmp_le_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
-        },
-        .gt => {
-            b.vecOp3(.cmp_gt_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
-        },
-        .ge => {
-            b.vecOp3(.cmp_ge_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
-        },
-        .eq => {
-            b.vecOp3(.cmp_eq_f32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
-        },
-        .and_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_f32, ma, a, zero);
-            b.vecOp3(.cmp_gt_f32, mb, rhs, zero);
-            b.vecOp3(.and_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
-        },
-        .or_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_f32, ma, a, zero);
-            b.vecOp3(.cmp_gt_f32, mb, rhs, zero);
-            b.vecOp3(.or_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
-        },
-        .xor_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_f32, ma, a, zero);
-            b.vecOp3(.cmp_gt_f32, mb, rhs, zero);
-            b.vecOp3(.xor_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constF32Splat(1.0));
-        },
-        .bitand => {
-            const ia = b.newVec();
-            const ib = b.newVec();
-            b.vecOp2(.cvt_round_f32_to_i32, ia, a);
-            b.vecOp2(.cvt_round_f32_to_i32, ib, rhs);
-            b.vecOp3(.and_u32, dst, ia, ib);
-            b.vecOp2(.cvt_i32_to_f32, dst, dst);
-        },
-        .bitor => {
-            const ia = b.newVec();
-            const ib = b.newVec();
-            b.vecOp2(.cvt_round_f32_to_i32, ia, a);
-            b.vecOp2(.cvt_round_f32_to_i32, ib, rhs);
-            b.vecOp3(.or_u32, dst, ia, ib);
-            b.vecOp2(.cvt_i32_to_f32, dst, dst);
-        },
-        .bitxor => {
-            const ia = b.newVec();
-            const ib = b.newVec();
-            b.vecOp2(.cvt_round_f32_to_i32, ia, a);
-            b.vecOp2(.cvt_round_f32_to_i32, ib, rhs);
-            b.vecOp3(.xor_u32, dst, ia, ib);
+        .bitand, .bitor, .bitxor => {
+            emitRoundedBitwise(b, op, dst, a, rhs);
             b.vecOp2(.cvt_i32_to_f32, dst, dst);
         },
     }
@@ -3653,58 +3112,18 @@ fn emitBinaryI32(b: *aj.Builder, op: ast.BinaryOp, dst: aj.Reg, a: aj.Reg, rhs: 
         .mul => b.vecOp3(.mul_i32, dst, a, rhs),
         .min => b.vecOp3(.min_i32, dst, a, rhs),
         .max => b.vecOp3(.max_i32, dst, a, rhs),
-        .lt => {
-            b.vecOp3(.cmp_gt_i32, dst, rhs, a);
+        .lt, .le, .gt, .ge, .eq, .and_op, .or_op, .xor_op => {
+            switch (op) {
+                // `a < b` is `b > a`; `<=`/`>=` invert the opposite strict compare.
+                .lt, .ge => b.vecOp3(.cmp_gt_i32, dst, rhs, a),
+                .gt, .le => b.vecOp3(.cmp_gt_i32, dst, a, rhs),
+                .eq => b.vecOp3(.cmp_eq_i32, dst, a, rhs),
+                else => emitLogicMask(b, op, dst, a, rhs, .cmp_gt_i32),
+            }
+            if (op == .le or op == .ge) b.vecOp2(.not_u32, dst, dst);
             b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
         },
-        .le => {
-            b.vecOp3(.cmp_gt_i32, dst, a, rhs);
-            b.vecOp2(.not_u32, dst, dst);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .gt => {
-            b.vecOp3(.cmp_gt_i32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .ge => {
-            b.vecOp3(.cmp_gt_i32, dst, rhs, a);
-            b.vecOp2(.not_u32, dst, dst);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .eq => {
-            b.vecOp3(.cmp_eq_i32, dst, a, rhs);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .and_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_i32, ma, a, zero);
-            b.vecOp3(.cmp_gt_i32, mb, rhs, zero);
-            b.vecOp3(.and_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .or_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_i32, ma, a, zero);
-            b.vecOp3(.cmp_gt_i32, mb, rhs, zero);
-            b.vecOp3(.or_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .xor_op => {
-            const zero = b.vecZero();
-            const ma = b.newVec();
-            const mb = b.newVec();
-            b.vecOp3(.cmp_gt_i32, ma, a, zero);
-            b.vecOp3(.cmp_gt_i32, mb, rhs, zero);
-            b.vecOp3(.xor_u32, dst, ma, mb);
-            b.vecOp3(.and_u32, dst, dst, b.constI32Splat(1));
-        },
-        .bitand => b.vecOp3(.and_u32, dst, a, rhs),
-        .bitor => b.vecOp3(.or_u32, dst, a, rhs),
-        .bitxor => b.vecOp3(.xor_u32, dst, a, rhs),
+        .bitand, .bitor, .bitxor => b.vecOp3(bitwiseVecOp(op), dst, a, rhs),
         else => unreachable,
     }
 }
@@ -3728,16 +3147,32 @@ fn emitTernaryF32(b: *aj.Builder, op: ast.TernaryOp, dst: aj.Reg, a: aj.Reg, b_r
 // Host-free JIT-vs-oracle bit-exact tests (Phase 2a + 2b + Phase 3 spatial/f16)
 // ============================================================================
 
-fn verifyBitExactF32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str: []const u8, width: usize, height: usize) !void {
+/// Compile `expr_str` for `cpu` over two `src_fmt` clips (`srcs`, sharing `src_stride`), run the
+/// kernel and the scalar oracle into `D` planes of `dst_fmt`, and expect bit-identical pixels
+/// (any NaN matches a NaN when `D` is `f32`).
+fn expectJitMatchesOracle(
+    comptime D: type,
+    allocator: std.mem.Allocator,
+    cpu: cpu_mod.CpuInfo,
+    expr_str: []const u8,
+    opt_int: bool,
+    src_fmt: ast.SampleFormat,
+    dst_fmt: ast.SampleFormat,
+    width: usize,
+    height: usize,
+    srcs: [2][*]const u8,
+    src_stride: isize,
+    frame_n: i32,
+    props: []const f32,
+) !void {
     const parser = @import("../expr/parser.zig");
     const lower_mod = @import("../expr/lower.zig");
     const optimize_mod = @import("../expr/optimize.zig");
 
     const profile = interp.TargetProfile.fromCpu(cpu);
-    const fmt = ast.SampleFormat{ .is_float = true, .bits_per_sample = 32 };
-    const fmts = [_]ast.SampleFormat{ fmt, fmt };
+    const fmts = [_]ast.SampleFormat{ src_fmt, src_fmt };
 
-    var prog = try parser.parse(allocator, expr_str, .{ .num_clips = 2 });
+    var prog = try parser.parse(allocator, expr_str, .{ .num_clips = 2, .opt_int = opt_int });
     defer prog.deinit(allocator);
     try lower_mod.lower(allocator, &prog, profile);
     try optimize_mod.optimize(allocator, &prog, profile, .{
@@ -3745,8 +3180,13 @@ fn verifyBitExactF32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_st
         .enable_fma = profile.use_fma,
     });
 
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
+    var info = try analysis_mod.analyze(allocator, &prog, &fmts, dst_fmt, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
     defer info.deinit(allocator);
+    if (!src_fmt.is_float and src_fmt.bits_per_sample == 32) {
+        // 32-bit integer inputs must never be routed into the 65536-entry u16 LUT.
+        try std.testing.expectEqual(analysis_mod.LutKind.none, info.lut_kind);
+        try std.testing.expectEqual(analysis_mod.LutKind.none, info.fallback_lut_kind);
+    }
 
     var rt = try aj.Runtime.init();
     defer rt.deinit();
@@ -3755,69 +3195,44 @@ fn verifyBitExactF32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_st
         .width = width,
         .height = height,
         .src_fmts = &fmts,
-        .dst_fmt = fmt,
+        .dst_fmt = dst_fmt,
     });
     defer compiled.deinit(allocator, &rt);
 
-    const stride_elems = std.mem.alignForward(usize, width, 16);
-    const stride_bytes: isize = @intCast(stride_elems * 4);
-    const total = stride_elems * height;
-
-    const src0 = try allocator.alignedAlloc(f32, .@"64", total);
-    defer allocator.free(src0);
-    const src1 = try allocator.alignedAlloc(f32, .@"64", total);
-    defer allocator.free(src1);
-    const dst_jit = try allocator.alignedAlloc(f32, .@"64", total);
+    // 64-byte rows: the widest frame alignment (AVX-512).
+    const dst_stride_elems = std.mem.alignForward(usize, width, 64 / @sizeOf(D));
+    const dst_stride: isize = @intCast(dst_stride_elems * @sizeOf(D));
+    const dst_jit = try allocator.alignedAlloc(D, .@"64", dst_stride_elems * height);
     defer allocator.free(dst_jit);
-    const dst_ref = try allocator.alignedAlloc(f32, .@"64", total);
+    const dst_ref = try allocator.alignedAlloc(D, .@"64", dst_stride_elems * height);
     defer allocator.free(dst_ref);
-
-    // Include quiet NaN and signaling NaN (V10) alongside edge values.
-    const snan: f32 = @bitCast(@as(u32, 0x7FA0_0001));
-    const edge_vals = [_]f32{
-        -10.5,             -2.5, -1.5,              -0.5,
-        -0.3,              -0.0, 0.0,               0.1,
-        0.5,               1.5,  2.5,               10.7,
-        std.math.nan(f32), snan, std.math.inf(f32), -std.math.inf(f32),
-        1e10,              0.25,
-    };
-    // M3: cover every single edge value on x and y (and all n*n pairs when width*height >= n*n).
-    const n_edge = edge_vals.len;
-    for (0..height) |y| {
-        for (0..stride_elems) |x| {
-            const dst_idx = y * stride_elems + x;
-            const pair_idx = y * width + @min(x, width - 1);
-            src0[dst_idx] = edge_vals[pair_idx % n_edge];
-            src1[dst_idx] = edge_vals[(pair_idx + pair_idx / n_edge) % n_edge];
-            dst_jit[dst_idx] = -777.0;
-            dst_ref[dst_idx] = -777.0;
-        }
+    if (D == f32) {
+        @memset(dst_jit, -777.0);
+        @memset(dst_ref, -777.0);
     }
 
-    const srcs = [_][*]const u8{ @ptrCast(src0.ptr), @ptrCast(src1.ptr) };
-    const strides = [_]isize{ stride_bytes, stride_bytes };
-    const props = [_]f32{ 3.25, -1.5 };
-
-    compiled.kernel.func(@ptrCast(dst_jit.ptr), stride_bytes, &srcs, &strides, 7, &props);
+    const strides = [_]isize{ src_stride, src_stride };
+    compiled.kernel.func(@ptrCast(dst_jit.ptr), dst_stride, &srcs, &strides, frame_n, if (props.len == 0) null else props.ptr);
     try interp.evalPlane(allocator, &prog, profile, .{
         .dst = @ptrCast(dst_ref.ptr),
-        .dst_stride = stride_bytes,
-        .dst_fmt = fmt,
+        .dst_stride = dst_stride,
+        .dst_fmt = dst_fmt,
         .srcs = &srcs,
         .src_strides = &strides,
         .src_fmts = &fmts,
         .width = width,
         .height = height,
-        .frame_n = 7,
-        .props = &props,
+        .frame_n = frame_n,
+        .props = props,
     });
 
     for (0..height) |y| {
         for (0..width) |x| {
-            const idx = y * stride_elems + x;
-            const g = dst_jit[idx];
-            const e = dst_ref[idx];
-            if (std.math.isNan(e)) {
+            const e = dst_ref[y * dst_stride_elems + x];
+            const g = dst_jit[y * dst_stride_elems + x];
+            if (D != f32) {
+                try std.testing.expectEqual(e, g);
+            } else if (std.math.isNan(e)) {
                 try std.testing.expect(std.math.isNan(g));
             } else {
                 const gb: u32 = @bitCast(g);
@@ -3833,47 +3248,67 @@ fn verifyBitExactF32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_st
     }
 }
 
+/// Two 64-byte-aligned `T` source planes with 16-element (64-byte) rows, filled over `[0, width)`
+/// so every edge value appears on both clips and, given `width * height >= n * n`, every pair.
+fn fillEdgePairs(comptime T: type, allocator: std.mem.Allocator, edge_vals: []const T, width: usize, height: usize) ![2][]align(64) T {
+    const stride = std.mem.alignForward(usize, width, 16);
+    const src0 = try allocator.alignedAlloc(T, .@"64", stride * height);
+    errdefer allocator.free(src0);
+    const src1 = try allocator.alignedAlloc(T, .@"64", stride * height);
+    const n_edge = edge_vals.len;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const idx = y * width + x;
+            src0[y * stride + x] = edge_vals[idx % n_edge];
+            src1[y * stride + x] = edge_vals[(idx + idx / n_edge) % n_edge];
+        }
+    }
+    return .{ src0, src1 };
+}
+
+fn verifyBitExactF32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str: []const u8, width: usize, height: usize) !void {
+    const fmt = ast.SampleFormat{ .is_float = true, .bits_per_sample = 32 };
+    const stride_elems = std.mem.alignForward(usize, width, 16);
+    const total = stride_elems * height;
+
+    const src0 = try allocator.alignedAlloc(f32, .@"64", total);
+    defer allocator.free(src0);
+    const src1 = try allocator.alignedAlloc(f32, .@"64", total);
+    defer allocator.free(src1);
+
+    // Include quiet NaN and signaling NaN (V10) alongside edge values.
+    const snan: f32 = @bitCast(@as(u32, 0x7FA0_0001));
+    const edge_vals = [_]f32{
+        -10.5,             -2.5, -1.5,              -0.5,
+        -0.3,              -0.0, 0.0,               0.1,
+        0.5,               1.5,  2.5,               10.7,
+        std.math.nan(f32), snan, std.math.inf(f32), -std.math.inf(f32),
+        1e10,              0.25,
+    };
+    // M3: cover every single edge value on x and y (and all n*n pairs when width*height >= n*n);
+    // the row padding repeats the last pixel.
+    const n_edge = edge_vals.len;
+    for (0..height) |y| {
+        for (0..stride_elems) |x| {
+            const pair_idx = y * width + @min(x, width - 1);
+            src0[y * stride_elems + x] = edge_vals[pair_idx % n_edge];
+            src1[y * stride_elems + x] = edge_vals[(pair_idx + pair_idx / n_edge) % n_edge];
+        }
+    }
+
+    const srcs = [_][*]const u8{ @ptrCast(src0.ptr), @ptrCast(src1.ptr) };
+    const props = [_]f32{ 3.25, -1.5 };
+    try expectJitMatchesOracle(f32, allocator, cpu, expr_str, false, fmt, fmt, width, height, srcs, @intCast(stride_elems * 4), 7, &props);
+}
+
 fn verifyBitExactU8(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str: []const u8, width: usize, height: usize, opt_int: bool) !void {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-
-    const profile = interp.TargetProfile.fromCpu(cpu);
     const fmt8 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 8 };
-    const fmts = [_]ast.SampleFormat{ fmt8, fmt8 };
-
-    var prog = try parser.parse(allocator, expr_str, .{ .num_clips = 2, .opt_int = opt_int });
-    defer prog.deinit(allocator);
-    try lower_mod.lower(allocator, &prog, profile);
-    try optimize_mod.optimize(allocator, &prog, profile, .{
-        .enable_value_changing = true,
-        .enable_fma = profile.use_fma,
-    });
-
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
-    defer info.deinit(allocator);
-
-    var rt = try aj.Runtime.init();
-    defer rt.deinit();
-
-    var compiled = try compilePlane(allocator, &rt, cpu, &prog, &info, .{
-        .width = width,
-        .height = height,
-        .src_fmts = &fmts,
-        .dst_fmt = fmt8,
-    });
-    defer compiled.deinit(allocator, &rt);
-
     const stride_u8 = std.mem.alignForward(usize, width, 64);
 
     const src0 = try allocator.alignedAlloc(u8, .@"64", stride_u8 * height);
     defer allocator.free(src0);
     const src1 = try allocator.alignedAlloc(u8, .@"64", stride_u8 * height);
     defer allocator.free(src1);
-    const dst_jit = try allocator.alignedAlloc(u8, .@"64", stride_u8 * height);
-    defer allocator.free(dst_jit);
-    const dst_ref = try allocator.alignedAlloc(u8, .@"64", stride_u8 * height);
-    defer allocator.free(dst_ref);
 
     for (0..height) |y| {
         for (0..width) |x| {
@@ -3883,161 +3318,35 @@ fn verifyBitExactU8(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str
     }
 
     const srcs = [_][*]const u8{ src0.ptr, src1.ptr };
-    const strides = [_]isize{ @intCast(stride_u8), @intCast(stride_u8) };
-
-    compiled.kernel.func(dst_jit.ptr, @intCast(stride_u8), &srcs, &strides, 0, null);
-    try interp.evalPlane(allocator, &prog, profile, .{
-        .dst = dst_ref.ptr,
-        .dst_stride = @intCast(stride_u8),
-        .dst_fmt = fmt8,
-        .srcs = &srcs,
-        .src_strides = &strides,
-        .src_fmts = &fmts,
-        .width = width,
-        .height = height,
-        .frame_n = 0,
-        .props = &.{},
-    });
-
-    for (0..height) |y| {
-        for (0..width) |x| {
-            try std.testing.expectEqual(dst_ref[y * stride_u8 + x], dst_jit[y * stride_u8 + x]);
-        }
-    }
+    try expectJitMatchesOracle(u8, allocator, cpu, expr_str, opt_int, fmt8, fmt8, width, height, srcs, @intCast(stride_u8), 0, &.{});
 }
 
 /// K4: Float -> u8 D4 store parity against the scalar oracle across qNaN, +-sNaN, +-inf, and OOB values.
 fn verifyBitExactF32ToU8(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str: []const u8, width: usize, height: usize) !void {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-
-    const profile = interp.TargetProfile.fromCpu(cpu);
-    const fmt_f32 = ast.SampleFormat{ .is_float = true, .bits_per_sample = 32 };
-    const fmt8 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 8 };
-    const fmts = [_]ast.SampleFormat{ fmt_f32, fmt_f32 };
-
-    var prog = try parser.parse(allocator, expr_str, .{ .num_clips = 2 });
-    defer prog.deinit(allocator);
-    try lower_mod.lower(allocator, &prog, profile);
-    try optimize_mod.optimize(allocator, &prog, profile, .{
-        .enable_value_changing = true,
-        .enable_fma = profile.use_fma,
-    });
-
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
-    defer info.deinit(allocator);
-
-    var rt = try aj.Runtime.init();
-    defer rt.deinit();
-
-    var compiled = try compilePlane(allocator, &rt, cpu, &prog, &info, .{
-        .width = width,
-        .height = height,
-        .src_fmts = &fmts,
-        .dst_fmt = fmt8,
-    });
-    defer compiled.deinit(allocator, &rt);
-
-    const stride_f32 = std.mem.alignForward(usize, width, 16);
-    const stride_f32_bytes: isize = @intCast(stride_f32 * 4);
-    const stride_u8 = std.mem.alignForward(usize, width, 64);
-
-    const src0 = try allocator.alignedAlloc(f32, .@"64", stride_f32 * height);
-    defer allocator.free(src0);
-    const src1 = try allocator.alignedAlloc(f32, .@"64", stride_f32 * height);
-    defer allocator.free(src1);
-    const dst_jit = try allocator.alignedAlloc(u8, .@"64", stride_u8 * height);
-    defer allocator.free(dst_jit);
-    const dst_ref = try allocator.alignedAlloc(u8, .@"64", stride_u8 * height);
-    defer allocator.free(dst_ref);
-
     const pos_snan: f32 = @bitCast(@as(u32, 0x7FA0_0001));
     const neg_snan: f32 = @bitCast(@as(u32, 0xFFA0_0001));
+    // M3: all 15*15=225 pairs at width >= 225.
     const edge_vals = [_]f32{
         -100.0,            -0.5,     -0.0,     0.0,               0.5,                1.5, 127.5, 254.5, 255.0, 300.0,
         std.math.nan(f32), pos_snan, neg_snan, std.math.inf(f32), -std.math.inf(f32),
     };
-    // M3: cover every single edge value on x and y (and all 15*15=225 pairs at width >= 225).
-    const n_edge = edge_vals.len;
-    for (0..height) |y| {
-        for (0..width) |x| {
-            const idx = y * width + x;
-            src0[y * stride_f32 + x] = edge_vals[idx % n_edge];
-            src1[y * stride_f32 + x] = edge_vals[(idx + idx / n_edge) % n_edge];
-        }
-    }
+    const src = try fillEdgePairs(f32, allocator, &edge_vals, width, height);
+    defer for (src) |s| allocator.free(s);
 
-    const srcs = [_][*]const u8{ @ptrCast(src0.ptr), @ptrCast(src1.ptr) };
-    const strides = [_]isize{ stride_f32_bytes, stride_f32_bytes };
-
-    compiled.kernel.func(dst_jit.ptr, @intCast(stride_u8), &srcs, &strides, 0, null);
-    try interp.evalPlane(allocator, &prog, profile, .{
-        .dst = dst_ref.ptr,
-        .dst_stride = @intCast(stride_u8),
-        .dst_fmt = fmt8,
-        .srcs = &srcs,
-        .src_strides = &strides,
-        .src_fmts = &fmts,
-        .width = width,
-        .height = height,
-        .frame_n = 0,
-        .props = &.{},
-    });
-
-    for (0..height) |y| {
-        for (0..width) |x| {
-            try std.testing.expectEqual(dst_ref[y * stride_u8 + x], dst_jit[y * stride_u8 + x]);
-        }
-    }
+    const fmt_f32 = ast.SampleFormat{ .is_float = true, .bits_per_sample = 32 };
+    const fmt8 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 8 };
+    const srcs = [_][*]const u8{ @ptrCast(src[0].ptr), @ptrCast(src[1].ptr) };
+    try expectJitMatchesOracle(u8, allocator, cpu, expr_str, false, fmt_f32, fmt8, width, height, srcs, @intCast(std.mem.alignForward(usize, width, 16) * 4), 0, &.{});
 }
 
 /// 32-bit integer (signed i32 semantics matching akarin) bit-exact JIT vs scalar oracle verification.
 fn verifyBitExactI32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str: []const u8, width: usize, height: usize, opt_int: bool) !void {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-
-    const profile = interp.TargetProfile.fromCpu(cpu);
-    const fmt32 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 32 };
-    const fmts = [_]ast.SampleFormat{ fmt32, fmt32 };
-
-    var prog = try parser.parse(allocator, expr_str, .{ .num_clips = 2, .opt_int = opt_int });
-    defer prog.deinit(allocator);
-    try lower_mod.lower(allocator, &prog, profile);
-    try optimize_mod.optimize(allocator, &prog, profile, .{
-        .enable_value_changing = true,
-        .enable_fma = profile.use_fma,
-    });
-
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt32, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
-    defer info.deinit(allocator);
-    // 32-bit integer inputs must never be routed into the 65536-entry u16 LUT.
-    try std.testing.expectEqual(analysis_mod.LutKind.none, info.lut_kind);
-    try std.testing.expectEqual(analysis_mod.LutKind.none, info.fallback_lut_kind);
-
-    var rt = try aj.Runtime.init();
-    defer rt.deinit();
-
-    var compiled = try compilePlane(allocator, &rt, cpu, &prog, &info, .{
-        .width = width,
-        .height = height,
-        .src_fmts = &fmts,
-        .dst_fmt = fmt32,
-    });
-    defer compiled.deinit(allocator, &rt);
-
     const stride_i32 = std.mem.alignForward(usize, width, 16);
-    const stride_bytes: isize = @intCast(stride_i32 * 4);
 
     const src0 = try allocator.alignedAlloc(i32, .@"64", stride_i32 * height);
     defer allocator.free(src0);
     const src1 = try allocator.alignedAlloc(i32, .@"64", stride_i32 * height);
     defer allocator.free(src1);
-    const dst_jit = try allocator.alignedAlloc(i32, .@"64", stride_i32 * height);
-    defer allocator.free(dst_jit);
-    const dst_ref = try allocator.alignedAlloc(i32, .@"64", stride_i32 * height);
-    defer allocator.free(dst_ref);
 
     const samples = [_]i32{
         0,                    1,                        -1,                       42,
@@ -4052,75 +3361,13 @@ fn verifyBitExactI32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_st
         }
     }
 
+    const fmt32 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 32 };
     const srcs = [_][*]const u8{ @ptrCast(src0.ptr), @ptrCast(src1.ptr) };
-    const strides = [_]isize{ stride_bytes, stride_bytes };
-
-    compiled.kernel.func(@ptrCast(dst_jit.ptr), stride_bytes, &srcs, &strides, 0, null);
-    try interp.evalPlane(allocator, &prog, profile, .{
-        .dst = @ptrCast(dst_ref.ptr),
-        .dst_stride = stride_bytes,
-        .dst_fmt = fmt32,
-        .srcs = &srcs,
-        .src_strides = &strides,
-        .src_fmts = &fmts,
-        .width = width,
-        .height = height,
-        .frame_n = 0,
-        .props = &.{},
-    });
-
-    for (0..height) |y| {
-        for (0..width) |x| {
-            try std.testing.expectEqual(dst_ref[y * stride_i32 + x], dst_jit[y * stride_i32 + x]);
-        }
-    }
+    try expectJitMatchesOracle(i32, allocator, cpu, expr_str, opt_int, fmt32, fmt32, width, height, srcs, @intCast(stride_i32 * 4), 0, &.{});
 }
 
 /// Float -> 32-bit integer D4 store parity across qNaN, +-sNaN, +-inf, and 2^31 boundary values.
 fn verifyBitExactF32ToI32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, expr_str: []const u8, width: usize, height: usize) !void {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
-
-    const profile = interp.TargetProfile.fromCpu(cpu);
-    const fmt_f32 = ast.SampleFormat{ .is_float = true, .bits_per_sample = 32 };
-    const fmt32 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 32 };
-    const fmts = [_]ast.SampleFormat{ fmt_f32, fmt_f32 };
-
-    var prog = try parser.parse(allocator, expr_str, .{ .num_clips = 2 });
-    defer prog.deinit(allocator);
-    try lower_mod.lower(allocator, &prog, profile);
-    try optimize_mod.optimize(allocator, &prog, profile, .{
-        .enable_value_changing = true,
-        .enable_fma = profile.use_fma,
-    });
-
-    var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt32, @intCast(width), @intCast(height), .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
-    defer info.deinit(allocator);
-
-    var rt = try aj.Runtime.init();
-    defer rt.deinit();
-
-    var compiled = try compilePlane(allocator, &rt, cpu, &prog, &info, .{
-        .width = width,
-        .height = height,
-        .src_fmts = &fmts,
-        .dst_fmt = fmt32,
-    });
-    defer compiled.deinit(allocator, &rt);
-
-    const stride_w = std.mem.alignForward(usize, width, 16);
-    const stride_bytes: isize = @intCast(stride_w * 4);
-
-    const src0 = try allocator.alignedAlloc(f32, .@"64", stride_w * height);
-    defer allocator.free(src0);
-    const src1 = try allocator.alignedAlloc(f32, .@"64", stride_w * height);
-    defer allocator.free(src1);
-    const dst_jit = try allocator.alignedAlloc(i32, .@"64", stride_w * height);
-    defer allocator.free(dst_jit);
-    const dst_ref = try allocator.alignedAlloc(i32, .@"64", stride_w * height);
-    defer allocator.free(dst_ref);
-
     const pos_snan: f32 = @bitCast(@as(u32, 0x7FA0_0001));
     const neg_snan: f32 = @bitCast(@as(u32, 0xFFA0_0001));
     const edge_vals = [_]f32{
@@ -4129,37 +3376,13 @@ fn verifyBitExactF32ToI32(allocator: std.mem.Allocator, cpu: cpu_mod.CpuInfo, ex
         3e9,                std.math.nan(f32), pos_snan, neg_snan,     std.math.inf(f32),
         -std.math.inf(f32),
     };
-    const n_edge = edge_vals.len;
-    for (0..height) |y| {
-        for (0..width) |x| {
-            const idx = y * width + x;
-            src0[y * stride_w + x] = edge_vals[idx % n_edge];
-            src1[y * stride_w + x] = edge_vals[(idx + idx / n_edge) % n_edge];
-        }
-    }
+    const src = try fillEdgePairs(f32, allocator, &edge_vals, width, height);
+    defer for (src) |s| allocator.free(s);
 
-    const srcs = [_][*]const u8{ @ptrCast(src0.ptr), @ptrCast(src1.ptr) };
-    const strides = [_]isize{ stride_bytes, stride_bytes };
-
-    compiled.kernel.func(@ptrCast(dst_jit.ptr), stride_bytes, &srcs, &strides, 0, null);
-    try interp.evalPlane(allocator, &prog, profile, .{
-        .dst = @ptrCast(dst_ref.ptr),
-        .dst_stride = stride_bytes,
-        .dst_fmt = fmt32,
-        .srcs = &srcs,
-        .src_strides = &strides,
-        .src_fmts = &fmts,
-        .width = width,
-        .height = height,
-        .frame_n = 0,
-        .props = &.{},
-    });
-
-    for (0..height) |y| {
-        for (0..width) |x| {
-            try std.testing.expectEqual(dst_ref[y * stride_w + x], dst_jit[y * stride_w + x]);
-        }
-    }
+    const fmt_f32 = ast.SampleFormat{ .is_float = true, .bits_per_sample = 32 };
+    const fmt32 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 32 };
+    const srcs = [_][*]const u8{ @ptrCast(src[0].ptr), @ptrCast(src[1].ptr) };
+    try expectJitMatchesOracle(i32, allocator, cpu, expr_str, false, fmt_f32, fmt32, width, height, srcs, @intCast(std.mem.alignForward(usize, width, 16) * 4), 0, &.{});
 }
 
 test "JIT-vs-oracle bit-exact parity across ISA tiers, widths, spatial, FMA, opt=1, and transcendentals" {

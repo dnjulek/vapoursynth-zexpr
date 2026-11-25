@@ -110,31 +110,17 @@ fn propExprGetFrame(
 
     switch (reason) {
         .Initial => {
-            for (d.nodes, d.clip_num_frames) |node, nf| {
-                zapi.requestFrameFilter(common.clampFrameIdx(n, nf), node);
-            }
+            common.requestInputs(zapi, n, d.nodes, d.clip_num_frames);
             return null;
         },
         .AllFramesReady => {
-            const n_clips = d.nodes.len;
-            var stack_frames: [32]?*const vs.Frame = @splat(null);
-            const heap_frames: ?[]?*const vs.Frame = if (n_clips > stack_frames.len)
-                allocator.alloc(?*const vs.Frame, n_clips) catch {
-                    zapi.setFilterError("PropExpr: out of memory");
-                    return null;
-                }
-            else
-                null;
-            defer if (heap_frames) |hf| allocator.free(hf);
-            const src_frames: []?*const vs.Frame = if (heap_frames) |hf| hf else stack_frames[0..n_clips];
-            @memset(src_frames, null);
-            defer {
-                for (src_frames) |mf| if (mf) |f| zapi.freeFrame(f);
+            var inputs: common.InputFrames = .{};
+            defer inputs.deinit(zapi);
+            if (!inputs.fetch(zapi, n, d.nodes, d.clip_num_frames)) {
+                zapi.setFilterError("PropExpr: out of memory");
+                return null;
             }
-
-            for (d.nodes, d.clip_num_frames, 0..) |node, nf, i| {
-                src_frames[i] = zapi.getFrameFilter(common.clampFrameIdx(n, nf), node);
-            }
+            const src_frames = inputs.frames;
 
             // Phase 1: Atomically evaluate ALL property updates against original input frames.
             const results = allocator.alloc(EvalResult, d.specs.len) catch {
@@ -156,16 +142,12 @@ fn propExprGetFrame(
                         switch (elem.*) {
                             .delete => break :blk .delete,
                             .expr => |*ce| {
-                                var prop_stack: [64]f32 = undefined;
-                                const prop_heap: ?[]f32 = if (ce.props.len > prop_stack.len)
-                                    allocator.alloc(f32, ce.props.len) catch {
-                                        zapi.setFilterError("PropExpr: out of memory");
-                                        return null;
-                                    }
-                                else
-                                    null;
-                                defer if (prop_heap) |ph| allocator.free(ph);
-                                const prop_vals: []f32 = if (prop_heap) |ph| ph else prop_stack[0..ce.props.len];
+                                var prop_buf: common.Scratch(f32, 64) = .{};
+                                defer prop_buf.deinit();
+                                const prop_vals = prop_buf.get(ce.props.len) orelse {
+                                    zapi.setFilterError("PropExpr: out of memory");
+                                    return null;
+                                };
 
                                 for (ce.props, 0..) |pb, pi| {
                                     switch (pb) {
@@ -181,19 +163,11 @@ fn propExprGetFrame(
                                             const f = src_frames[cid];
                                             const vf = zapi.vsapi.getVideoFrameFormat.?(f).*;
                                             const meta = common.clipMetaFromFrame(zapi, f, vf, 0, builtins.isRangeKind(bspec.kind)) orelse {
-                                                var ebuf: [512]u8 = undefined;
-                                                var ew: std.Io.Writer = .fixed(ebuf[0 .. ebuf.len - 1]);
-                                                ew.print("PropExpr: key '{s}': unsupported clip format for built-in constant '{s}'", .{ spec.key_z, @tagName(bspec.kind) }) catch {};
-                                                ebuf[ew.end] = 0;
-                                                zapi.setFilterError(ebuf[0..ew.end :0]);
+                                                common.setFilterErrorFmt(zapi, filter_name, "key '{s}': unsupported clip format for built-in constant '{s}'", .{ spec.key_z, @tagName(bspec.kind) });
                                                 return null;
                                             };
                                             const bv = builtins.resolveMeta(bspec.kind, meta) catch {
-                                                var ebuf: [512]u8 = undefined;
-                                                var ew: std.Io.Writer = .fixed(ebuf[0 .. ebuf.len - 1]);
-                                                ew.print("PropExpr: key '{s}': built-in constant '{s}' is unsupported on >16-bit integer clips", .{ spec.key_z, @tagName(bspec.kind) }) catch {};
-                                                ebuf[ew.end] = 0;
-                                                zapi.setFilterError(ebuf[0..ew.end :0]);
+                                                common.setFilterErrorFmt(zapi, filter_name, "key '{s}': built-in constant '{s}' is unsupported on >16-bit integer clips", .{ spec.key_z, @tagName(bspec.kind) });
                                                 return null;
                                             };
                                             prop_vals[pi] = bv.f32Val();
@@ -335,7 +309,7 @@ pub fn create(
     _ = user_data;
     const zapi = ZAPI.init(vsapi, core, null);
     const map_out = zapi.initZMap(out);
-    createImpl(zapi, in, out, map_out, vsapi) catch |err| switch (err) {
+    createImpl(zapi, in, out, map_out) catch |err| switch (err) {
         error.Invalid => {},
         error.OutOfMemory => map_out.setError("PropExpr: out of memory"),
     };
@@ -346,7 +320,6 @@ fn createImpl(
     in: ?*const vs.Map,
     out: ?*vs.Map,
     map_out: ZAPI.ZMap(?*vs.Map),
-    vsapi: ?*const vs.API,
 ) (common.ArgError || std.mem.Allocator.Error)!void {
     const nodes = common.getNodes(allocator, zapi, in, "clips") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -368,13 +341,13 @@ fn createImpl(
     }
 
     const vi0 = zapi.getVideoInfo(nodes[0]);
-    const has_dict = vsapi.?.mapGetType.?(in, "dict") != .Unset;
-    const in_num_keys_raw = vsapi.?.mapNumKeys.?(in);
+    const has_dict = zapi.vsapi.mapGetType.?(in, "dict") != .Unset;
+    const in_num_keys_raw = zapi.vsapi.mapNumKeys.?(in);
     const in_num_keys: usize = if (in_num_keys_raw > 0) @intCast(in_num_keys_raw) else 0;
 
     var extra_kw_count: usize = 0;
     for (0..in_num_keys) |ki| {
-        const k = vsapi.?.mapGetKey.?(in, @intCast(ki)).?;
+        const k = zapi.vsapi.mapGetKey.?(in, @intCast(ki)).?;
         const ks = std.mem.span(k);
         if (!std.mem.eql(u8, ks, "clips") and !std.mem.eql(u8, ks, "dict")) {
             extra_kw_count += 1;
@@ -403,32 +376,32 @@ fn createImpl(
     if (has_dict) {
         // Akarin style: call `dict` function, freeing function + both temporary maps on every exit (Y20).
         var err: vs.MapPropertyError = .Success;
-        const func = vsapi.?.mapGetFunction.?(in, "dict", 0, &err) orelse {
+        const func = zapi.vsapi.mapGetFunction.?(in, "dict", 0, &err) orelse {
             return common.fail(map_out, filter_name, "dict must be a callable function", .{});
         };
-        defer vsapi.?.freeFunction.?(func);
+        defer zapi.vsapi.freeFunction.?(func);
 
-        const call_in = vsapi.?.createMap.?() orelse return error.OutOfMemory;
-        defer vsapi.?.freeMap.?(call_in);
+        const call_in = zapi.vsapi.createMap.?() orelse return error.OutOfMemory;
+        defer zapi.vsapi.freeMap.?(call_in);
 
-        const call_out = vsapi.?.createMap.?() orelse return error.OutOfMemory;
-        defer vsapi.?.freeMap.?(call_out);
+        const call_out = zapi.vsapi.createMap.?() orelse return error.OutOfMemory;
+        defer zapi.vsapi.freeMap.?(call_out);
 
-        vsapi.?.callFunction.?(func, call_in, call_out);
-        if (vsapi.?.mapGetError.?(call_out)) |fn_err| {
+        zapi.vsapi.callFunction.?(func, call_in, call_out);
+        if (zapi.vsapi.mapGetError.?(call_out)) |fn_err| {
             return common.fail(map_out, filter_name, "dict callback error: {s}", .{std.mem.span(fn_err)});
         }
 
-        const nkeys_raw = vsapi.?.mapNumKeys.?(call_out);
+        const nkeys_raw = zapi.vsapi.mapNumKeys.?(call_out);
         if (nkeys_raw <= 0) {
             return common.fail(map_out, filter_name, "dict callback must return at least one property", .{});
         }
         const nkeys: usize = @intCast(nkeys_raw);
 
         for (0..nkeys) |ki| {
-            const k = vsapi.?.mapGetKey.?(call_out, @intCast(ki)).?;
-            const ptype = vsapi.?.mapGetType.?(call_out, k);
-            const nelems_raw = vsapi.?.mapNumElements.?(call_out, k);
+            const k = zapi.vsapi.mapGetKey.?(call_out, @intCast(ki)).?;
+            const ptype = zapi.vsapi.mapGetType.?(call_out, k);
+            const nelems_raw = zapi.vsapi.mapNumElements.?(call_out, k);
             if (nelems_raw <= 0) {
                 return common.fail(map_out, filter_name, "property '{s}' has empty value", .{std.mem.span(k)});
             }
@@ -443,7 +416,7 @@ fn createImpl(
                     errdefer allocator.free(vals);
                     for (0..nelems) |ei| {
                         var e2: vs.MapPropertyError = .Success;
-                        vals[ei] = vsapi.?.mapGetInt.?(call_out, k, @intCast(ei), &e2);
+                        vals[ei] = zapi.vsapi.mapGetInt.?(call_out, k, @intCast(ei), &e2);
                     }
                     try specs_list.append(allocator, .{ .key_z = key_z, .value = .{ .const_ints = vals } });
                 },
@@ -455,7 +428,7 @@ fn createImpl(
                     errdefer allocator.free(vals);
                     for (0..nelems) |ei| {
                         var e2: vs.MapPropertyError = .Success;
-                        vals[ei] = vsapi.?.mapGetFloat.?(call_out, k, @intCast(ei), &e2);
+                        vals[ei] = zapi.vsapi.mapGetFloat.?(call_out, k, @intCast(ei), &e2);
                     }
                     try specs_list.append(allocator, .{ .key_z = key_z, .value = .{ .const_floats = vals } });
                 },
@@ -472,10 +445,10 @@ fn createImpl(
     } else {
         // Cranexpr style: extra keyword arguments in `in`, requiring string values.
         for (0..in_num_keys) |ki| {
-            const k = vsapi.?.mapGetKey.?(in, @intCast(ki)).?;
+            const k = zapi.vsapi.mapGetKey.?(in, @intCast(ki)).?;
             const ks = std.mem.span(k);
             if (std.mem.eql(u8, ks, "clips") or std.mem.eql(u8, ks, "dict")) continue;
-            if (vsapi.?.mapGetType.?(in, k) != .Data) {
+            if (zapi.vsapi.mapGetType.?(in, k) != .Data) {
                 return common.fail(map_out, filter_name, "keyword argument '{s}' must be a string expression", .{ks});
             }
             var spec = try parseDataKeySpec(zapi, in, k, nodes, profile, map_out);
@@ -507,12 +480,7 @@ fn createImpl(
         .specs = owned_specs,
     };
 
-    for (nodes, clip_num_frames, 0..) |node, nf, i| {
-        deps[i] = .{
-            .source = node,
-            .requestPattern = if (nf >= data.out_vi.numFrames) .StrictSpatial else .FrameReuseLastOnly,
-        };
-    }
+    common.fillDeps(deps, nodes, clip_num_frames, data.out_vi.numFrames);
 
     zapi.createVideoFilter(out, filter_name, &data.out_vi, propExprGetFrame, propExprFree, .Parallel, deps, data);
 }

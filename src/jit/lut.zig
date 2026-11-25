@@ -142,11 +142,7 @@ pub const Lut = struct {
                 defer compiled.deinit(allocator, runtime);
                 compiled.kernel.func(table.ptr, dst_stride, src_ptrs.ptr, src_strides.ptr, 0, null);
                 filled_by_jit = true;
-            } else |err| {
-                if (err == error.ExecMemDenied) {
-                    if (out_execmem_denied) |flag| flag.* = true;
-                }
-            }
+            } else |err| noteExecMemDenied(err, out_execmem_denied);
         }
 
         if (!filled_by_jit) {
@@ -179,11 +175,7 @@ pub const Lut = struct {
                 if (rt) |runtime| {
                     if (compileU8LutPlane(runtime, lcpu, info.lut_clips[0], table[0..256])) |k| {
                         simd_kernel = k;
-                    } else |err| {
-                        if (err == error.ExecMemDenied) {
-                            if (out_execmem_denied) |flag| flag.* = true;
-                        }
-                    }
+                    } else |err| noteExecMemDenied(err, out_execmem_denied);
                 }
             }
         }
@@ -338,6 +330,13 @@ pub const Lut = struct {
         }
     }
 };
+
+/// Flag an `ExecMemDenied` JIT failure for the caller; any other JIT error just falls back silently.
+fn noteExecMemDenied(err: anyerror, flag: ?*bool) void {
+    if (err == error.ExecMemDenied) {
+        if (flag) |f| f.* = true;
+    }
+}
 
 /// Compile a runtime-dimension AsmJit plane kernel for 1D `u8 -> u8` LUTs using
 /// AVX-512 VBMI `vpermb`, AVX2/SSE4.1 `vpshufb + vpblendvb` tree, or AArch64 NEON `tbl`.
@@ -736,10 +735,16 @@ fn applyLut2dU8ToU16Packed8x(
     }
 }
 
+/// Test-only: parse `src` over `num_clips` clips, then lower and optimize it for `profile`.
+fn testProgram(a: std.mem.Allocator, src: []const u8, num_clips: u16, profile: interp.TargetProfile, opts: @import("../expr/optimize.zig").OptOptions) !ast.Program {
+    var prog = try @import("../expr/parser.zig").parse(a, src, .{ .num_clips = num_clips });
+    errdefer prog.deinit(a);
+    try @import("../expr/lower.zig").lower(a, &prog, profile);
+    try @import("../expr/optimize.zig").optimize(a, &prog, profile, opts);
+    return prog;
+}
+
 test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD u8 LUT" {
-    const parser = @import("../expr/parser.zig");
-    const lower_mod = @import("../expr/lower.zig");
-    const optimize_mod = @import("../expr/optimize.zig");
     const allocator = std.testing.allocator;
 
     const cpu = cpu_mod.detectWithOverride(null);
@@ -751,10 +756,8 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
     {
         const fmt10 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 10 };
         const fmts = [_]ast.SampleFormat{fmt10};
-        var prog = try parser.parse(allocator, "x 1023 / 2.2 pow 1023 *", .{ .num_clips = 1 });
+        var prog = try testProgram(allocator, "x 1023 / 2.2 pow 1023 *", 1, profile, .{});
         defer prog.deinit(allocator);
-        try lower_mod.lower(allocator, &prog, profile);
-        try optimize_mod.optimize(allocator, &prog, profile, .{});
 
         var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt10, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
@@ -812,19 +815,15 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
     {
         const fmt16 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 16 };
         const fmts = [_]ast.SampleFormat{fmt16};
-        var prog = try parser.parse(allocator, "x 4112 < 65535 x 19275 > 0 65535 x 4112 - 65535 19275 4112 - / * - ? ?", .{ .num_clips = 1 });
+        var prog = try testProgram(allocator, "x 4112 < 65535 x 19275 > 0 65535 x 4112 - 65535 19275 4112 - / * - ? ?", 1, profile, .{});
         defer prog.deinit(allocator);
-        try lower_mod.lower(allocator, &prog, profile);
-        try optimize_mod.optimize(allocator, &prog, profile, .{});
         var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info.lut_kind);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info.fallback_lut_kind);
 
-        var p_exp = try parser.parse(allocator, "x 65535 / exp 24000 *", .{ .num_clips = 1 });
+        var p_exp = try testProgram(allocator, "x 65535 / exp 24000 *", 1, profile, .{});
         defer p_exp.deinit(allocator);
-        try lower_mod.lower(allocator, &p_exp, profile);
-        try optimize_mod.optimize(allocator, &p_exp, profile, .{});
         var i_exp4 = try analysis_mod.analyze(allocator, &p_exp, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = true, .f32_lanes = 4 });
         defer i_exp4.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, i_exp4.lut_kind);
@@ -832,10 +831,8 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         defer i_exp8.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, i_exp8.lut_kind);
 
-        var p_poly = try parser.parse(allocator, "x 65535 / T! T@ 0.1 * 0.2 + T@ * 0.3 + T@ * 0.4 + T@ * 0.5 + T@ * 0.6 + T@ * 0.7 + T@ * 0.8 + 65535 *", .{ .num_clips = 1 });
+        var p_poly = try testProgram(allocator, "x 65535 / T! T@ 0.1 * 0.2 + T@ * 0.3 + T@ * 0.4 + T@ * 0.5 + T@ * 0.6 + T@ * 0.7 + T@ * 0.8 + 65535 *", 1, profile, .{ .enable_fma = true });
         defer p_poly.deinit(allocator);
-        try lower_mod.lower(allocator, &p_poly, profile);
-        try optimize_mod.optimize(allocator, &p_poly, profile, .{ .enable_fma = true });
         var i_poly4 = try analysis_mod.analyze(allocator, &p_poly, &fmts, fmt16, 16, 1, .{ .has_fast_u8_lut = true, .f32_lanes = 4 });
         defer i_poly4.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, i_poly4.lut_kind);
@@ -852,42 +849,32 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         const fmts1 = [_]ast.SampleFormat{fmt8};
         const fmts2 = [_]ast.SampleFormat{ fmt8, fmt8 };
 
-        var p_pref = try parser.parse(allocator, "x 16 < 1 x 75 > 0 1 x 16 - 1 75 16 - / * - ? ?", .{ .num_clips = 1 });
+        var p_pref = try testProgram(allocator, "x 16 < 1 x 75 > 0 1 x 16 - 1 75 16 - / * - ? ?", 1, profile, .{});
         defer p_pref.deinit(allocator);
-        try lower_mod.lower(allocator, &p_pref, profile);
-        try optimize_mod.optimize(allocator, &p_pref, profile, .{});
         var i_pref = try analysis_mod.analyze(allocator, &p_pref, &fmts1, fmtf32, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_pref.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, i_pref.lut_kind);
 
-        var p_gam = try parser.parse(allocator, "x 255 / 2.2 pow", .{ .num_clips = 1 });
+        var p_gam = try testProgram(allocator, "x 255 / 2.2 pow", 1, profile, .{});
         defer p_gam.deinit(allocator);
-        try lower_mod.lower(allocator, &p_gam, profile);
-        try optimize_mod.optimize(allocator, &p_gam, profile, .{});
         var i_gam = try analysis_mod.analyze(allocator, &p_gam, &fmts1, fmtf32, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_gam.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, i_gam.lut_kind);
 
-        var p_2sqrt = try parser.parse(allocator, "x 1 + sqrt y 1 + sqrt + 8 *", .{ .num_clips = 2 });
+        var p_2sqrt = try testProgram(allocator, "x 1 + sqrt y 1 + sqrt + 8 *", 2, profile, .{});
         defer p_2sqrt.deinit(allocator);
-        try lower_mod.lower(allocator, &p_2sqrt, profile);
-        try optimize_mod.optimize(allocator, &p_2sqrt, profile, .{});
         var i_2sqrt = try analysis_mod.analyze(allocator, &p_2sqrt, &fmts2, fmt8, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_2sqrt.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, i_2sqrt.lut_kind);
 
-        var p_2pow = try parser.parse(allocator, "x 255 / 0.01 + y 255 / 2 * pow 255 *", .{ .num_clips = 2 });
+        var p_2pow = try testProgram(allocator, "x 255 / 0.01 + y 255 / 2 * pow 255 *", 2, profile, .{});
         defer p_2pow.deinit(allocator);
-        try lower_mod.lower(allocator, &p_2pow, profile);
-        try optimize_mod.optimize(allocator, &p_2pow, profile, .{});
         var i_2pow = try analysis_mod.analyze(allocator, &p_2pow, &fmts2, fmt8, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_2pow.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut2d_u8, i_2pow.lut_kind);
 
-        var p_i16 = try parser.parse(allocator, "x 2 * 10 + 200 min 20 max 1 +", .{ .num_clips = 1 });
+        var p_i16 = try testProgram(allocator, "x 2 * 10 + 200 min 20 max 1 +", 1, profile, .{});
         defer p_i16.deinit(allocator);
-        try lower_mod.lower(allocator, &p_i16, profile);
-        try optimize_mod.optimize(allocator, &p_i16, profile, .{});
         var i_i16 = try analysis_mod.analyze(allocator, &p_i16, &fmts1, fmt8, 16, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer i_i16.deinit(allocator);
         try std.testing.expect(i_i16.int16_plan.eligible);
@@ -898,10 +885,8 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
     {
         const fmt8 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 8 };
         const fmts = [_]ast.SampleFormat{fmt8};
-        var prog = try parser.parse(allocator, "x 255 / 2.2 pow 255 *", .{ .num_clips = 1 });
+        var prog = try testProgram(allocator, "x 255 / 2.2 pow 255 *", 1, profile, .{});
         defer prog.deinit(allocator);
-        try lower_mod.lower(allocator, &prog, profile);
-        try optimize_mod.optimize(allocator, &prog, profile, .{});
 
         var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, 256, 1, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
@@ -973,10 +958,8 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
     {
         const fmt8 = ast.SampleFormat{ .is_float = false, .bits_per_sample = 8 };
         const fmts = [_]ast.SampleFormat{ fmt8, fmt8 };
-        var prog = try parser.parse(allocator, "x 255 / 2.2 pow y 255 / 1.8 pow + 127.5 *", .{ .num_clips = 2 });
+        var prog = try testProgram(allocator, "x 255 / 2.2 pow y 255 / 1.8 pow + 127.5 *", 2, profile, .{});
         defer prog.deinit(allocator);
-        try lower_mod.lower(allocator, &prog, profile);
-        try optimize_mod.optimize(allocator, &prog, profile, .{});
 
         var info = try analysis_mod.analyze(allocator, &prog, &fmts, fmt8, 64, 4, .{ .has_fast_u8_lut = aj.Builder.cpuSupportsFastLutU8(cpu), .f32_lanes = cpu.f32_lanes });
         defer info.deinit(allocator);
@@ -1018,28 +1001,22 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
         const fmt_f32 = ast.SampleFormat{ .is_float = true, .bits_per_sample = 32 };
         const fmts = [_]ast.SampleFormat{fmt8};
 
-        var p_cheap = try parser.parse(allocator, "x 255 /", .{ .num_clips = 1 });
+        var p_cheap = try testProgram(allocator, "x 255 /", 1, profile, .{});
         defer p_cheap.deinit(allocator);
-        try lower_mod.lower(allocator, &p_cheap, profile);
-        try optimize_mod.optimize(allocator, &p_cheap, profile, .{});
         var info_cheap = try analysis_mod.analyze(allocator, &p_cheap, &fmts, fmt_f32, 1920, 1080, .{ .has_fast_u8_lut = true });
         defer info_cheap.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info_cheap.lut_kind);
 
-        var p_heavy = try parser.parse(allocator, "x 255 / 2.2 pow", .{ .num_clips = 1 });
+        var p_heavy = try testProgram(allocator, "x 255 / 2.2 pow", 1, profile, .{});
         defer p_heavy.deinit(allocator);
-        try lower_mod.lower(allocator, &p_heavy, profile);
-        try optimize_mod.optimize(allocator, &p_heavy, profile, .{});
         var info_heavy = try analysis_mod.analyze(allocator, &p_heavy, &fmts, fmt_f32, 1920, 1080, .{ .has_fast_u8_lut = true });
         defer info_heavy.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_heavy.lut_kind);
 
         // K3: u8 -> u8 `x 1.5 * 10 +` takes LUT only when CPU supports fast SIMD u8 LUT;
         // heavy `gamma` still takes LUT even when CPU lacks fast SIMD u8 LUT (e.g. SKX without VBMI / SSE2).
-        var p_lin = try parser.parse(allocator, "x 1.5 * 10 +", .{ .num_clips = 1 });
+        var p_lin = try testProgram(allocator, "x 1.5 * 10 +", 1, profile, .{});
         defer p_lin.deinit(allocator);
-        try lower_mod.lower(allocator, &p_lin, profile);
-        try optimize_mod.optimize(allocator, &p_lin, profile, .{});
         var info_lin_simd = try analysis_mod.analyze(allocator, &p_lin, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = true });
         defer info_lin_simd.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_lin_simd.lut_kind);
@@ -1050,30 +1027,24 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
 
         // M1: u8-plan cost-10 and i16-plan cost-9 expressions must stay on SIMD JIT (not scalar LUT)
         // when the CPU lacks fast SIMD u8 LUT, while still exposing `fallback_lut_kind` for ExecMemDenied.
-        var p_u8_c10 = try parser.parse(allocator, "x 200 min 10 + 30 max 5 - 220 min 7 + 40 max 9 - 230 min 11 +", .{ .num_clips = 1 });
+        var p_u8_c10 = try testProgram(allocator, "x 200 min 10 + 30 max 5 - 220 min 7 + 40 max 9 - 230 min 11 +", 1, profile, .{});
         defer p_u8_c10.deinit(allocator);
-        try lower_mod.lower(allocator, &p_u8_c10, profile);
-        try optimize_mod.optimize(allocator, &p_u8_c10, profile, .{});
         var info_u8_c10 = try analysis_mod.analyze(allocator, &p_u8_c10, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = false });
         defer info_u8_c10.deinit(allocator);
         try std.testing.expect(info_u8_c10.u8_plan.eligible);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info_u8_c10.lut_kind);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_u8_c10.fallback_lut_kind);
 
-        var p_i16_c9 = try parser.parse(allocator, "x 128 - 3 * 128 + 0 max 255 min 2 * 100 - 0 max 255 min", .{ .num_clips = 1 });
+        var p_i16_c9 = try testProgram(allocator, "x 128 - 3 * 128 + 0 max 255 min 2 * 100 - 0 max 255 min", 1, profile, .{});
         defer p_i16_c9.deinit(allocator);
-        try lower_mod.lower(allocator, &p_i16_c9, profile);
-        try optimize_mod.optimize(allocator, &p_i16_c9, profile, .{});
         var info_i16_c9 = try analysis_mod.analyze(allocator, &p_i16_c9, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = false });
         defer info_i16_c9.deinit(allocator);
         try std.testing.expect(info_i16_c9.int16_plan.eligible);
         try std.testing.expectEqual(analysis_mod.LutKind.none, info_i16_c9.lut_kind);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_i16_c9.fallback_lut_kind);
 
-        var p_gam = try parser.parse(allocator, "x 255 / 2.2 pow 255 *", .{ .num_clips = 1 });
+        var p_gam = try testProgram(allocator, "x 255 / 2.2 pow 255 *", 1, profile, .{});
         defer p_gam.deinit(allocator);
-        try lower_mod.lower(allocator, &p_gam, profile);
-        try optimize_mod.optimize(allocator, &p_gam, profile, .{});
         var info_gam_nosimd = try analysis_mod.analyze(allocator, &p_gam, &fmts, fmt8, 1920, 1080, .{ .has_fast_u8_lut = false });
         defer info_gam_nosimd.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u8, info_gam_nosimd.lut_kind);
@@ -1084,10 +1055,8 @@ test "LUT matches JIT bit-for-bit including B4 out-of-range u16 samples and SIMD
     {
         const fmt_f16 = ast.SampleFormat{ .is_float = true, .bits_per_sample = 16 };
         const fmts_f16 = [_]ast.SampleFormat{fmt_f16};
-        var p_f16 = try parser.parse(allocator, "x abs 2.2 pow", .{ .num_clips = 1 });
+        var p_f16 = try testProgram(allocator, "x abs 2.2 pow", 1, profile, .{ .enable_fma = profile.use_fma });
         defer p_f16.deinit(allocator);
-        try lower_mod.lower(allocator, &p_f16, profile);
-        try optimize_mod.optimize(allocator, &p_f16, profile, .{ .enable_fma = profile.use_fma });
         var info_f16 = try analysis_mod.analyze(allocator, &p_f16, &fmts_f16, fmt_f16, 17, 2, .{ .has_fast_u8_lut = true, .f32_lanes = cpu.f32_lanes });
         defer info_f16.deinit(allocator);
         try std.testing.expectEqual(analysis_mod.LutKind.lut1d_u16, info_f16.lut_kind);

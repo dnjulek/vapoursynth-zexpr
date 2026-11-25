@@ -80,47 +80,29 @@ fn selectGetFrame(
     switch (reason) {
         .Initial => {
             slots.* = .{ null, null, null, null };
-            for (d.prop_src, d.prop_num_frames) |node, nf| {
-                zapi.requestFrameFilter(common.clampFrameIdx(n, nf), node);
-            }
+            common.requestInputs(zapi, n, d.prop_src, d.prop_num_frames);
             return null;
         },
         .AllFramesReady => {
             if (slots[0] == null) {
                 // Pass 1: Evaluate plane expressions from `prop_src` frames and request selected `clip_src`.
-                const n_props = d.prop_src.len;
-                var stack_pframes: [32]?*const vs.Frame = @splat(null);
-                const heap_pframes: ?[]?*const vs.Frame = if (n_props > stack_pframes.len)
-                    allocator.alloc(?*const vs.Frame, n_props) catch {
-                        zapi.setFilterError("Select: out of memory");
-                        return null;
-                    }
-                else
-                    null;
-                defer if (heap_pframes) |hp| allocator.free(hp);
-                const prop_frames: []?*const vs.Frame = if (heap_pframes) |hp| hp else stack_pframes[0..n_props];
-                @memset(prop_frames, null);
-                defer {
-                    for (prop_frames) |mf| if (mf) |f| zapi.freeFrame(f);
+                var inputs: common.InputFrames = .{};
+                defer inputs.deinit(zapi);
+                if (!inputs.fetch(zapi, n, d.prop_src, d.prop_num_frames)) {
+                    zapi.setFilterError("Select: out of memory");
+                    return null;
                 }
-
-                for (d.prop_src, d.prop_num_frames, 0..) |node, nf, i| {
-                    prop_frames[i] = zapi.getFrameFilter(common.clampFrameIdx(n, nf), node);
-                }
+                const prop_frames = inputs.frames;
 
                 var chosen: [max_planes]usize = .{ 0, 0, 0 };
                 for (0..d.num_planes) |p| {
                     const pe = &d.planes[p];
-                    var prop_stack: [64]f32 = undefined;
-                    const prop_heap: ?[]f32 = if (pe.props.len > prop_stack.len)
-                        allocator.alloc(f32, pe.props.len) catch {
-                            zapi.setFilterError("Select: out of memory");
-                            return null;
-                        }
-                    else
-                        null;
-                    defer if (prop_heap) |ph| allocator.free(ph);
-                    const prop_vals: []f32 = if (prop_heap) |ph| ph else prop_stack[0..pe.props.len];
+                    var prop_buf: common.Scratch(f32, 64) = .{};
+                    defer prop_buf.deinit();
+                    const prop_vals = prop_buf.get(pe.props.len) orelse {
+                        zapi.setFilterError("Select: out of memory");
+                        return null;
+                    };
 
                     for (pe.props, 0..) |pb, pi| {
                         switch (pb) {
@@ -256,7 +238,7 @@ pub fn create(
     _ = user_data;
     const zapi = ZAPI.init(vsapi, core, null);
     const map_out = zapi.initZMap(out);
-    createImpl(zapi, in, out, map_out, vsapi) catch |err| switch (err) {
+    createImpl(zapi, in, out, map_out) catch |err| switch (err) {
         error.Invalid => {},
         error.OutOfMemory => map_out.setError("Select: out of memory"),
     };
@@ -267,7 +249,6 @@ fn createImpl(
     in: ?*const vs.Map,
     out: ?*vs.Map,
     map_out: ZAPI.ZMap(?*vs.Map),
-    vsapi: ?*const vs.API,
 ) (common.ArgError || std.mem.Allocator.Error)!void {
     const clip_src = common.getNodes(allocator, zapi, in, "clip_src") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -317,7 +298,7 @@ fn createImpl(
     }
 
     const num_planes: usize = @intCast(vi0.format.numPlanes);
-    const expr_count_raw = vsapi.?.mapNumElements.?(in, "expr");
+    const expr_count_raw = zapi.vsapi.mapNumElements.?(in, "expr");
     if (expr_count_raw <= 0 or expr_count_raw > vi0.format.numPlanes) {
         return common.fail(map_out, filter_name, "expr must have between 1 and {d} elements", .{num_planes});
     }
@@ -412,18 +393,10 @@ fn createImpl(
         .num_planes = num_planes,
     };
 
-    var di: usize = 0;
-    for (clip_src) |node| {
-        deps[di] = .{ .source = node, .requestPattern = .StrictSpatial };
-        di += 1;
+    for (deps[0..clip_src.len], clip_src) |*dep, node| {
+        dep.* = .{ .source = node, .requestPattern = .StrictSpatial };
     }
-    for (prop_src, prop_num_frames) |node, nf| {
-        deps[di] = .{
-            .source = node,
-            .requestPattern = if (nf >= data.out_vi.numFrames) .StrictSpatial else .FrameReuseLastOnly,
-        };
-        di += 1;
-    }
+    common.fillDeps(deps[clip_src.len..], prop_src, prop_num_frames, data.out_vi.numFrames);
 
     zapi.createVideoFilter(out, filter_name, &data.out_vi, selectGetFrame, selectFree, .Parallel, deps, data);
 }
